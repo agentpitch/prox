@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  WINDIVERT_VERSION: 2.2.2
+  WINDIVERT_RELEASE_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
+  WINDIVERT_RELEASE_PAGE: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -40,18 +45,47 @@ jobs:
 
       - name: Test
         shell: pwsh
-        run: go test ./...
+        run: go test -mod=mod ./...
+
+      - name: Download WinDivert runtime
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $archivePath = Join-Path $env:RUNNER_TEMP "WinDivert-$env:WINDIVERT_VERSION-A.zip"
+          $extractPath = Join-Path $env:RUNNER_TEMP "WinDivert-$env:WINDIVERT_VERSION-A"
+
+          Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
+          Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+
+          Invoke-WebRequest -Uri $env:WINDIVERT_RELEASE_URL -OutFile $archivePath
+          Expand-Archive -Path $archivePath -DestinationPath $extractPath -Force
+
+          $dll = Get-ChildItem $extractPath -Recurse -Filter WinDivert.dll |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
+            Select-Object -First 1
+          $sys = Get-ChildItem $extractPath -Recurse -Filter WinDivert64.sys |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
+            Select-Object -First 1
+
+          if ($null -eq $dll -or $null -eq $sys) {
+            throw "Failed to locate x64 WinDivert runtime files in $env:WINDIVERT_RELEASE_URL"
+          }
+
+          Copy-Item $dll.FullName (Join-Path $env:RUNNER_TEMP "WinDivert.dll")
+          Copy-Item $sys.FullName (Join-Path $env:RUNNER_TEMP "WinDivert64.sys")
 
       - name: Build and package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path build, package, release | Out-Null
-          go build -trimpath -ldflags "-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+          go build -mod=mod -trimpath -ldflags "-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
 
           Copy-Item "build\pitchProx.exe" "release\pitchProx.exe"
           Copy-Item "build\pitchProx.exe" "package\pitchProx.exe"
+          Copy-Item (Join-Path $env:RUNNER_TEMP "WinDivert.dll") "package\WinDivert.dll"
+          Copy-Item (Join-Path $env:RUNNER_TEMP "WinDivert64.sys") "package\WinDivert64.sys"
 
-          foreach ($file in @("WinDivert.dll", "WinDivert64.sys", "README.md", "CHECKS.md")) {
+          foreach ($file in @("README.md", "CHECKS.md")) {
             if (Test-Path $file) {
               Copy-Item $file package\
             }

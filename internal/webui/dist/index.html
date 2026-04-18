@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pitchProx</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="256x256" href="/pp_icon_256.png">
+  <link rel="apple-touch-icon" href="/pp_icon_256.png">
+  <meta name="theme-color" content="#0b1630">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-wrap">
+      <div class="brand-row">
+        <h1>pitchProx</h1>
+        <button id="settingsBtn" type="button" class="icon-btn" title="Параметры">⚙</button>
+      </div>
+      <div id="statusLine" class="muted">Автосохранение включено…</div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel stack">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Правила</div>
+            <div class="hint">Порядок сверху вниз. Первое совпадение побеждает. Значения можно перечислять через ; или с новой строки.</div>
+          </div>
+          <button id="addRuleBtn" type="button">Добавить правило</button>
+        </div>
+        <div id="rules" class="list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Прокси</div>
+            <div class="hint">Проверка proxy доступна прямо из строки элемента.</div>
+          </div>
+          <button id="addProxyBtn" type="button">Добавить proxy</button>
+        </div>
+        <div id="proxies" class="list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Цепочки</div>
+            <div class="hint">Список остаётся компактным, редактирование открывается в диалоге.</div>
+          </div>
+          <button id="addChainBtn" type="button">Добавить chain</button>
+        </div>
+        <div id="chains" class="list"></div>
+      </div>
+    </section>
+
+    <section class="panel stack observability-panel">
+      <div class="card fixed-card activity-card">
+        <div class="card-head wrap">
+          <div>
+            <div class="card-title">Активность proxy</div>
+            <div id="activityHint" class="hint">Проксируемый входящий и исходящий трафик.</div>
+          </div>
+        </div>
+        <div id="activityStats" class="activity-stats"></div>
+        <canvas id="activityChart" class="chartbox" height="220"></canvas>
+      </div>
+
+      <div id="connectionsCard" class="card fixed-card connections-card">
+        <div class="card-head wrap">
+          <div>
+            <div class="card-title">Активные соединения</div>
+            <div id="connectionSummary" class="hint">Снимок обновляется раз в 7 секунд.</div>
+          </div>
+          <div class="connection-filter-tools">
+            <div class="connection-search" role="search">
+              <input id="connectionSearch" type="text" placeholder="Поиск по PID, процессу, host, port, rule, action" autocomplete="off" spellcheck="false" />
+              <button id="clearConnectionSearchBtn" type="button" class="search-clear" aria-label="Очистить поиск">×</button>
+            </div>
+            <div id="connectionTabs" class="tabs"></div>
+          </div>
+        </div>
+        <div id="focusBar" class="focus-bar"></div>
+        <div class="table-wrap connections-wrap">
+          <table id="connectionsTable">
+            <thead><tr><th>PID</th><th>Процесс</th><th>Host/IP</th><th>Port</th><th>Rule</th><th>Action</th><th>State</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="logCard" class="card fixed-card log-card">
+        <div class="card-head wrap">
+          <div>
+            <div class="card-title">Лог</div>
+            <div id="logsHint" class="hint">Лог в реальном времени. Подробные записи собираются, пока открыт WebUI.</div>
+          </div>
+          <div class="head-tools">
+            <button id="scrollLogsTopBtn" type="button">К новым</button>
+          </div>
+        </div>
+        <pre id="logs" class="logbox"></pre>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="editorDialog" class="editor-dialog">
+    <form method="dialog" class="editor-shell" id="editorForm">
+      <div class="editor-head">
+        <div>
+          <div id="editorTitle" class="card-title">Редактор</div>
+          <div id="editorHint" class="hint"></div>
+        </div>
+        <button id="editorCloseBtn" type="button" class="ghost">Закрыть</button>
+      </div>
+      <div id="editorBody" class="editor-body"></div>
+      <div class="editor-actions">
+        <div id="editorExtraActions" class="editor-extra-actions"></div>
+        <div class="editor-main-actions">
+          <button id="editorCancelBtn" type="button">Отмена</button>
+          <button id="editorSaveBtn" type="button" class="primary">Применить</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

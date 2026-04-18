@@ -19,10 +19,10 @@ Legacy compatibility:
 
 pitchProx watches new outbound TCP connections, determines which process created them, matches the connection against an ordered ruleset, and then chooses one of four actions. In the optimized runtime, connections that are definitively `Direct` are bypassed without entering the local relay path.
 
-- `Direct` — connect directly to the original destination.
-- `Proxy` — connect through one proxy profile.
-- `Chain` — connect through a sequence of proxy profiles.
-- `Block` — deny the connection.
+- `Direct` - connect directly to the original destination.
+- `Proxy` - connect through one proxy profile.
+- `Chain` - connect through a sequence of proxy profiles.
+- `Block` - deny the connection.
 
 The rules use Proxifier-style text fields:
 
@@ -189,36 +189,40 @@ Any
 
 Main areas:
 
-- **Rules** — ordered ruleset, quick enable/disable, move up/down, edit dialog.
-- **Proxies** — proxy profiles with inline target and test button.
-- **Chains** — ordered lists of proxy IDs.
-- **Proxy activity** — proxied Rx/Tx graph and totals for the configured retention window.
-- **Active connections** — grouped connection table with a free-text search field plus rule/action click-filters.
-- **Log** — live event log with process/rule/action filtering.
+- **Rules** - ordered ruleset, quick enable/disable, move up/down, edit dialog.
+- **Proxies** - proxy profiles with inline target and test button.
+- **Chains** - ordered lists of proxy IDs.
+- **Proxy activity** - proxied Rx/Tx graph and totals for the configured retention window.
+- **Active connections** - grouped connection table with a free-text search field plus rule/action click-filters.
+- **Log** - live event log with process/rule/action filtering.
 
 ## Documentation map
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — runtime architecture and data flow.
-- [docs/RULE_LANGUAGE.md](docs/RULE_LANGUAGE.md) — full rule syntax and matching semantics.
-- [docs/UI_REFERENCE.md](docs/UI_REFERENCE.md) — WebUI layout and user workflows.
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — localhost HTTP API used by the WebUI.
-- [docs/RECREATION_SPEC.md](docs/RECREATION_SPEC.md) — text-only specification detailed enough to recreate the program from scratch.
-- [docs/CODE_MAP.md](docs/CODE_MAP.md) — source file map by responsibility.
-- [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) — preserved CPU investigation that motivated later runtime optimizations.
-- [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) — how to publish the repository to GitHub and use the included CI workflow.
-- [CHECKS.md](CHECKS.md) — verification notes for this archive.
-
-
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - runtime architecture and data flow.
+- [docs/RULE_LANGUAGE.md](docs/RULE_LANGUAGE.md) - full rule syntax and matching semantics.
+- [docs/UI_REFERENCE.md](docs/UI_REFERENCE.md) - WebUI layout and user workflows.
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) - localhost HTTP API used by the WebUI.
+- [docs/RECREATION_SPEC.md](docs/RECREATION_SPEC.md) - text-only specification detailed enough to recreate the program from scratch.
+- [docs/CODE_MAP.md](docs/CODE_MAP.md) - source file map by responsibility.
+- [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) - preserved CPU investigation that motivated later runtime optimizations.
+- [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) - how to publish the repository to GitHub and use the included CI and release workflow.
+- [CHECKS.md](CHECKS.md) - verification notes for this archive.
 
 ## GitHub Actions CI
 
 This archive includes a ready-to-commit workflow at:
 
 ```text
-.github/workflows/windows-build.yml
+.github/workflows/ci.yml
 ```
 
-It builds `pitchProx.exe` on a GitHub-hosted Windows runner and uploads the result as a workflow artifact.
+It builds `pitchProx.exe` on a GitHub-hosted Windows runner, packages a Windows zip plus SHA-256 checksums, and uploads them as workflow artifacts.
+
+If you push a tag named `v*` such as `v0.1.0`, the same workflow also creates a GitHub Release automatically and attaches:
+
+- `pitchProx.exe`
+- `pitchProx-windows-amd64.zip`
+- `pitchProx-windows-amd64.sha256`
 
 ## Performance model
 
@@ -230,8 +234,6 @@ Desktop mode is optimized for a quiet idle state:
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception, and only those flows get dedicated WinDivert packet handling;
 - owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan.
-
-
 
 ## Historical performance note
 
@@ -245,7 +247,6 @@ It is kept as a historical design record because it identified the original kern
 - Hostname recovery is strongest for HTTP and TLS because those protocols expose `Host` or `SNI`.
 - UDP/QUIC/HTTP3 are out of scope in the current codebase.
 - Service mode is headless; the tray belongs to desktop mode.
-
 
 ## Windows build notes
 
@@ -268,6 +269,5 @@ The file icon is embedded from `assets/pp_icon_256.png` through the generated re
 ```powershell
 python .\tools\make_icon_syso.py
 ```
-
 
 WebUI also serves the embedded application icon at `/favicon.ico` and `/pp_icon_256.png`.

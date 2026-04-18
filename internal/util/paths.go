@@ -8,7 +8,7 @@ import (
 
 const (
 	portableConfigName       = "pitchProx.config.json"
-	portableHistoryName      = "pitchProx.history.sqlite"
+	portableHistoryName      = "pitchProx.history"
 	legacyPortableConfigName = "myprox.config.json"
 	legacyPortableHistory    = "myprox.history.sqlite"
 )
@@ -48,9 +48,7 @@ func HistoryPath() string {
 		return override
 	}
 	if exe, err := os.Executable(); err == nil {
-		portable := filepath.Join(filepath.Dir(exe), portableHistoryName)
-		migrateLegacyFile(portable, legacyHistoryCandidates())
-		return portable
+		return filepath.Join(filepath.Dir(exe), portableHistoryName)
 	}
 	return filepath.Join(DefaultDataDir(), portableHistoryName)
 }
@@ -89,28 +87,6 @@ func legacyConfigCandidates() []string {
 		candidates = append(candidates,
 			filepath.Join(dir, "pitchprox", "config.json"),
 			filepath.Join(dir, "myprox", "config.json"),
-		)
-	}
-	return candidates
-}
-
-func legacyHistoryCandidates() []string {
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), legacyPortableHistory))
-	}
-	if runtime.GOOS == "windows" {
-		if base := os.Getenv("ProgramData"); base != "" {
-			candidates = append(candidates,
-				filepath.Join(base, "pitchProx", "history.sqlite"),
-				filepath.Join(base, "MyProx", "history.sqlite"),
-			)
-		}
-	}
-	if dir, err := os.UserConfigDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(dir, "pitchprox", "history.sqlite"),
-			filepath.Join(dir, "myprox", "history.sqlite"),
 		)
 	}
 	return candidates

@@ -1,7 +1,9 @@
 package history
 
 import (
-	"database/sql"
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,13 +14,13 @@ import (
 	"time"
 
 	"github.com/openai/pitchprox/internal/config"
-	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
+	root string
 
 	mu                 sync.Mutex
+	flushMu            sync.Mutex
 	pendingLogs        []LogRecord
 	pendingConnections []ConnectionRecord
 	pendingTraffic     map[int64]TrafficSample
@@ -35,35 +37,37 @@ type rulePending struct {
 	Item RuleActivity
 }
 
+type timedRuleActivity struct {
+	Time time.Time `json:"time"`
+	RuleActivity
+}
+
+type connectionAggregate struct {
+	Item        ConnectionRecord
+	BlockedOnly bool
+	SawError    bool
+}
+
 const (
 	flushInterval      = 3 * time.Second
 	pruneInterval      = time.Minute
 	maxInitialLogQuery = 5000
+	segmentLayout      = "2006010215"
 )
 
 func Open(path string, retention time.Duration) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	root := segmentRoot(path)
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create history dir: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
 	s := &Store{
-		db:             db,
+		root:           root,
 		pendingTraffic: map[int64]TrafficSample{},
 		pendingRule:    map[string]rulePending{},
 		wake:           make(chan struct{}, 1),
 		stop:           make(chan struct{}),
 	}
 	s.SetRetentionWindow(retention)
-	if err := s.init(); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	s.wg.Add(1)
 	go s.loop()
 	return s, nil
@@ -72,7 +76,7 @@ func Open(path string, retention time.Duration) (*Store, error) {
 func (s *Store) Close() error {
 	close(s.stop)
 	s.wg.Wait()
-	return s.db.Close()
+	return nil
 }
 
 func (s *Store) SetRetentionWindow(d time.Duration) {
@@ -170,6 +174,9 @@ func (s *Store) Snapshot(retention time.Duration) (SnapshotData, error) {
 }
 
 func (s *Store) Flush() error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	s.mu.Lock()
 	logs := append([]LogRecord(nil), s.pendingLogs...)
 	conns := append([]ConnectionRecord(nil), s.pendingConnections...)
@@ -189,127 +196,22 @@ func (s *Store) Flush() error {
 	}
 	s.mu.Unlock()
 
-	if len(logs) == 0 && len(conns) == 0 && len(traffic) == 0 && len(rules) == 0 && !shouldPrune {
-		return nil
+	if err := s.appendLogs(logs); err != nil {
+		return err
 	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin history tx: %w", err)
+	if err := s.appendConnections(conns); err != nil {
+		return err
 	}
-	rollback := func(e error) error {
-		_ = tx.Rollback()
-		return e
+	if err := s.appendTraffic(traffic); err != nil {
+		return err
 	}
-
-	if len(logs) > 0 {
-		stmt, err := tx.Prepare(`INSERT INTO logs(ts, level, message, connection_id, pid, exe_path, action, rule_id, rule_name, host, port)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-		if err != nil {
-			return rollback(fmt.Errorf("prepare log insert: %w", err))
-		}
-		for _, item := range logs {
-			if _, err := stmt.Exec(item.Time.UTC().UnixMilli(), item.Level, item.Message, item.ConnectionID, item.PID, item.ExePath, string(item.Action), item.RuleID, item.RuleName, item.Host, item.Port); err != nil {
-				_ = stmt.Close()
-				return rollback(fmt.Errorf("insert log: %w", err))
-			}
-		}
-		_ = stmt.Close()
+	if err := s.appendRules(rules); err != nil {
+		return err
 	}
-
-	if len(conns) > 0 {
-		stmt, err := tx.Prepare(`INSERT INTO connection_history(
-			connection_id, pid, exe_path, source_ip, source_port, original_ip, original_port, hostname,
-			rule_id, rule_name, action, proxy_id, chain_id, state, bytes_up, bytes_down,
-			created_at, last_updated_at, hit_count)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-		if err != nil {
-			return rollback(fmt.Errorf("prepare connection insert: %w", err))
-		}
-		for _, item := range conns {
-			count := item.Count
-			if count <= 0 {
-				count = 1
-			}
-			created := item.CreatedAt.UTC()
-			if created.IsZero() {
-				created = time.Now().UTC()
-			}
-			updated := item.LastUpdatedAt.UTC()
-			if updated.IsZero() {
-				updated = created
-			}
-			if _, err := stmt.Exec(item.ID, item.PID, item.ExePath, item.SourceIP, item.SourcePort, item.OriginalIP, item.OriginalPort, item.Hostname,
-				item.RuleID, item.RuleName, string(item.Action), item.ProxyID, item.ChainID, item.State, item.BytesUp, item.BytesDown,
-				created.UnixMilli(), updated.UnixMilli(), count); err != nil {
-				_ = stmt.Close()
-				return rollback(fmt.Errorf("insert connection: %w", err))
-			}
-		}
-		_ = stmt.Close()
-	}
-
-	if len(traffic) > 0 {
-		stmt, err := tx.Prepare(`INSERT INTO traffic_seconds(ts, up_bytes, down_bytes)
-			VALUES(?, ?, ?)
-			ON CONFLICT(ts) DO UPDATE SET up_bytes = up_bytes + excluded.up_bytes, down_bytes = down_bytes + excluded.down_bytes`)
-		if err != nil {
-			return rollback(fmt.Errorf("prepare traffic upsert: %w", err))
-		}
-		keys := make([]int64, 0, len(traffic))
-		for ts := range traffic {
-			keys = append(keys, ts)
-		}
-		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-		for _, ts := range keys {
-			item := traffic[ts]
-			if _, err := stmt.Exec(ts, item.UpBytes, item.DownBytes); err != nil {
-				_ = stmt.Close()
-				return rollback(fmt.Errorf("upsert traffic: %w", err))
-			}
-		}
-		_ = stmt.Close()
-	}
-
-	if len(rules) > 0 {
-		stmt, err := tx.Prepare(`INSERT INTO rule_activity_seconds(ts, rule_id, rule_name, action, connections, up_bytes, down_bytes)
-			VALUES(?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(ts, rule_id, rule_name, action)
-			DO UPDATE SET connections = connections + excluded.connections, up_bytes = up_bytes + excluded.up_bytes, down_bytes = down_bytes + excluded.down_bytes`)
-		if err != nil {
-			return rollback(fmt.Errorf("prepare rule activity upsert: %w", err))
-		}
-		keys := make([]string, 0, len(rules))
-		for key := range rules {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			item := rules[key]
-			if _, err := stmt.Exec(item.Ts, item.Item.RuleID, item.Item.RuleName, string(item.Item.Action), item.Item.Connections, item.Item.UpBytes, item.Item.DownBytes); err != nil {
-				_ = stmt.Close()
-				return rollback(fmt.Errorf("upsert rule activity: %w", err))
-			}
-		}
-		_ = stmt.Close()
-	}
-
 	if shouldPrune {
-		cutoff := time.Now().UTC().Add(-time.Duration(s.retention.Load())).UnixMilli()
-		for _, query := range []string{
-			`DELETE FROM logs WHERE ts < ?`,
-			`DELETE FROM connection_history WHERE last_updated_at < ?`,
-			`DELETE FROM traffic_seconds WHERE ts * 1000 < ?`,
-			`DELETE FROM rule_activity_seconds WHERE ts * 1000 < ?`,
-		} {
-			if _, err := tx.Exec(query, cutoff); err != nil {
-				return rollback(fmt.Errorf("prune history: %w", err))
-			}
+		if err := s.pruneSegments(time.Now().UTC().Add(-time.Duration(s.retention.Load()))); err != nil {
+			return err
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit history tx: %w", err)
 	}
 	return nil
 }
@@ -338,209 +240,334 @@ func (s *Store) wakeFlush() {
 	}
 }
 
-func (s *Store) init() error {
-	pragmas := []string{
-		`PRAGMA journal_mode=WAL;`,
-		`PRAGMA synchronous=NORMAL;`,
-		`PRAGMA temp_store=MEMORY;`,
-		`PRAGMA busy_timeout=5000;`,
+func (s *Store) appendLogs(items []LogRecord) error {
+	if len(items) == 0 {
+		return nil
 	}
-	for _, q := range pragmas {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("sqlite pragma: %w", err)
+	buffers, err := marshalBySegment("logs", len(items), func(write func(time.Time, any) error) error {
+		for _, item := range items {
+			if err := write(item.Time.UTC(), item); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return s.flushSegmentBuffers(buffers)
+}
+
+func (s *Store) appendConnections(items []ConnectionRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	buffers, err := marshalBySegment("connections", len(items), func(write func(time.Time, any) error) error {
+		for _, item := range items {
+			ts := item.LastUpdatedAt.UTC()
+			if ts.IsZero() {
+				ts = time.Now().UTC()
+			}
+			if err := write(ts, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return s.flushSegmentBuffers(buffers)
+}
+
+func (s *Store) appendTraffic(items map[int64]TrafficSample) error {
+	if len(items) == 0 {
+		return nil
+	}
+	keys := make([]int64, 0, len(items))
+	for ts := range items {
+		keys = append(keys, ts)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	buffers, err := marshalBySegment("traffic", len(keys), func(write func(time.Time, any) error) error {
+		for _, ts := range keys {
+			item := items[ts]
+			if err := write(item.Time.UTC(), item); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return s.flushSegmentBuffers(buffers)
+}
+
+func (s *Store) appendRules(items map[string]rulePending) error {
+	if len(items) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	buffers, err := marshalBySegment("rules", len(keys), func(write func(time.Time, any) error) error {
+		for _, key := range keys {
+			item := items[key]
+			record := timedRuleActivity{Time: time.Unix(item.Ts, 0).UTC(), RuleActivity: item.Item}
+			if err := write(record.Time, record); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return s.flushSegmentBuffers(buffers)
+}
+
+func marshalBySegment(prefix string, sizeHint int, emit func(write func(time.Time, any) error) error) (map[string]*bytes.Buffer, error) {
+	buffers := make(map[string]*bytes.Buffer, max(1, sizeHint/16))
+	write := func(ts time.Time, item any) error {
+		name := segmentFileName(prefix, ts.UTC())
+		buf := buffers[name]
+		if buf == nil {
+			buf = &bytes.Buffer{}
+			buffers[name] = buf
+		}
+		data, err := json.Marshal(item)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+		return nil
+	}
+	if err := emit(write); err != nil {
+		return nil, err
+	}
+	return buffers, nil
+}
+
+func (s *Store) flushSegmentBuffers(buffers map[string]*bytes.Buffer) error {
+	if len(buffers) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(buffers))
+	for key := range buffers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		path := filepath.Join(s.root, key)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("open history segment %s: %w", key, err)
+		}
+		if _, err := f.Write(buffers[key].Bytes()); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write history segment %s: %w", key, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close history segment %s: %w", key, err)
 		}
 	}
-	schema := []string{
-		`CREATE TABLE IF NOT EXISTS logs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			ts INTEGER NOT NULL,
-			level TEXT NOT NULL,
-			message TEXT NOT NULL,
-			connection_id TEXT,
-			pid INTEGER,
-			exe_path TEXT,
-			action TEXT,
-			rule_id TEXT,
-			rule_name TEXT,
-			host TEXT,
-			port INTEGER
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);`,
-		`CREATE INDEX IF NOT EXISTS idx_logs_pid_ts ON logs(pid, ts DESC);`,
-		`CREATE INDEX IF NOT EXISTS idx_logs_action_ts ON logs(action, ts DESC);`,
-		`CREATE TABLE IF NOT EXISTS connection_history (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			connection_id TEXT,
-			pid INTEGER NOT NULL,
-			exe_path TEXT,
-			source_ip TEXT,
-			source_port INTEGER,
-			original_ip TEXT,
-			original_port INTEGER,
-			hostname TEXT,
-			rule_id TEXT,
-			rule_name TEXT,
-			action TEXT,
-			proxy_id TEXT,
-			chain_id TEXT,
-			state TEXT,
-			bytes_up INTEGER NOT NULL DEFAULT 0,
-			bytes_down INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL,
-			last_updated_at INTEGER NOT NULL,
-			hit_count INTEGER NOT NULL DEFAULT 1
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_connection_history_last ON connection_history(last_updated_at DESC);`,
-		`CREATE INDEX IF NOT EXISTS idx_connection_history_rule ON connection_history(rule_id, last_updated_at DESC);`,
-		`CREATE INDEX IF NOT EXISTS idx_connection_history_pid ON connection_history(pid, last_updated_at DESC);`,
-		`CREATE TABLE IF NOT EXISTS traffic_seconds (
-			ts INTEGER PRIMARY KEY,
-			up_bytes INTEGER NOT NULL DEFAULT 0,
-			down_bytes INTEGER NOT NULL DEFAULT 0
-		);`,
-		`CREATE TABLE IF NOT EXISTS rule_activity_seconds (
-			ts INTEGER NOT NULL,
-			rule_id TEXT NOT NULL DEFAULT '',
-			rule_name TEXT NOT NULL DEFAULT '',
-			action TEXT NOT NULL DEFAULT '',
-			connections INTEGER NOT NULL DEFAULT 0,
-			up_bytes INTEGER NOT NULL DEFAULT 0,
-			down_bytes INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY(ts, rule_id, rule_name, action)
-		);`,
-		`CREATE INDEX IF NOT EXISTS idx_rule_activity_ts ON rule_activity_seconds(ts DESC);`,
+	return nil
+}
+
+func (s *Store) pruneSegments(cutoff time.Time) error {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return fmt.Errorf("list history segments: %w", err)
 	}
-	for _, q := range schema {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("init schema: %w", err)
+	cutoff = cutoff.UTC()
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		start, ok := parseSegmentTime(entry.Name())
+		if !ok {
+			continue
+		}
+		if !start.Add(time.Hour).After(cutoff) {
+			if err := os.Remove(filepath.Join(s.root, entry.Name())); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("prune history segment %s: %w", entry.Name(), err)
+			}
 		}
 	}
 	return nil
 }
 
 func (s *Store) queryConnections(cutoff time.Time) ([]ConnectionRecord, error) {
-	rows, err := s.db.Query(`SELECT
-		COALESCE(MAX(connection_id), ''),
-		pid,
-		COALESCE(exe_path, ''),
-		COALESCE(MAX(source_ip), ''),
-		COALESCE(MAX(source_port), 0),
-		COALESCE(original_ip, ''),
-		COALESCE(original_port, 0),
-		COALESCE(hostname, ''),
-		COALESCE(rule_id, ''),
-		COALESCE(rule_name, ''),
-		COALESCE(action, ''),
-		COALESCE(proxy_id, ''),
-		COALESCE(chain_id, ''),
-		CASE
-			WHEN SUM(CASE WHEN state = 'blocked' THEN 1 ELSE 0 END) = COUNT(*) THEN 'blocked'
-			WHEN SUM(CASE WHEN state = 'error' THEN 1 ELSE 0 END) > 0 THEN 'error'
-			ELSE 'closed'
-		END,
-		SUM(bytes_up),
-		SUM(bytes_down),
-		MIN(created_at),
-		MAX(last_updated_at),
-		SUM(hit_count)
-	FROM connection_history
-	WHERE last_updated_at >= ?
-	GROUP BY pid, exe_path, original_ip, original_port, hostname, rule_id, rule_name, action, proxy_id, chain_id
-	ORDER BY MAX(last_updated_at) DESC`, cutoff.UTC().UnixMilli())
+	files, err := s.segmentFiles("connections", cutoff)
 	if err != nil {
-		return nil, fmt.Errorf("query connections: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-	out := make([]ConnectionRecord, 0, 64)
-	for rows.Next() {
-		var item ConnectionRecord
-		var action string
-		var createdMs, updatedMs int64
-		if err := rows.Scan(&item.ID, &item.PID, &item.ExePath, &item.SourceIP, &item.SourcePort, &item.OriginalIP, &item.OriginalPort, &item.Hostname, &item.RuleID, &item.RuleName, &action, &item.ProxyID, &item.ChainID, &item.State, &item.BytesUp, &item.BytesDown, &createdMs, &updatedMs, &item.Count); err != nil {
-			return nil, fmt.Errorf("scan connection: %w", err)
+	agg := map[string]connectionAggregate{}
+	for _, file := range files {
+		if err := readSegmentFile(file, func(item ConnectionRecord) {
+			if item.LastUpdatedAt.UTC().Before(cutoff) {
+				return
+			}
+			key := connectionAggregateKey(item)
+			state := strings.ToLower(strings.TrimSpace(item.State))
+			count := item.Count
+			if count <= 0 {
+				count = 1
+			}
+			current, ok := agg[key]
+			if !ok {
+				if item.CreatedAt.IsZero() {
+					item.CreatedAt = item.LastUpdatedAt
+				}
+				item.Count = count
+				current = connectionAggregate{
+					Item:        item,
+					BlockedOnly: state == "blocked",
+					SawError:    state == "error",
+				}
+			} else {
+				if item.CreatedAt.IsZero() {
+					item.CreatedAt = item.LastUpdatedAt
+				}
+				if current.Item.CreatedAt.IsZero() || (!item.CreatedAt.IsZero() && item.CreatedAt.Before(current.Item.CreatedAt)) {
+					current.Item.CreatedAt = item.CreatedAt
+				}
+				if item.LastUpdatedAt.After(current.Item.LastUpdatedAt) {
+					current.Item.ID = item.ID
+					current.Item.SourceIP = item.SourceIP
+					current.Item.SourcePort = item.SourcePort
+					current.Item.LastUpdatedAt = item.LastUpdatedAt
+				}
+				current.Item.BytesUp += item.BytesUp
+				current.Item.BytesDown += item.BytesDown
+				current.Item.Count += count
+				current.BlockedOnly = current.BlockedOnly && state == "blocked"
+				current.SawError = current.SawError || state == "error"
+			}
+			switch {
+			case current.SawError:
+				current.Item.State = "error"
+			case current.BlockedOnly:
+				current.Item.State = "blocked"
+			default:
+				current.Item.State = "closed"
+			}
+			agg[key] = current
+		}); err != nil {
+			return nil, fmt.Errorf("query connections: %w", err)
 		}
-		item.Action = config.RuleAction(action)
-		item.CreatedAt = time.UnixMilli(createdMs).UTC()
-		item.LastUpdatedAt = time.UnixMilli(updatedMs).UTC()
-		if item.Count <= 0 {
-			item.Count = 1
-		}
-		out = append(out, item)
 	}
-	return out, rows.Err()
+	out := make([]ConnectionRecord, 0, len(agg))
+	for _, item := range agg {
+		out = append(out, item.Item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LastUpdatedAt.Equal(out[j].LastUpdatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].LastUpdatedAt.After(out[j].LastUpdatedAt)
+	})
+	return out, nil
 }
 
 func (s *Store) queryLogs(cutoff time.Time) ([]LogRecord, error) {
-	rows, err := s.db.Query(`SELECT ts, level, message, connection_id, pid, exe_path, action, rule_id, rule_name, host, port
-		FROM logs
-		WHERE ts >= ?
-		ORDER BY ts DESC
-		LIMIT ?`, cutoff.UTC().UnixMilli(), maxInitialLogQuery)
+	files, err := s.segmentFiles("logs", cutoff)
 	if err != nil {
-		return nil, fmt.Errorf("query logs: %w", err)
-	}
-	defer rows.Close()
-	items := make([]LogRecord, 0, 128)
-	for rows.Next() {
-		var item LogRecord
-		var action string
-		var ts int64
-		if err := rows.Scan(&ts, &item.Level, &item.Message, &item.ConnectionID, &item.PID, &item.ExePath, &action, &item.RuleID, &item.RuleName, &item.Host, &item.Port); err != nil {
-			return nil, fmt.Errorf("scan log: %w", err)
-		}
-		item.Time = time.UnixMilli(ts).UTC()
-		item.Action = config.RuleAction(action)
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	items := make([]LogRecord, 0, 128)
+	for _, file := range files {
+		if err := readSegmentFile(file, func(item LogRecord) {
+			if item.Time.UTC().Before(cutoff) {
+				return
+			}
+			items = append(items, item)
+		}); err != nil {
+			return nil, fmt.Errorf("query logs: %w", err)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Time.After(items[j].Time) })
+	if len(items) > maxInitialLogQuery {
+		items = items[:maxInitialLogQuery]
 	}
 	return trimLogs(items), nil
 }
 
 func (s *Store) queryTraffic(cutoff time.Time) ([]TrafficSample, TrafficTotals, error) {
-	rows, err := s.db.Query(`SELECT ts, up_bytes, down_bytes FROM traffic_seconds WHERE ts >= ? ORDER BY ts ASC`, cutoff.UTC().Unix())
+	files, err := s.segmentFiles("traffic", cutoff)
 	if err != nil {
-		return nil, TrafficTotals{}, fmt.Errorf("query traffic: %w", err)
+		return nil, TrafficTotals{}, err
 	}
-	defer rows.Close()
-	out := make([]TrafficSample, 0, 256)
-	totals := TrafficTotals{}
-	for rows.Next() {
-		var ts int64
-		var item TrafficSample
-		if err := rows.Scan(&ts, &item.UpBytes, &item.DownBytes); err != nil {
-			return nil, TrafficTotals{}, fmt.Errorf("scan traffic: %w", err)
+	agg := map[int64]TrafficSample{}
+	for _, file := range files {
+		if err := readSegmentFile(file, func(item TrafficSample) {
+			if item.Time.UTC().Before(cutoff) {
+				return
+			}
+			key := item.Time.UTC().Unix()
+			current := agg[key]
+			if current.Time.IsZero() {
+				current.Time = item.Time.UTC()
+			}
+			current.UpBytes += item.UpBytes
+			current.DownBytes += item.DownBytes
+			agg[key] = current
+		}); err != nil {
+			return nil, TrafficTotals{}, fmt.Errorf("query traffic: %w", err)
 		}
-		item.Time = time.Unix(ts, 0).UTC()
+	}
+	keys := make([]int64, 0, len(agg))
+	for ts := range agg {
+		keys = append(keys, ts)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	out := make([]TrafficSample, 0, len(keys))
+	totals := TrafficTotals{}
+	for _, ts := range keys {
+		item := agg[ts]
 		totals.UpBytes += item.UpBytes
 		totals.DownBytes += item.DownBytes
 		out = append(out, item)
 	}
-	return out, totals, rows.Err()
+	return out, totals, nil
 }
 
 func (s *Store) queryRuleStats(cutoff time.Time) ([]RuleActivity, error) {
-	rows, err := s.db.Query(`SELECT rule_id, rule_name, action, SUM(connections), SUM(up_bytes), SUM(down_bytes)
-		FROM rule_activity_seconds
-		WHERE ts >= ?
-		GROUP BY rule_id, rule_name, action`, cutoff.UTC().Unix())
+	files, err := s.segmentFiles("rules", cutoff)
 	if err != nil {
-		return nil, fmt.Errorf("query rule stats: %w", err)
-	}
-	defer rows.Close()
-	out := make([]RuleActivity, 0, 64)
-	for rows.Next() {
-		var item RuleActivity
-		var action string
-		if err := rows.Scan(&item.RuleID, &item.RuleName, &action, &item.Connections, &item.UpBytes, &item.DownBytes); err != nil {
-			return nil, fmt.Errorf("scan rule stat: %w", err)
-		}
-		item.Action = config.RuleAction(action)
-		out = append(out, item)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	agg := map[string]RuleActivity{}
+	for _, file := range files {
+		if err := readSegmentFile(file, func(item timedRuleActivity) {
+			if item.Time.UTC().Before(cutoff) {
+				return
+			}
+			if item.Connections == 0 && item.UpBytes == 0 && item.DownBytes == 0 {
+				return
+			}
+			key := fmt.Sprintf("%s\x1f%s\x1f%s", strings.ToLower(strings.TrimSpace(item.RuleID)), strings.ToLower(strings.TrimSpace(item.RuleName)), strings.ToLower(strings.TrimSpace(string(item.Action))))
+			current := agg[key]
+			if current.RuleID == "" && current.RuleName == "" {
+				current.RuleID = item.RuleID
+				current.RuleName = item.RuleName
+				current.Action = item.Action
+			}
+			current.Connections += item.Connections
+			current.UpBytes += item.UpBytes
+			current.DownBytes += item.DownBytes
+			agg[key] = current
+		}); err != nil {
+			return nil, fmt.Errorf("query rule stats: %w", err)
+		}
+	}
+	out := make([]RuleActivity, 0, len(agg))
+	for _, item := range agg {
+		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Connections != out[j].Connections {
@@ -554,6 +581,102 @@ func (s *Store) queryRuleStats(cutoff time.Time) ([]RuleActivity, error) {
 		return strings.ToLower(out[i].RuleName) < strings.ToLower(out[j].RuleName)
 	})
 	return out, nil
+}
+
+func (s *Store) segmentFiles(prefix string, cutoff time.Time) ([]string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("list history segments: %w", err)
+	}
+	type candidate struct {
+		start time.Time
+		path  string
+	}
+	files := make([]candidate, 0, 8)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix+"-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		start, ok := parseSegmentTime(entry.Name())
+		if !ok {
+			continue
+		}
+		if start.Add(time.Hour).Before(cutoff.UTC()) {
+			continue
+		}
+		files = append(files, candidate{start: start, path: filepath.Join(s.root, entry.Name())})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].start.Before(files[j].start) })
+	out := make([]string, 0, len(files))
+	for _, item := range files {
+		out = append(out, item.path)
+	}
+	return out, nil
+}
+
+func readSegmentFile[T any](path string, fn func(T)) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2<<20)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var item T
+		if err := json.Unmarshal(line, &item); err != nil {
+			return err
+		}
+		fn(item)
+	}
+	return scanner.Err()
+}
+
+func connectionAggregateKey(item ConnectionRecord) string {
+	return fmt.Sprintf("%d\x1f%s\x1f%s\x1f%d\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s",
+		item.PID,
+		item.ExePath,
+		item.OriginalIP,
+		item.OriginalPort,
+		item.Hostname,
+		item.RuleID,
+		item.RuleName,
+		item.Action,
+		item.ProxyID,
+		item.ChainID,
+	)
+}
+
+func segmentRoot(path string) string {
+	ext := filepath.Ext(path)
+	if strings.EqualFold(ext, ".sqlite") {
+		return strings.TrimSuffix(path, ext)
+	}
+	if ext == "" {
+		return path
+	}
+	return path + ".segments"
+}
+
+func segmentFileName(prefix string, ts time.Time) string {
+	return fmt.Sprintf("%s-%s.jsonl", prefix, ts.UTC().Truncate(time.Hour).Format(segmentLayout))
+}
+
+func parseSegmentTime(name string) (time.Time, bool) {
+	base := strings.TrimSuffix(filepath.Base(name), ".jsonl")
+	_, stamp, ok := strings.Cut(base, "-")
+	if !ok {
+		return time.Time{}, false
+	}
+	ts, err := time.ParseInLocation(segmentLayout, stamp, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts.UTC(), true
 }
 
 func trimLogs(items []LogRecord) []LogRecord {

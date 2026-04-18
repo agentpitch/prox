@@ -6,12 +6,13 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. It combines:
 - a local transparent listener that handles only `Proxy / Chain / Block` flows and hostname-dependent `Direct` decisions;
 - a localhost WebUI for configuration and observability;
 - a Windows tray icon with live proxied traffic activity;
-- SQLite-backed history so connection/log/rule history does not stay in RAM.
+- segment-backed file history so connection/log/rule history does not stay in RAM.
 
-This repository is intended to be **portable**: the runtime configuration is stored next to `pitchProx.exe` as `pitchProx.config.json`, and runtime history is stored next to it as `pitchProx.history.sqlite`.
+This repository is intended to be **portable**: the runtime configuration is stored next to `pitchProx.exe` as `pitchProx.config.json`, and runtime history is stored next to it as `pitchProx.history/`.
 
 Legacy compatibility:
-- if `myprox.config.json` or `myprox.history.sqlite` exists next to the executable, pitchProx will copy it into the new `pitchProx.*` filenames on first start;
+- if `myprox.config.json` exists next to the executable, pitchProx will copy it into the new `pitchProx.*` filename on first start;
+- legacy `myprox.history.sqlite` files are left untouched; new builds write history into `pitchProx.history/`;
 - legacy `MYPROX_CONFIG`, `MYPROX_HISTORY`, and `MYPROX_DISABLE_TRAY` environment variables are still honored.
 
 ## What the program does
@@ -68,7 +69,7 @@ In service mode the process is headless. The service does not display a tray ico
 Requirements:
 
 - Windows 10/11 x64
-- Go 1.22+
+- Go 1.25+
 - WinDivert 2.2.2+
 
 Place these files next to the built executable:
@@ -124,10 +125,10 @@ pitchProx.config.json
 
 This is deliberate so a prepared setup can be copied to another machine together with the executable.
 
-The runtime history database is also portable and lives next to the executable:
+The runtime history store is also portable and lives next to the executable:
 
 ```text
-pitchProx.history.sqlite
+pitchProx.history\
 ```
 
 ## Rule syntax summary
@@ -225,7 +226,7 @@ Desktop mode is optimized for a quiet idle state:
 
 - the tray reads a lightweight in-process traffic view instead of the full WebUI snapshot;
 - verbose `info/debug` logging is captured only while the WebUI is open or recently active;
-- connection/log/rule/traffic history is stored in SQLite instead of remaining in RAM;
+- connection/log/rule/traffic history is stored in compact hourly file segments instead of remaining in RAM;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception, and only those flows get dedicated WinDivert packet handling;
 - owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan.

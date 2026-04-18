@@ -28,9 +28,9 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. The program 
 
 ### Observability + control plane
 
-- serves localhost JSON API and the embedded WebUI;
+- serves localhost JSON API and the embedded WebUI through a lightweight loopback HTTP implementation;
 - maintains lightweight live state for currently open connections;
-- persists historical logs, closed connections, proxy traffic and rule activity to SQLite;
+- persists historical logs, closed connections, proxy traffic and rule activity into compact hourly file segments;
 - renders a tray icon in desktop mode.
 
 ## 2. Process model
@@ -42,7 +42,7 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. The program 
 Inside that one process:
 
 - `Runtime` starts either (a) observer-only mode, or (b) selective interception mode with WinDivert + transparent listener;
-- `httpapi.Server` serves the WebUI;
+- `httpapi.Server` serves the WebUI without `net/http` or TLS baggage;
 - `trayapp.Run()` is started in a goroutine and uses an in-process provider instead of talking to the full snapshot API.
 
 This is the normal daily-use mode.
@@ -54,7 +54,7 @@ This is the normal daily-use mode.
 Service mode starts:
 
 - runtime;
-- localhost HTTP server.
+- localhost lightweight HTTP server.
 
 It is intentionally headless. No tray is started from the service because services live in Session 0.
 
@@ -79,7 +79,7 @@ Commands:
 
 Application orchestration.
 
-- `Program` starts/stops runtime and HTTP server;
+- `Program` starts/stops runtime and the lightweight loopback WebUI server;
 - `Runtime` owns config store, rule engine, monitor, flow table, direct connection observer, and—when needed—the transparent listener and WinDivert engine.
 
 ### `internal/config`
@@ -135,13 +135,13 @@ Responsibilities:
 
 - keep only active/open connections in RAM;
 - keep a very small recent traffic window in RAM for tray rendering;
-- write historical logs/connections/traffic/rule activity into SQLite;
+- write historical logs/connections/traffic/rule activity into hourly file segments;
 - provide snapshots for WebUI;
 - publish SSE log events.
 
 ### `internal/history`
 
-SQLite-backed history store.
+Segment-backed history store.
 
 Persists:
 
@@ -150,10 +150,10 @@ Persists:
 - per-second proxied traffic samples;
 - per-second rule activity samples.
 
-SQLite database path:
+History store path:
 
 ```text
-<dir of pitchProx.exe>\pitchProx.history.sqlite
+<dir of pitchProx.exe>\pitchProx.history\
 ```
 
 ### `internal/httpapi`
@@ -200,7 +200,7 @@ Responsibilities:
 15. Accounting updates are batched and attributed to:
     - rule stats;
     - proxy activity when action is `Proxy` or `Chain`.
-16. Closed/blocked/error connection history is persisted to SQLite.
+16. Closed/blocked/error connection history is persisted to the file-backed history store.
 17. Open connections remain only in RAM until they close.
 
 ## 5. Quiet mode and performance design
@@ -232,7 +232,7 @@ It controls:
 - historical active-connections view;
 - proxy activity graph window;
 - rule activity window;
-- SQLite pruning horizon.
+- segment pruning horizon.
 
 The default is 7 minutes.
 
@@ -241,7 +241,7 @@ The default is 7 minutes.
 Portable files next to the executable:
 
 - `pitchProx.config.json`
-- `pitchProx.history.sqlite`
+- `pitchProx.history\`
 
 Transient/ephemeral:
 

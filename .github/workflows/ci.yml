@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Show Go version
+        shell: pwsh
+        run: go version
+
+      - name: Tidy modules
+        shell: pwsh
+        run: go mod tidy
+
+      - name: Test
+        shell: pwsh
+        run: go test ./...
+
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          go build -trimpath -ldflags "-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitchProx-windows-amd64
+          if-no-files-found: error
+          path: |
+            build/pitchProx.exe
+            README.md
+            CHECKS.md
+            docs/**

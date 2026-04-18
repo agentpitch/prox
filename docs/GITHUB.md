@@ -19,11 +19,17 @@ This repository includes a single GitHub Actions workflow for Windows CI and tag
 8. generates `pitchProx-windows-amd64.sha256`;
 9. uploads the packaged release files as a workflow artifact.
 
+When the ref is `main`, the workflow also:
+
+10. creates a prerelease automatically for that exact `main` commit;
+11. attaches the executable, zip archive, and checksum file to that prerelease;
+12. lets GitHub generate release notes from merged changes.
+
 When the ref is a tag starting with `v`, the workflow also:
 
-10. creates a GitHub Release automatically;
-11. attaches the executable, zip archive, and checksum file to that release;
-12. lets GitHub generate release notes from merged changes.
+13. creates a versioned GitHub Release automatically;
+14. attaches the executable, zip archive, and checksum file to that release;
+15. lets GitHub generate release notes from merged changes.
 
 ## Triggers
 
@@ -34,6 +40,8 @@ When the ref is a tag starting with `v`, the workflow also:
 
 ## Release usage
 
+Push to `main` and GitHub will publish a prerelease for that commit automatically.
+
 Create and push an annotated tag such as:
 
 ```powershell
@@ -41,11 +49,12 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-That tag starts the same workflow and publishes the release automatically.
+That tag starts the same workflow and publishes the versioned release automatically.
 
 ## Notes
 
 - The build job runs on `windows-latest` because pitchProx is Windows-only.
 - The release job uses the built-in `GITHUB_TOKEN`; no extra secret is required for standard releases in the same repository.
 - WinDivert is pinned to the official `v2.2.2` release: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+- `main` pushes produce prereleases named `Main build <sha>` with tags in the form `main-<sha>`.
 - Runtime integration with WinDivert is **not** exercised in GitHub-hosted CI. The workflow is a build-and-basic-test pipeline, not a full driver/runtime integration test.

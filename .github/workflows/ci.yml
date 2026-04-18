@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows-build:
     runs-on: windows-latest
@@ -22,33 +26,81 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-          cache-dependency-path: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Show Go version
         shell: pwsh
         run: go version
 
-      - name: Tidy modules
+      - name: Download Go modules
         shell: pwsh
-        run: go mod tidy
+        run: go mod download
 
       - name: Test
         shell: pwsh
         run: go test ./...
 
-      - name: Build
+      - name: Build and package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path build | Out-Null
+          New-Item -ItemType Directory -Force -Path build, package, release | Out-Null
           go build -trimpath -ldflags "-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
 
-      - name: Upload artifact
+          Copy-Item "build\pitchProx.exe" "release\pitchProx.exe"
+          Copy-Item "build\pitchProx.exe" "package\pitchProx.exe"
+
+          foreach ($file in @("WinDivert.dll", "WinDivert64.sys", "README.md", "CHECKS.md")) {
+            if (Test-Path $file) {
+              Copy-Item $file package\
+            }
+          }
+
+          if (Test-Path docs) {
+            Copy-Item docs package\docs -Recurse
+          }
+
+          Compress-Archive -Path package\* -DestinationPath release\pitchProx-windows-amd64.zip -Force
+
+          $hashes = @(
+            Get-FileHash -Algorithm SHA256 release\pitchProx.exe
+            Get-FileHash -Algorithm SHA256 release\pitchProx-windows-amd64.zip
+          ) | ForEach-Object {
+            "{0} *{1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
+          }
+          Set-Content -Path release\pitchProx-windows-amd64.sha256 -Value $hashes
+
+      - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pitchProx-windows-amd64
           if-no-files-found: error
           path: |
-            build/pitchProx.exe
-            README.md
-            CHECKS.md
-            docs/**
+            release/pitchProx.exe
+            release/pitchProx-windows-amd64.zip
+            release/pitchProx-windows-amd64.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pitchProx-windows-amd64
+          path: release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/**/pitchProx.exe
+            release-assets/**/pitchProx-windows-amd64.zip
+            release-assets/**/pitchProx-windows-amd64.sha256

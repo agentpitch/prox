@@ -14,15 +14,16 @@ This repository includes a single GitHub Actions workflow for Windows CI and tag
 3. downloads Go modules;
 4. runs `go test ./...`;
 5. builds `build/pitchProx.exe` with the Windows GUI subsystem;
-6. packages `pitchProx.exe`, optional WinDivert runtime files, `README.md`, `CHECKS.md`, and `docs/` into `pitchProx-windows-amd64.zip`;
-7. generates `pitchProx-windows-amd64.sha256`;
-8. uploads the packaged release files as a workflow artifact.
+6. downloads `WinDivert.dll` and `WinDivert64.sys` from the official WinDivert 2.2.2 release;
+7. packages `pitchProx.exe`, the WinDivert runtime files, `README.md`, `CHECKS.md`, and `docs/` into `pitchProx-windows-amd64.zip`;
+8. generates `pitchProx-windows-amd64.sha256`;
+9. uploads the packaged release files as a workflow artifact.
 
 When the ref is a tag starting with `v`, the workflow also:
 
-9. creates a GitHub Release automatically;
-10. attaches the executable, zip archive, and checksum file to that release;
-11. lets GitHub generate release notes from merged changes.
+10. creates a GitHub Release automatically;
+11. attaches the executable, zip archive, and checksum file to that release;
+12. lets GitHub generate release notes from merged changes.
 
 ## Triggers
 
@@ -46,4 +47,5 @@ That tag starts the same workflow and publishes the release automatically.
 
 - The build job runs on `windows-latest` because pitchProx is Windows-only.
 - The release job uses the built-in `GITHUB_TOKEN`; no extra secret is required for standard releases in the same repository.
+- WinDivert is pinned to the official `v2.2.2` release: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
 - Runtime integration with WinDivert is **not** exercised in GitHub-hosted CI. The workflow is a build-and-basic-test pipeline, not a full driver/runtime integration test.

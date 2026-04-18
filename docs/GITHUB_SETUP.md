@@ -7,9 +7,10 @@ This repository is prepared for GitHub Actions and automatic GitHub Releases.
 - `.github/workflows/ci.yml`
 
 It builds `pitchProx.exe` on `windows-latest`, using the Go version declared in
-`go.mod`, packages a Windows zip and checksum file, uploads them as workflow
-artifacts, and publishes a GitHub Release automatically when you push a tag that
-matches `v*`.
+`go.mod`, downloads the WinDivert runtime from the official `v2.2.2` release,
+packages a Windows zip and checksum file, uploads them as workflow artifacts,
+and publishes a GitHub Release automatically when you push a tag that matches
+`v*`.
 
 Triggers:
 
@@ -48,7 +49,8 @@ git push origin v0.1.0
 
 ## Notes about WinDivert
 
-The workflow builds the executable. If your repository also stores `WinDivert.dll`
-and `WinDivert64.sys`, the workflow copies them into the packaged zip automatically.
-If those files are absent, the workflow still succeeds and publishes the built exe,
-zip, and checksum anyway.
+The workflow downloads `WinDivert.dll` and `WinDivert64.sys` automatically from:
+
+- https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+
+This keeps the packaged GitHub Release self-contained even if those files are not committed to the repository.

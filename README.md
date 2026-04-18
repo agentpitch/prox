@@ -72,6 +72,10 @@ Requirements:
 - Go 1.25+
 - WinDivert 2.2.2+
 
+Get the runtime files from the official WinDivert 2.2.2 release page:
+
+- https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+
 Place these files next to the built executable:
 
 - `WinDivert.dll`
@@ -90,7 +94,7 @@ Or manually from PowerShell:
 ```powershell
 go mod tidy
 New-Item -ItemType Directory -Force -Path build | Out-Null
-go build -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+go build -mod=mod -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
 ```
 
 The `cmd/pitchprox/pitchprox_windows_amd64.syso` resource file is already checked into the repo, so the `pp` icon is embedded by a normal `go build` on Windows.
@@ -218,6 +222,8 @@ This archive includes a ready-to-commit workflow at:
 
 It builds `pitchProx.exe` on a GitHub-hosted Windows runner, packages a Windows zip plus SHA-256 checksums, and uploads them as workflow artifacts.
 
+During GitHub Actions packaging, the workflow automatically downloads `WinDivert.dll` and `WinDivert64.sys` from the official WinDivert 2.2.2 release and includes them in the packaged zip.
+
 If you push a tag named `v*` such as `v0.1.0`, the same workflow also creates a GitHub Release automatically and attaches:
 
 - `pitchProx.exe`
@@ -261,7 +267,7 @@ Use:
 If you build manually and want the same behavior, use:
 
 ```powershell
-go build -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+go build -mod=mod -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
 ```
 
 The file icon is embedded from `assets/pp_icon_256.png` through the generated resource object `cmd/pitchprox/pitchprox_windows_amd64.syso`. To regenerate it, run:

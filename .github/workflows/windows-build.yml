@@ -1,0 +1,55 @@
+name: windows-build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download Go dependencies
+        shell: pwsh
+        run: go mod download
+
+      - name: Build GUI executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          go build -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "build\pitchProx.exe" "dist"
+          if (Test-Path WinDivert.dll) { Copy-Item "WinDivert.dll" "dist" }
+          if (Test-Path WinDivert64.sys) { Copy-Item "WinDivert64.sys" "dist" }
+          if (Test-Path README.md) { Copy-Item "README.md" "dist" }
+          Compress-Archive -Path dist\* -DestinationPath pitchProx-windows-amd64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitchProx-windows-amd64
+          path: |
+            build/pitchProx.exe
+            pitchProx-windows-amd64.zip

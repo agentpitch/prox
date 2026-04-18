@@ -8,7 +8,7 @@ This file maps concepts to source files.
 
 ## Runtime orchestration
 
-- `internal/app/program.go` — start/stop orchestration for runtime + HTTP server.
+- `internal/app/program.go` — start/stop orchestration for runtime + lightweight loopback WebUI server.
 - `internal/app/runtime.go` — owns config store, monitor, flow table, rule engine, direct observer, and selective interception startup.
 
 ## Configuration
@@ -24,8 +24,8 @@ This file maps concepts to source files.
 
 ## History and observability
 
-- `internal/history/model.go` — SQLite persistence record types.
-- `internal/history/store.go` — SQLite store, batching, flushing, pruning, aggregated queries.
+- `internal/history/model.go` — file-backed history record types.
+- `internal/history/store.go` — segment-backed history store, batching, flushing, pruning, aggregated queries.
 - `internal/monitor/monitor.go` — active in-RAM state, SSE publishing, snapshot assembly, tray view.
 
 ## Transparent routing
@@ -38,7 +38,7 @@ This file maps concepts to source files.
 
 ## HTTP API and UI
 
-- `internal/httpapi/server.go` — localhost API and embedded static file server.
+- `internal/httpapi/server.go` — lightweight localhost API/SSE server and embedded static file server.
 - `internal/webui/dist/index.html` — page structure.
 - `internal/webui/dist/styles.css` — layout and styling.
 - `internal/webui/dist/app.js` — all client-side rendering, editors, filters, autosave, charts.
@@ -52,7 +52,7 @@ This file maps concepts to source files.
 - `internal/win/owner_windows.go` — Windows TCP owner helpers and exe path lookup.
 - `internal/win/owner_cache_windows.go` — on-demand owner cache used by the SYN classifier.
 - `internal/service/service_windows.go` — Windows Service wrapper.
-- `internal/trayapp/tray_windows.go` — tray window, icon drawing, menu and click handling.
+- `internal/trayapp/tray_windows.go` — tray window, icon drawing, menu, and lightweight remote polling.
 - `internal/util/browser_windows.go` — open WebUI in default browser.
 - `internal/util/console_windows.go` — hide console on Explorer launch.
 - `internal/util/elevate_windows.go` — self-elevation helpers.

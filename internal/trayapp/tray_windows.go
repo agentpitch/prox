@@ -3,6 +3,7 @@
 package trayapp
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -10,10 +11,14 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"net/http"
+	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -166,7 +171,6 @@ var (
 type helper struct {
 	provider          Provider
 	url               string
-	httpClient        *http.Client
 	hwnd              windows.Handle
 	iconHandle        windows.Handle
 	iconPath          string
@@ -186,10 +190,9 @@ func Run(opts Options) error {
 		url = trimTrailingSlash(opts.Provider.OpenURL())
 	}
 	h := &helper{
-		provider:   opts.Provider,
-		url:        url,
-		httpClient: &http.Client{Timeout: 2 * time.Second},
-		iconPath:   filepath.Join(os.TempDir(), fmt.Sprintf("pitchprox_tray_%d.ico", os.Getpid())),
+		provider: opts.Provider,
+		url:      url,
+		iconPath: filepath.Join(os.TempDir(), fmt.Sprintf("pitchprox_tray_%d.ico", os.Getpid())),
 	}
 	already, err := h.acquireMutex()
 	if err != nil {
@@ -445,15 +448,14 @@ func (h *helper) fetchTrayView() (monitor.TrayView, error) {
 		return h.provider.TrayView(trayHistorySeconds)
 	}
 	var view monitor.TrayView
-	resp, err := h.httpClient.Get(h.url + "/api/tray")
+	body, status, err := httpJSONRequest("GET", h.url+"/api/tray", nil)
 	if err != nil {
 		return view, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return view, fmt.Errorf("tray status: %s", resp.Status)
+	if status != 200 {
+		return view, fmt.Errorf("tray status: %d", status)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
+	if err := json.Unmarshal(body, &view); err != nil {
 		return view, err
 	}
 	return view, nil
@@ -481,18 +483,12 @@ func (h *helper) requestProgramStop() {
 }
 
 func (h *helper) postStop() error {
-	req, err := http.NewRequest(http.MethodPost, h.url+"/api/control/stop", bytes.NewReader([]byte(`{}`)))
+	_, status, err := httpJSONRequest("POST", h.url+"/api/control/stop", []byte(`{}`))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("stop status: %s", resp.Status)
+	if status != 200 && status != 202 && status != 204 {
+		return fmt.Errorf("stop status: %d", status)
 	}
 	return nil
 }
@@ -788,4 +784,144 @@ func trimTrailingSlash(url string) string {
 		url = url[:len(url)-1]
 	}
 	return url
+}
+
+func httpJSONRequest(method, rawURL string, body []byte) ([]byte, int, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	host := u.Host
+	if host == "" {
+		return nil, 0, fmt.Errorf("missing host")
+	}
+	if u.Port() == "" {
+		host = net.JoinHostPort(u.Hostname(), "80")
+	}
+	conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+
+	target := u.EscapedPath()
+	if target == "" {
+		target = "/"
+	}
+	if u.RawQuery != "" {
+		target += "?" + u.RawQuery
+	}
+
+	bw := bufio.NewWriter(conn)
+	if _, err := fmt.Fprintf(bw, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", method, target, u.Host); err != nil {
+		return nil, 0, err
+	}
+	if len(body) > 0 {
+		if _, err := fmt.Fprintf(bw, "Content-Type: application/json\r\nContent-Length: %d\r\n", len(body)); err != nil {
+			return nil, 0, err
+		}
+	}
+	if _, err := bw.WriteString("\r\n"); err != nil {
+		return nil, 0, err
+	}
+	if len(body) > 0 {
+		if _, err := bw.Write(body); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return nil, 0, err
+	}
+	return readHTTPResponse(bufio.NewReader(conn))
+}
+
+func readHTTPResponse(br *bufio.Reader) ([]byte, int, error) {
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return nil, 0, err
+	}
+	parts := bytes.Fields([]byte(statusLine))
+	if len(parts) < 2 {
+		return nil, 0, fmt.Errorf("invalid response status")
+	}
+	status, err := strconv.Atoi(string(parts[1]))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	headers := map[string]string{}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return nil, 0, err
+		}
+		line = trimHTTPLine(line)
+		if line == "" {
+			break
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, 0, fmt.Errorf("invalid response header")
+		}
+		headers[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+
+	if strings.Contains(strings.ToLower(headers["transfer-encoding"]), "chunked") {
+		body, err := readChunkedBody(br)
+		return body, status, err
+	}
+	if lengthText := headers["content-length"]; lengthText != "" {
+		n, err := strconv.Atoi(lengthText)
+		if err != nil || n < 0 {
+			return nil, 0, fmt.Errorf("invalid content length")
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(br, body); err != nil {
+			return nil, 0, err
+		}
+		return body, status, nil
+	}
+	body, err := io.ReadAll(br)
+	return body, status, err
+}
+
+func readChunkedBody(br *bufio.Reader) ([]byte, error) {
+	var body bytes.Buffer
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = trimHTTPLine(line)
+		sizeText := line
+		if idx := strings.IndexByte(sizeText, ';'); idx >= 0 {
+			sizeText = sizeText[:idx]
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeText), 16, 64)
+		if err != nil {
+			return nil, err
+		}
+		if size == 0 {
+			for {
+				trailer, err := br.ReadString('\n')
+				if err != nil {
+					return nil, err
+				}
+				if trimHTTPLine(trailer) == "" {
+					return body.Bytes(), nil
+				}
+			}
+		}
+		if _, err := io.CopyN(&body, br, size); err != nil {
+			return nil, err
+		}
+		if _, err := br.ReadString('\n'); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func trimHTTPLine(v string) string {
+	return strings.TrimRight(v, "\r\n")
 }

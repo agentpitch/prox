@@ -1,0 +1,13 @@
+/build/
+/dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.config.json
+*.exe
+*.dll
+*.sys
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

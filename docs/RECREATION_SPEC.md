@@ -12,7 +12,7 @@ Build a Windows transparent TCP proxy manager with these properties:
 - actions `Direct`, `Proxy`, `Chain`, `Block`;
 - ordered rule list with first-match-wins;
 - portable config saved next to the executable;
-- portable SQLite history saved next to the executable;
+- portable segment-backed history saved next to the executable;
 - live observability for rules, connections, proxy usage and logs;
 - Windows tray icon with live proxied traffic mini-graph.
 
@@ -51,7 +51,7 @@ Behavior:
 Location:
 
 ```text
-<dir of pitchProx.exe>\pitchProx.history.sqlite
+<dir of pitchProx.exe>\pitchProx.history\
 ```
 
 Stored there:
@@ -228,7 +228,7 @@ When the connection is not blocked:
 Requirements:
 
 - keep only currently open/opening connections in RAM;
-- keep closed history in SQLite;
+- keep closed history in the segment-backed file store;
 - show grouped rows by PID/process/host/port/rule/action;
 - default `Все` tab shows only explicit non-default rule matches;
 - `Ещё` shows default/unassigned traffic;
@@ -242,7 +242,7 @@ Requirements:
 
 - real-time delivery via SSE;
 - newest items visually on top in the UI;
-- persist logs in SQLite;
+- persist logs in the segment-backed file store;
 - keep at most 100 latest entries per process plus a small generic tail in the visible log view;
 - `warn/error` always captured;
 - `info/debug` captured only while WebUI is active or recently active.

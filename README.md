@@ -224,7 +224,7 @@ It builds `pitchProx.exe` on a GitHub-hosted Windows runner, packages a Windows 
 
 During GitHub Actions packaging, the workflow automatically downloads `WinDivert.dll` and `WinDivert64.sys` from the official WinDivert 2.2.2 release and includes them in the packaged zip.
 
-A push to `main` creates a prerelease automatically for that commit.
+A push to `main` runs the Windows build and uploads packaged workflow artifacts.
 
 If you push a tag named `v*` such as `v0.1.0`, the same workflow also creates a versioned GitHub Release automatically and attaches:
 

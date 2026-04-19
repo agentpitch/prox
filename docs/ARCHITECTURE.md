@@ -31,7 +31,9 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. The program 
 - serves localhost JSON API and the embedded WebUI through a lightweight loopback HTTP implementation;
 - maintains lightweight live state for currently open connections;
 - persists historical logs, closed connections, proxy traffic and rule activity into compact hourly file segments;
-- renders a tray icon in desktop mode.
+- renders a tray icon in desktop mode;
+- lets the direct observer go dormant again when no active UI client remains;
+- compacts WebUI traffic snapshots into bounded time buckets before serializing them.
 
 ## 2. Process model
 
@@ -212,7 +214,7 @@ The optimized design intentionally separates **core routing** from **heavy obser
 - rule engine;
 - tiny live tray traffic ring in RAM;
 - warning/error logs;
-- direct connection observer;
+- direct connection observer, but only while the UI is actively viewed;
 - and only when needed: WinDivert selective interception + transparent listener.
 
 ### UI-heavy pieces
@@ -222,6 +224,8 @@ The optimized design intentionally separates **core routing** from **heavy obser
 - rich WebUI investigation data.
 
 Verbose logging is only captured while the WebUI is open or recently active. Tray traffic does **not** mark the UI as active.
+When the browser tab is hidden or closing, the frontend explicitly marks the UI inactive so the backend can return to the colder quiet-mode behavior sooner.
+Traffic history for the WebUI is bucketed before it leaves the backend, so long retention windows do not require building or shipping giant per-second arrays.
 
 ## 6. Retention model
 

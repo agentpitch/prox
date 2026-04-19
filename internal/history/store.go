@@ -48,6 +48,11 @@ type connectionAggregate struct {
 	SawError    bool
 }
 
+type SnapshotOptions struct {
+	IncludeLogs          bool
+	TrafficBucketSeconds int
+}
+
 const (
 	flushInterval      = 3 * time.Second
 	pruneInterval      = time.Minute
@@ -149,6 +154,10 @@ func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action co
 }
 
 func (s *Store) Snapshot(retention time.Duration) (SnapshotData, error) {
+	return s.SnapshotWithOptions(retention, SnapshotOptions{IncludeLogs: true, TrafficBucketSeconds: 1})
+}
+
+func (s *Store) SnapshotWithOptions(retention time.Duration, options SnapshotOptions) (SnapshotData, error) {
 	if retention < time.Minute {
 		retention = time.Duration(s.retention.Load())
 	}
@@ -161,10 +170,12 @@ func (s *Store) Snapshot(retention time.Duration) (SnapshotData, error) {
 	if out.Connections, err = s.queryConnections(cutoff); err != nil {
 		return SnapshotData{}, err
 	}
-	if out.Logs, err = s.queryLogs(cutoff); err != nil {
-		return SnapshotData{}, err
+	if options.IncludeLogs {
+		if out.Logs, err = s.queryLogs(cutoff); err != nil {
+			return SnapshotData{}, err
+		}
 	}
-	if out.Traffic, out.TrafficTotals, err = s.queryTraffic(cutoff); err != nil {
+	if out.Traffic, out.TrafficTotals, err = s.queryTraffic(cutoff, options.TrafficBucketSeconds); err != nil {
 		return SnapshotData{}, err
 	}
 	if out.RuleStats, err = s.queryRuleStats(cutoff); err != nil {
@@ -497,21 +508,34 @@ func (s *Store) queryLogs(cutoff time.Time) ([]LogRecord, error) {
 	return trimLogs(items), nil
 }
 
-func (s *Store) queryTraffic(cutoff time.Time) ([]TrafficSample, TrafficTotals, error) {
+func (s *Store) queryTraffic(cutoff time.Time, bucketSeconds int) ([]TrafficSample, TrafficTotals, error) {
 	files, err := s.segmentFiles("traffic", cutoff)
 	if err != nil {
 		return nil, TrafficTotals{}, err
 	}
+	cutoff = cutoff.UTC().Truncate(time.Second)
+	if bucketSeconds < 1 {
+		bucketSeconds = 1
+	}
+	bucketWidth := int64(bucketSeconds)
+	cutoffUnix := cutoff.Unix()
 	agg := map[int64]TrafficSample{}
+	totals := TrafficTotals{}
 	for _, file := range files {
 		if err := readSegmentFile(file, func(item TrafficSample) {
-			if item.Time.UTC().Before(cutoff) {
+			ts := item.Time.UTC()
+			if ts.Before(cutoff) {
 				return
 			}
-			key := item.Time.UTC().Unix()
+			totals.UpBytes += item.UpBytes
+			totals.DownBytes += item.DownBytes
+			key := ts.Unix()
+			if bucketWidth > 1 {
+				key = cutoffUnix + ((key-cutoffUnix)/bucketWidth)*bucketWidth
+			}
 			current := agg[key]
-			if current.Time.IsZero() {
-				current.Time = item.Time.UTC()
+			if current.Time.Before(ts) {
+				current.Time = ts
 			}
 			current.UpBytes += item.UpBytes
 			current.DownBytes += item.DownBytes
@@ -526,11 +550,8 @@ func (s *Store) queryTraffic(cutoff time.Time) ([]TrafficSample, TrafficTotals, 
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	out := make([]TrafficSample, 0, len(keys))
-	totals := TrafficTotals{}
 	for _, ts := range keys {
 		item := agg[ts]
-		totals.UpBytes += item.UpBytes
-		totals.DownBytes += item.DownBytes
 		out = append(out, item)
 	}
 	return out, totals, nil

@@ -53,8 +53,13 @@ type proxyTestRequest struct {
 type request struct {
 	Method  string
 	Path    string
+	Query   url.Values
 	Headers map[string]string
 	Body    []byte
+}
+
+type uiVisibilityRequest struct {
+	Active bool `json:"active"`
 }
 
 func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
@@ -151,11 +156,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	case "/api/config":
 		s.handleConfig(conn, req)
 	case "/api/snapshot":
-		s.handleSnapshot(conn)
+		s.handleSnapshot(conn, req)
 	case "/api/tray":
 		s.handleTray(conn)
 	case "/api/events":
 		s.handleEvents(conn)
+	case "/api/ui/visibility":
+		s.handleUIVisibility(conn, req)
 	case "/api/proxy-test":
 		s.handleProxyTest(conn, req)
 	case "/api/control/stop":
@@ -193,8 +200,12 @@ func (s *Server) handleConfig(conn net.Conn, req request) {
 	}
 }
 
-func (s *Server) handleSnapshot(conn net.Conn) {
-	writeJSON(conn, 200, s.Runtime.Monitor().Snapshot())
+func (s *Server) handleSnapshot(conn net.Conn, req request) {
+	includeLogs := true
+	if req.Query.Get("include_logs") == "0" {
+		includeLogs = false
+	}
+	writeJSON(conn, 200, s.Runtime.Monitor().SnapshotWithOptions(monitor.SnapshotOptions{IncludeLogs: includeLogs}))
 }
 
 func (s *Server) handleTray(conn net.Conn) {
@@ -233,6 +244,26 @@ func (s *Server) handleControlStop(conn net.Conn, req request) {
 	}
 }
 
+func (s *Server) handleUIVisibility(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	var payload uiVisibilityRequest
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &payload); err != nil {
+			writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
+			return
+		}
+	}
+	if payload.Active {
+		s.Runtime.Monitor().MarkUIActive()
+	} else {
+		s.Runtime.Monitor().MarkUIInactive()
+	}
+	writeEmpty(conn, 204)
+}
+
 func (s *Server) handleEvents(conn net.Conn) {
 	bw := bufio.NewWriter(conn)
 	if err := writeHeaders(bw, 200, map[string]string{
@@ -242,10 +273,6 @@ func (s *Server) handleEvents(conn net.Conn) {
 	}, -1); err != nil {
 		return
 	}
-	if err := writeSSE(bw, mustJSON(monitor.Event{Type: "snapshot", Data: s.Runtime.Monitor().Snapshot()})); err != nil {
-		return
-	}
-
 	_, ch, cancel := s.Runtime.Monitor().Subscribe()
 	defer cancel()
 
@@ -307,6 +334,7 @@ func readRequest(br *bufio.Reader) (request, error) {
 	req := request{
 		Method:  strings.ToUpper(strings.TrimSpace(parts[0])),
 		Path:    target.Path,
+		Query:   target.Query(),
 		Headers: map[string]string{},
 	}
 	var contentLength int
@@ -489,7 +517,7 @@ func shouldMarkUIActive(path string) bool {
 		return false
 	}
 	switch path {
-	case "/api/health", "/api/tray", "/api/control/stop":
+	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility":
 		return false
 	default:
 		return true

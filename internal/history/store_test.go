@@ -77,3 +77,102 @@ func TestStoreSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("rule connections = %d, want 1", snap.RuleStats[0].Connections)
 	}
 }
+
+func TestStoreSnapshotWithoutLogs(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	store.RecordLog(LogRecord{
+		Time:    now,
+		Level:   "info",
+		Message: "hidden",
+		PID:     77,
+	})
+	store.RecordConnection(ConnectionRecord{
+		ID:            "conn-2",
+		PID:           77,
+		ExePath:       "worker.exe",
+		OriginalIP:    "8.8.8.8",
+		OriginalPort:  53,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+		Count:         1,
+	})
+
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+
+	snap, err := store.SnapshotWithOptions(10*time.Minute, SnapshotOptions{IncludeLogs: false})
+	if err != nil {
+		t.Fatalf("snapshot without logs: %v", err)
+	}
+
+	if got := len(snap.Logs); got != 0 {
+		t.Fatalf("logs len = %d, want 0 when logs are excluded", got)
+	}
+	if got := len(snap.Connections); got != 1 {
+		t.Fatalf("connections len = %d, want 1", got)
+	}
+}
+
+func TestStoreSnapshotBucketsTraffic(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	store.AddTraffic(base.Add(0*time.Second), 10, 100)
+	store.AddTraffic(base.Add(1*time.Second), 20, 200)
+	store.AddTraffic(base.Add(2*time.Second), 30, 300)
+	store.AddTraffic(base.Add(3*time.Second), 40, 400)
+
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+
+	snap, err := store.SnapshotWithOptions(10*time.Minute, SnapshotOptions{
+		IncludeLogs:          false,
+		TrafficBucketSeconds: 3,
+	})
+	if err != nil {
+		t.Fatalf("snapshot with traffic buckets: %v", err)
+	}
+
+	if got := len(snap.Traffic); got != 2 {
+		t.Fatalf("traffic len = %d, want 2", got)
+	}
+	if got := snap.Traffic[0].UpBytes; got != 60 {
+		t.Fatalf("first bucket up = %d, want 60", got)
+	}
+	if got := snap.Traffic[0].DownBytes; got != 600 {
+		t.Fatalf("first bucket down = %d, want 600", got)
+	}
+	if got := snap.Traffic[1].UpBytes; got != 40 {
+		t.Fatalf("second bucket up = %d, want 40", got)
+	}
+	if got := snap.Traffic[1].DownBytes; got != 400 {
+		t.Fatalf("second bucket down = %d, want 400", got)
+	}
+	if snap.TrafficTotals.UpBytes != 100 || snap.TrafficTotals.DownBytes != 1000 {
+		t.Fatalf("traffic totals = %+v, want up=100 down=1000", snap.TrafficTotals)
+	}
+}

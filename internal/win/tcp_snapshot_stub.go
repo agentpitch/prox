@@ -19,4 +19,10 @@ type TCPConnection struct {
 	SeenAt     time.Time
 }
 
+type TCPSnapshotter struct{}
+
 func ListTCPConnections() ([]TCPConnection, error) { return nil, nil }
+
+func NewTCPSnapshotter() *TCPSnapshotter { return &TCPSnapshotter{} }
+
+func (s *TCPSnapshotter) ListTCPConnections() ([]TCPConnection, error) { return nil, nil }

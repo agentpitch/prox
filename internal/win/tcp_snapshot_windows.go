@@ -5,6 +5,7 @@ package win
 import (
 	"encoding/binary"
 	"net/netip"
+	"sync"
 	"time"
 )
 
@@ -22,10 +23,27 @@ type TCPConnection struct {
 
 const tcpStateListen = 2
 
+type TCPSnapshotter struct {
+	mu       sync.Mutex
+	exeByPID map[uint32]exeCacheEntry
+}
+
+var defaultTCPSnapshotter = NewTCPSnapshotter()
+
 func ListTCPConnections() ([]TCPConnection, error) {
+	return defaultTCPSnapshotter.ListTCPConnections()
+}
+
+func NewTCPSnapshotter() *TCPSnapshotter {
+	return &TCPSnapshotter{exeByPID: map[uint32]exeCacheEntry{}}
+}
+
+func (s *TCPSnapshotter) ListTCPConnections() ([]TCPConnection, error) {
+	if s == nil {
+		s = defaultTCPSnapshotter
+	}
 	now := time.Now().UTC()
 	items := make([]TCPConnection, 0, 128)
-	exeCache := map[uint32]string{}
 
 	if rows, err := loadTCP4Table(tcpTableOwnerPIDAll); err == nil {
 		for _, row := range rows {
@@ -41,7 +59,7 @@ func ListTCPConnections() ([]TCPConnection, error) {
 			}
 			items = append(items, TCPConnection{
 				PID:        row.OwningPID,
-				ExePath:    exePathCached(exeCache, row.OwningPID),
+				ExePath:    s.exePathCached(row.OwningPID, now),
 				LocalIP:    local,
 				LocalPort:  lp,
 				RemoteIP:   remote,
@@ -65,7 +83,7 @@ func ListTCPConnections() ([]TCPConnection, error) {
 			}
 			items = append(items, TCPConnection{
 				PID:        row.OwningPID,
-				ExePath:    exePathCached(exeCache, row.OwningPID),
+				ExePath:    s.exePathCached(row.OwningPID, now),
 				LocalIP:    local,
 				LocalPort:  lp,
 				RemoteIP:   remote,
@@ -79,12 +97,28 @@ func ListTCPConnections() ([]TCPConnection, error) {
 	return items, nil
 }
 
-func exePathCached(cache map[uint32]string, pid uint32) string {
-	if path, ok := cache[pid]; ok {
+func (s *TCPSnapshotter) exePathCached(pid uint32, now time.Time) string {
+	if s == nil {
+		path, _ := ExePath(pid)
 		return path
 	}
+	s.mu.Lock()
+	entry, ok := s.exeByPID[pid]
+	if ok && now.Before(entry.Expires) {
+		path := entry.Path
+		s.mu.Unlock()
+		return path
+	}
+	s.mu.Unlock()
+
 	path, _ := ExePath(pid)
-	cache[pid] = path
+
+	s.mu.Lock()
+	if s.exeByPID == nil {
+		s.exeByPID = map[uint32]exeCacheEntry{}
+	}
+	s.exeByPID[pid] = exeCacheEntry{Path: path, Expires: now.Add(exeCacheTTL)}
+	s.mu.Unlock()
 	return path
 }
 

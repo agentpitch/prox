@@ -1,5 +1,5 @@
 let state = null;
-let snapshot = { connections: [], logs: [], traffic: [], traffic_totals: { up_bytes: 0, down_bytes: 0 }, rule_stats: [] };
+let snapshot = { connections: [], logs: [], traffic: [], traffic_totals: { up_bytes: 0, down_bytes: 0 }, traffic_bucket_seconds: 1, rule_stats: [] };
 let logEntries = [];
 let ui = {
   connFilter: sessionStorage.getItem('pitchprox_conn_filter') || 'all',
@@ -7,6 +7,7 @@ let ui = {
   focus: { pid: null, exePath: '', ruleId: '', ruleName: '' },
   snapshotTimer: null,
   events: null,
+  eventsWanted: false,
   eventsRetryTimer: null,
   logsInitialized: false,
   editorSave: null,
@@ -422,14 +423,21 @@ async function loadConfig() {
   renderAll();
 }
 
-async function loadSnapshot() {
-  const data = await api('/api/snapshot');
+function buildSnapshotURL(options = {}) {
+  const params = new URLSearchParams();
+  if (options.includeLogs === false) params.set('include_logs', '0');
+  const query = params.toString();
+  return query ? `/api/snapshot?${query}` : '/api/snapshot';
+}
+
+async function loadSnapshot(options = {}) {
+  const data = await api(buildSnapshotURL(options));
   snapshot = data;
   if (data && data.retention_minutes && (!state || !state.retention_minutes)) {
     state = state || {};
     state.retention_minutes = Number(data.retention_minutes) || 7;
   }
-  if (!ui.logsInitialized || !ui.events) {
+  if (options.includeLogs !== false && (!ui.logsInitialized || !ui.events)) {
     logEntries = Array.isArray(data.logs) ? data.logs.slice() : [];
     ui.logsInitialized = true;
   }
@@ -1275,6 +1283,8 @@ function handleLiveEvent(event) {
 }
 
 function startLiveEvents() {
+  ui.eventsWanted = true;
+  if (document.hidden) return;
   if (ui.events) {
     ui.events.close();
     ui.events = null;
@@ -1296,36 +1306,67 @@ function startLiveEvents() {
     if (ui.events === es) {
       es.close();
       ui.events = null;
-      ui.eventsRetryTimer = setTimeout(() => startLiveEvents(), 1500);
+      if (ui.eventsWanted && !document.hidden) {
+        ui.eventsRetryTimer = setTimeout(() => startLiveEvents(), 1500);
+      }
     }
   };
 }
 
-function buildTrafficSeries() {
-  const now = Date.now();
-  const buckets = new Map((snapshot.traffic || []).map((item) => [new Date(item.time).getTime(), item]));
-  const out = [];
-  for (let ts = now - retentionWindowMs(); ts <= now; ts += 1000) {
-    const key = Math.floor(ts / 1000) * 1000;
-    const item = buckets.get(key) || { up_bytes: 0, down_bytes: 0, time: new Date(key).toISOString() };
-    out.push({ t: key, up: Number(item.up_bytes || 0), down: Number(item.down_bytes || 0) });
+function stopLiveEvents() {
+  ui.eventsWanted = false;
+  if (ui.events) {
+    ui.events.close();
+    ui.events = null;
   }
-  return compressSeries(out, 120);
+  if (ui.eventsRetryTimer) {
+    clearTimeout(ui.eventsRetryTimer);
+    ui.eventsRetryTimer = null;
+  }
 }
 
-function compressSeries(series, maxPoints) {
-  if (series.length <= maxPoints) return series;
-  const bucketSize = Math.ceil(series.length / maxPoints);
-  const out = [];
-  for (let i = 0; i < series.length; i += bucketSize) {
-    const chunk = series.slice(i, i + bucketSize);
-    out.push({
-      t: chunk[chunk.length - 1].t,
-      up: chunk.reduce((sum, x) => sum + x.up, 0) / chunk.length,
-      down: chunk.reduce((sum, x) => sum + x.down, 0) / chunk.length,
-    });
+function stopSnapshotPolling() {
+  if (ui.snapshotTimer) {
+    clearInterval(ui.snapshotTimer);
+    ui.snapshotTimer = null;
   }
-  return out;
+}
+
+async function postUIVisibility(active, keepalive = false) {
+  try {
+    await fetch('/api/ui/visibility', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active }),
+      keepalive,
+    });
+  } catch (_) {
+  }
+}
+
+function leaveLiveMode(keepalive = false) {
+  stopLiveEvents();
+  stopSnapshotPolling();
+  void postUIVisibility(false, keepalive);
+}
+
+async function enterLiveMode(forceFullSnapshot = false) {
+  if (document.hidden) return;
+  void postUIVisibility(true);
+  if (forceFullSnapshot) {
+    await loadSnapshot();
+  }
+  startSnapshotPolling();
+  startLiveEvents();
+}
+
+function buildTrafficSeries() {
+  const bucketSeconds = Math.max(1, Number(snapshot?.traffic_bucket_seconds || 1));
+  return (snapshot.traffic || []).map((item) => ({
+    t: new Date(item.time).getTime(),
+    up: Number(item.up_bytes || 0) / bucketSeconds,
+    down: Number(item.down_bytes || 0) / bucketSeconds,
+  })).filter((item) => Number.isFinite(item.t));
 }
 
 function renderActivityStats() {
@@ -1333,8 +1374,8 @@ function renderActivityStats() {
   const current = series[series.length - 1] || { up: 0, down: 0 };
   const peakRx = Math.max(0, ...series.map((x) => x.down || 0));
   const peakTx = Math.max(0, ...series.map((x) => x.up || 0));
-  const windowRx = series.reduce((sum, x) => sum + Number(x.down || 0), 0);
-  const windowTx = series.reduce((sum, x) => sum + Number(x.up || 0), 0);
+  const windowRx = Number(snapshot?.traffic_totals?.down_bytes || 0);
+  const windowTx = Number(snapshot?.traffic_totals?.up_bytes || 0);
   $('activityStats').innerHTML = `
     <div class="stat-pill stat-rx"><span>Входящий</span><strong>${escapeHtml(formatRate(current.down || 0))}</strong></div>
     <div class="stat-pill stat-tx"><span>Исходящий</span><strong>${escapeHtml(formatRate(current.up || 0))}</strong></div>
@@ -1380,8 +1421,8 @@ function renderActivityChart() {
   const chartH = height - padding.top - padding.bottom;
   const minScaleBytes = 5 * 1024;
   const maxY = Math.max(minScaleBytes, 1, ...series.flatMap((p) => [p.up || 0, p.down || 0]));
-  const minT = series[0].t;
-  const maxT = Math.max(series[series.length - 1].t, minT + 1000);
+  const maxT = Date.now();
+  const minT = maxT - retentionWindowMs();
   const toX = (t) => padding.left + ((t - minT) / (maxT - minT)) * chartW;
   const toY = (v) => padding.top + chartH - (v / maxY) * chartH;
 
@@ -1425,17 +1466,17 @@ function renderActivity() {
   renderActivityChart();
 }
 
-async function refreshSnapshot() {
+async function refreshSnapshot(options = { includeLogs: false }) {
   try {
-    await loadSnapshot();
+    await loadSnapshot(options);
   } catch (e) {
     console.error(e);
   }
 }
 
 function startSnapshotPolling() {
-  if (ui.snapshotTimer) clearInterval(ui.snapshotTimer);
-  ui.snapshotTimer = setInterval(refreshSnapshot, SNAPSHOT_POLL_MS);
+  stopSnapshotPolling();
+  ui.snapshotTimer = setInterval(() => refreshSnapshot({ includeLogs: !ui.events }), SNAPSHOT_POLL_MS);
 }
 
 $('settingsBtn').onclick = openSettingsEditor;
@@ -1458,15 +1499,19 @@ $('editorCancelBtn').onclick = closeEditor;
 $('editorSaveBtn').onclick = async () => { if (typeof ui.editorSave === 'function') await ui.editorSave(); };
 $('editorDialog').addEventListener('cancel', (e) => { e.preventDefault(); closeEditor(); });
 window.addEventListener('resize', () => renderActivityChart());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    leaveLiveMode(true);
+    return;
+  }
+  void enterLiveMode(true);
+});
 window.addEventListener('beforeunload', () => {
-  if (ui.events) ui.events.close();
-  if (ui.eventsRetryTimer) clearTimeout(ui.eventsRetryTimer);
-  if (ui.snapshotTimer) clearInterval(ui.snapshotTimer);
+  leaveLiveMode(true);
 });
 
 (async function init() {
   await loadConfig();
   await loadSnapshot();
-  startSnapshotPolling();
-  startLiveEvents();
+  await enterLiveMode(false);
 })();

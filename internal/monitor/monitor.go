@@ -70,12 +70,17 @@ type RuleActivity struct {
 }
 
 type Snapshot struct {
-	Connections      []Connection    `json:"connections"`
-	Logs             []LogEntry      `json:"logs"`
-	Traffic          []TrafficSample `json:"traffic"`
-	TrafficTotals    TrafficTotals   `json:"traffic_totals"`
-	RuleStats        []RuleActivity  `json:"rule_stats"`
-	RetentionMinutes int             `json:"retention_minutes"`
+	Connections          []Connection    `json:"connections"`
+	Logs                 []LogEntry      `json:"logs"`
+	Traffic              []TrafficSample `json:"traffic"`
+	TrafficTotals        TrafficTotals   `json:"traffic_totals"`
+	TrafficBucketSeconds int             `json:"traffic_bucket_seconds"`
+	RuleStats            []RuleActivity  `json:"rule_stats"`
+	RetentionMinutes     int             `json:"retention_minutes"`
+}
+
+type SnapshotOptions struct {
+	IncludeLogs bool
 }
 
 type TrayView struct {
@@ -94,6 +99,7 @@ type Bus struct {
 	subs             map[int]chan []byte
 	nextSubID        int
 	uiActiveUntil    time.Time
+	uiWake           chan struct{}
 	retentionWindow  time.Duration
 	history          *history.Store
 	lastActivePrune  time.Time
@@ -101,12 +107,13 @@ type Bus struct {
 }
 
 const (
-	uiVerboseWindow   = 90 * time.Second
-	defaultRetention  = 7 * time.Minute
-	maxRetention      = 24 * time.Hour
-	trayKeepWindow    = 2 * time.Minute
-	pruneActiveEvery  = 15 * time.Second
-	pruneTrafficEvery = 15 * time.Second
+	uiVerboseWindow          = 90 * time.Second
+	defaultRetention         = 7 * time.Minute
+	maxRetention             = 24 * time.Hour
+	snapshotTrafficMaxPoints = 120
+	trayKeepWindow           = 2 * time.Minute
+	pruneActiveEvery         = 15 * time.Second
+	pruneTrafficEvery        = 15 * time.Second
 )
 
 func NewBus(historyPath string) (*Bus, error) {
@@ -118,6 +125,7 @@ func NewBus(historyPath string) (*Bus, error) {
 		active:          map[string]Connection{},
 		trafficLive:     map[int64]TrafficSample{},
 		subs:            map[int]chan []byte{},
+		uiWake:          make(chan struct{}, 1),
 		retentionWindow: defaultRetention,
 		history:         hist,
 	}, nil
@@ -160,6 +168,13 @@ func (b *Bus) SetRetentionWindow(d time.Duration) {
 func (b *Bus) MarkUIActive() {
 	b.mu.Lock()
 	b.uiActiveUntil = time.Now().UTC().Add(uiVerboseWindow)
+	b.signalUIWakeLocked()
+	b.mu.Unlock()
+}
+
+func (b *Bus) MarkUIInactive() {
+	b.mu.Lock()
+	b.uiActiveUntil = time.Time{}
 	b.mu.Unlock()
 }
 
@@ -171,6 +186,13 @@ func (b *Bus) UIActive() bool {
 
 func (b *Bus) uiActiveLocked(now time.Time) bool {
 	return len(b.subs) > 0 || now.Before(b.uiActiveUntil)
+}
+
+func (b *Bus) UIWake() <-chan struct{} {
+	b.mu.RLock()
+	ch := b.uiWake
+	b.mu.RUnlock()
+	return ch
 }
 
 func (b *Bus) UpsertConnection(c Connection) {
@@ -316,6 +338,10 @@ func (b *Bus) AddRuleTraffic(ruleID, ruleName string, action config.RuleAction, 
 }
 
 func (b *Bus) Snapshot() Snapshot {
+	return b.SnapshotWithOptions(SnapshotOptions{IncludeLogs: true})
+}
+
+func (b *Bus) SnapshotWithOptions(options SnapshotOptions) Snapshot {
 	b.mu.Lock()
 	now := time.Now().UTC()
 	b.pruneActiveMaybeLocked(now)
@@ -327,18 +353,29 @@ func (b *Bus) Snapshot() Snapshot {
 	retention := b.retentionWindowLocked()
 	b.mu.Unlock()
 
-	data, err := b.history.Snapshot(retention)
+	trafficBucketSeconds := snapshotTrafficBucketSeconds(retention)
+	data, err := b.history.SnapshotWithOptions(retention, history.SnapshotOptions{
+		IncludeLogs:          options.IncludeLogs,
+		TrafficBucketSeconds: trafficBucketSeconds,
+	})
 	if err != nil {
 		// fall back to only active connections; surface error via generic log path.
-		return Snapshot{Connections: sortConnections(active), RetentionMinutes: int(retention / time.Minute)}
+		return Snapshot{
+			Connections:          sortConnections(active),
+			TrafficBucketSeconds: trafficBucketSeconds,
+			RetentionMinutes:     int(retention / time.Minute),
+		}
 	}
 	conns := active
 	for _, item := range data.Connections {
 		conns = append(conns, fromHistoryConnection(item))
 	}
-	logs := make([]LogEntry, 0, len(data.Logs))
-	for _, item := range data.Logs {
-		logs = append(logs, fromHistoryLog(item))
+	var logs []LogEntry
+	if options.IncludeLogs {
+		logs = make([]LogEntry, 0, len(data.Logs))
+		for _, item := range data.Logs {
+			logs = append(logs, fromHistoryLog(item))
+		}
 	}
 	traffic := make([]TrafficSample, 0, len(data.Traffic))
 	for _, item := range data.Traffic {
@@ -349,13 +386,26 @@ func (b *Bus) Snapshot() Snapshot {
 		ruleStats = append(ruleStats, RuleActivity(item))
 	}
 	return Snapshot{
-		Connections:      sortConnections(conns),
-		Logs:             logs,
-		Traffic:          traffic,
-		TrafficTotals:    TrafficTotals(data.TrafficTotals),
-		RuleStats:        ruleStats,
-		RetentionMinutes: int(retention / time.Minute),
+		Connections:          sortConnections(conns),
+		Logs:                 logs,
+		Traffic:              traffic,
+		TrafficTotals:        TrafficTotals(data.TrafficTotals),
+		TrafficBucketSeconds: trafficBucketSeconds,
+		RuleStats:            ruleStats,
+		RetentionMinutes:     int(retention / time.Minute),
 	}
+}
+
+func snapshotTrafficBucketSeconds(retention time.Duration) int {
+	seconds := int((retention + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	bucketSeconds := (seconds + snapshotTrafficMaxPoints - 1) / snapshotTrafficMaxPoints
+	if bucketSeconds < 1 {
+		return 1
+	}
+	return bucketSeconds
 }
 
 func (b *Bus) TrayView(seconds int) TrayView {
@@ -434,6 +484,7 @@ func (b *Bus) Subscribe() (int, <-chan []byte, func()) {
 	ch := make(chan []byte, 64)
 	b.subs[id] = ch
 	b.uiActiveUntil = time.Now().UTC().Add(uiVerboseWindow)
+	b.signalUIWakeLocked()
 	cancel := func() {
 		b.mu.Lock()
 		if sub, ok := b.subs[id]; ok {
@@ -443,6 +494,16 @@ func (b *Bus) Subscribe() (int, <-chan []byte, func()) {
 		b.mu.Unlock()
 	}
 	return id, ch, cancel
+}
+
+func (b *Bus) signalUIWakeLocked() {
+	if b.uiWake == nil {
+		return
+	}
+	select {
+	case b.uiWake <- struct{}{}:
+	default:
+	}
 }
 
 func (b *Bus) mustJSON(v interface{}) []byte {

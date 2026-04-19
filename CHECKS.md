@@ -10,6 +10,9 @@ This archive contains the current optimized baseline with segment-backed history
 - the global all-packets WinDivert path was replaced with a selective SYN classifier plus per-flow interception;
 - all-direct rulesets now run in observer-only mode without starting WinDivert at all;
 - owner lookup is on-demand instead of hot periodic refresh;
+- direct observer now fully sleeps when no active UI client is present and wakes immediately when the UI returns;
+- periodic WebUI refreshes can skip historical log payloads, while tab hide/close explicitly marks the UI inactive;
+- WebUI traffic snapshots are bucketed on the backend, so long retention windows do not emit or render full per-second series;
 - relay accounting is batched instead of writing counters on every copied chunk;
 - the embedded WebUI/control plane now uses a lightweight loopback HTTP implementation instead of `net/http`;
 - SQLite and `modernc` were removed from the runtime path.
@@ -21,6 +24,7 @@ These checks were executed successfully:
 ```text
 go test ./...
 go mod tidy
+node --check internal/webui/dist/app.js
 gofmt -w internal/httpapi/server.go internal/trayapp/tray_windows.go internal/history/store.go internal/util/paths.go
 go build -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
 go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
@@ -55,4 +59,5 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 - `pitchProx.config.json` and `pitchProx.history\` appear next to the executable;
 - rule matching works for `Direct / Proxy / Chain / Block`;
 - proxy activity, connection history, and logs continue to work after long uptime;
+- hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
 - idle memory is materially lower than older builds because the binary no longer links `net/http`/TLS or SQLite.

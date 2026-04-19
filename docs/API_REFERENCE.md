@@ -31,7 +31,11 @@ Important: changing listen addresses or transparent listener addresses/ports doe
 
 ## `GET /api/snapshot`
 
-Returns the full WebUI snapshot.
+Returns the WebUI snapshot.
+
+Optional query parameters:
+
+- `include_logs=0` - omit historical log payloads for lighter periodic refreshes.
 
 Fields:
 
@@ -39,8 +43,14 @@ Fields:
 - `logs`
 - `traffic`
 - `traffic_totals`
+- `traffic_bucket_seconds`
 - `rule_stats`
 - `retention_minutes`
+
+Notes:
+
+- `traffic` is a bounded bucketed series for the full retention window rather than a raw per-second dump.
+- `traffic_bucket_seconds` tells the WebUI how many seconds each traffic bucket represents.
 
 This is heavier than tray data and is intended for the WebUI, not for the tray.
 
@@ -64,14 +74,26 @@ Desktop single-process mode usually bypasses this endpoint and reads tray data d
 
 Server-Sent Events stream.
 
-Used for real-time log delivery and immediate UI refresh while the UI is open.
+Used for real-time log delivery while the UI is actively open.
 
 Event types emitted by the backend:
 
-- `snapshot`
-- `connection`
-- `connection_delete`
 - `log`
+
+## `POST /api/ui/visibility`
+
+Request:
+
+```json
+{"active": false}
+```
+
+Used by the WebUI when the browser tab becomes hidden or visible again.
+
+Behavior:
+
+- `active=true` marks the UI as actively viewed;
+- `active=false` allows the backend to cool down sooner when the tab is hidden or closing.
 
 ## `POST /api/proxy-test`
 
@@ -125,5 +147,6 @@ Exceptions that do **not** mark the UI active:
 - `/api/health`
 - `/api/tray`
 - `/api/control/stop`
+- `/api/ui/visibility`
 
-This prevents tray polling from accidentally keeping expensive verbose logging enabled all the time.
+This prevents tray polling or hidden-tab bookkeeping from accidentally keeping expensive verbose logging enabled all the time.

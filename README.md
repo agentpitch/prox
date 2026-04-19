@@ -239,8 +239,11 @@ Desktop mode is optimized for a quiet idle state:
 - the tray reads a lightweight in-process traffic view instead of the full WebUI snapshot;
 - verbose `info/debug` logging is captured only while the WebUI is open or recently active;
 - connection/log/rule/traffic history is stored in compact hourly file segments instead of remaining in RAM;
+- when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
+- WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception, and only those flows get dedicated WinDivert packet handling;
+- direct-bypass TCP observation now becomes truly dormant when no active UI client is present, instead of continuing periodic full TCP-table scans in the background;
 - owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan.
 
 ## Historical performance note

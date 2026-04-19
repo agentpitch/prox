@@ -5,17 +5,27 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/openai/pitchprox/internal/config"
 	"github.com/openai/pitchprox/internal/monitor"
 	"github.com/openai/pitchprox/internal/proxy"
 	"github.com/openai/pitchprox/internal/win"
 )
 
+type directObserverMonitor interface {
+	UIActive() bool
+	UIWake() <-chan struct{}
+	UpsertConnection(monitor.Connection)
+	AddRuleConnection(string, string, config.RuleAction)
+	AddLog(string, string, ...interface{})
+}
+
 type directObserver struct {
-	Monitor        *monitor.Bus
-	Flows          *proxy.FlowTable
-	ActiveInterval time.Duration
-	IdleInterval   time.Duration
-	Decide         func(win.TCPConnection) (monitor.Connection, bool)
+	Monitor         directObserverMonitor
+	Flows           *proxy.FlowTable
+	ActiveInterval  time.Duration
+	DormantInterval time.Duration
+	Decide          func(win.TCPConnection) (monitor.Connection, bool)
+	List            func() ([]win.TCPConnection, error)
 }
 
 func (o *directObserver) Start(ctx context.Context) {
@@ -26,28 +36,50 @@ func (o *directObserver) Start(ctx context.Context) {
 	if activeInterval <= 0 {
 		activeInterval = 5 * time.Second
 	}
-	idleInterval := o.IdleInterval
-	if idleInterval <= 0 {
-		idleInterval = 20 * time.Second
+	dormantInterval := o.DormantInterval
+	if dormantInterval <= 0 {
+		dormantInterval = 5 * time.Second
+	}
+	list := o.List
+	if list == nil {
+		list = win.ListTCPConnections
 	}
 	seen := map[string]monitor.Connection{}
 	for {
-		interval := idleInterval
 		if o.Monitor.UIActive() {
-			interval = activeInterval
+			o.scan(list, seen)
+			select {
+			case <-ctx.Done():
+				o.finalizeAll(seen)
+				return
+			case <-time.After(activeInterval):
+			}
+			continue
 		}
-		o.scan(seen)
+		if len(seen) > 0 {
+			o.finalizeAll(seen)
+			clear(seen)
+		}
+		wake := o.Monitor.UIWake()
+		if wake == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(dormantInterval):
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
-			o.finalizeAll(seen)
 			return
-		case <-time.After(interval):
+		case <-wake:
+		case <-time.After(dormantInterval):
 		}
 	}
 }
 
-func (o *directObserver) scan(seen map[string]monitor.Connection) {
-	items, err := win.ListTCPConnections()
+func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map[string]monitor.Connection) {
+	items, err := list()
 	if err != nil {
 		o.Monitor.AddLog("warn", "tcp observer: %v", err)
 		return

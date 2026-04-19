@@ -109,11 +109,11 @@ func (r *Runtime) Start(ctx context.Context) error {
 	r.runCancel = cancel
 	cfg := r.CurrentConfig()
 	r.directObserver = &directObserver{
-		Monitor:        r.monitor,
-		Flows:          r.flows,
-		ActiveInterval: 7 * time.Second,
-		IdleInterval:   60 * time.Second,
-		Decide:         r.directConnectionView,
+		Monitor:         r.monitor,
+		Flows:           r.flows,
+		ActiveInterval:  7 * time.Second,
+		DormantInterval: 5 * time.Second,
+		Decide:          r.directConnectionView,
 	}
 	go r.directObserver.Start(ctx)
 

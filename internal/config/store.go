@@ -35,8 +35,11 @@ func (s *Store) LoadOrCreate() error {
 	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
-		s.cfg = DefaultConfig()
-		Normalize(&s.cfg)
+		cfg, err := Canonicalize(DefaultConfig())
+		if err != nil {
+			return fmt.Errorf("validate default config: %w", err)
+		}
+		s.cfg = cfg
 		return s.saveLocked()
 	}
 	if err != nil {
@@ -46,8 +49,8 @@ func (s *Store) LoadOrCreate() error {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
-	Normalize(&cfg)
-	if err := Validate(cfg); err != nil {
+	cfg, err = Canonicalize(cfg)
+	if err != nil {
 		return fmt.Errorf("validate config: %w", err)
 	}
 	s.cfg = cfg
@@ -57,19 +60,22 @@ func (s *Store) LoadOrCreate() error {
 func (s *Store) Get() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneConfig(s.cfg)
+	return Clone(s.cfg)
 }
 
-func (s *Store) Save(cfg Config) error {
-	Normalize(&cfg)
-	if err := Validate(cfg); err != nil {
-		return err
+func (s *Store) Save(cfg Config) (Config, error) {
+	cfg, err := Canonicalize(cfg)
+	if err != nil {
+		return Config{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg.UpdatedAt = time.Now().UTC()
-	s.cfg = cloneConfig(cfg)
-	return s.saveLocked()
+	s.cfg = Clone(cfg)
+	if err := s.saveLocked(); err != nil {
+		return Config{}, err
+	}
+	return Clone(s.cfg), nil
 }
 
 func (s *Store) saveLocked() error {

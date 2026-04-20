@@ -19,9 +19,13 @@ let ui = {
 
 const SNAPSHOT_POLL_MS = 7000;
 
-function retentionMinutes() {
-  const n = Number(state?.retention_minutes || snapshot?.retention_minutes || 7);
+function retentionMinutesFor(source = state) {
+  const n = Number(source?.retention_minutes || snapshot?.retention_minutes || 7);
   return Number.isFinite(n) && n >= 1 ? Math.round(n) : 7;
+}
+
+function retentionMinutes() {
+  return retentionMinutesFor(state);
 }
 
 function retentionWindowMs() {
@@ -257,6 +261,30 @@ function clearFocus() {
   sessionStorage.setItem('pitchprox_conn_filter', ui.connFilter);
   renderObservability();
 }
+function makeProxyDraft(overrides = {}) {
+  return {
+    id: uid('proxy'),
+    name: '',
+    type: 'http',
+    address: '',
+    username: '',
+    password: '',
+    enabled: true,
+    __test_target: 'www.google.com:443',
+    ...clone(overrides || {}),
+  };
+}
+
+function makeChainDraft(overrides = {}) {
+  return {
+    id: uid('chain'),
+    name: '',
+    proxy_ids: [],
+    enabled: true,
+    ...clone(overrides || {}),
+  };
+}
+
 function makeRuleDraft(overrides = {}) {
   return {
     id: uid('rule'),
@@ -273,10 +301,9 @@ function makeRuleDraft(overrides = {}) {
   };
 }
 
-function defaultRuleInsertIndex() {
-  const rules = state.rules || [];
-  const defaultIdx = rules.findIndex((r) => String(r.id || '').toLowerCase() === 'default');
-  return defaultIdx >= 0 ? defaultIdx : rules.length;
+function defaultRuleInsertIndex(rules = state?.rules || []) {
+  const defaultIdx = (rules || []).findIndex((r) => String(r.id || '').toLowerCase() === 'default');
+  return defaultIdx >= 0 ? defaultIdx : (rules || []).length;
 }
 
 function buildPidRuleFromFocus() {
@@ -360,16 +387,17 @@ function stripUIFields(obj) {
   return out;
 }
 
-function collectConfig() {
+function collectConfig(source = state) {
+  const src = source || {};
   return {
-    version: state.version || 1,
-    updated_at: state.updated_at,
-    retention_minutes: retentionMinutes(),
-    http: stripUIFields(state.http || {}),
-    transparent: stripUIFields(state.transparent || {}),
-    proxies: (state.proxies || []).map(stripUIFields),
-    chains: (state.chains || []).map(stripUIFields),
-    rules: (state.rules || []).map(stripUIFields),
+    version: src.version || 1,
+    updated_at: src.updated_at,
+    retention_minutes: retentionMinutesFor(src),
+    http: stripUIFields(src.http || {}),
+    transparent: stripUIFields(src.transparent || {}),
+    proxies: (src.proxies || []).map(stripUIFields),
+    chains: (src.chains || []).map(stripUIFields),
+    rules: (src.rules || []).map(stripUIFields),
   };
 }
 
@@ -398,24 +426,31 @@ function restoreTransientState(nextState, transient) {
   return out;
 }
 
-async function persistConfig(successMessage = 'Сохранено') {
-  const transient = captureTransientState(state);
+async function persistState(nextState, successMessage = 'Сохранено') {
+  const transient = captureTransientState(nextState);
   ui.saving = true;
   updateStatusLine();
   try {
-    const saved = await api('/api/config', { method: 'PUT', body: JSON.stringify(collectConfig()) });
+    const saved = await api('/api/config', { method: 'PUT', body: JSON.stringify(collectConfig(nextState)) });
     state = restoreTransientState(saved, transient);
-    ui.saving = false;
     renderAll();
     flashStatus(successMessage);
     return true;
   } catch (e) {
-    ui.saving = false;
-    updateStatusLine();
+    console.error(e);
     flashStatus(`Ошибка сохранения: ${e.message}`, 'error', 6000);
     alert(`Ошибка сохранения: ${e.message}`);
-    throw e;
+    return false;
+  } finally {
+    ui.saving = false;
+    updateStatusLine();
   }
+}
+
+async function applyStateChange(mutator, successMessage = 'Сохранено') {
+  const next = clone(state || {});
+  mutator(next);
+  return persistState(next, successMessage);
 }
 
 async function loadConfig() {
@@ -451,7 +486,6 @@ function renderAll() {
   renderProxies();
   renderChains();
   renderObservability();
-  renderRules();
 }
 
 function renderProxies() {
@@ -498,11 +532,10 @@ function renderProxies() {
     row.querySelector('[data-role="target"]').addEventListener('input', (e) => { proxy.__test_target = e.target.value; });
     row.querySelector('[data-action="edit"]').onclick = () => openProxyEditor(idx);
     row.querySelector('[data-action="delete"]').onclick = async () => {
-      state.proxies.splice(idx, 1);
-      renderProxies();
-      renderRules();
-      renderChains();
-      await persistConfig('Прокси удалён');
+      await applyStateChange((next) => {
+        next.proxies = next.proxies || [];
+        next.proxies.splice(idx, 1);
+      }, 'Прокси удалён');
     };
     row.querySelector('[data-action="test"]').onclick = async () => {
       const btn = row.querySelector('[data-action="test"]');
@@ -554,10 +587,10 @@ function renderChains() {
     `;
     row.querySelector('[data-action="edit"]').onclick = () => openChainEditor(idx);
     row.querySelector('[data-action="delete"]').onclick = async () => {
-      state.chains.splice(idx, 1);
-      renderChains();
-      renderRules();
-      await persistConfig('Цепочка удалена');
+      await applyStateChange((next) => {
+        next.chains = next.chains || [];
+        next.chains.splice(idx, 1);
+      }, 'Цепочка удалена');
     };
     box.appendChild(row);
   });
@@ -648,9 +681,12 @@ function renderRules() {
     if (toggle) {
       toggle.onchange = async (e) => {
         e.stopPropagation();
-        state.rules[idx].enabled = !!toggle.checked;
-        renderRules();
-        await persistConfig(state.rules[idx].enabled ? 'Правило включено' : 'Правило отключено');
+        const nextEnabled = !!toggle.checked;
+        const ok = await applyStateChange((next) => {
+          next.rules = next.rules || [];
+          next.rules[idx].enabled = nextEnabled;
+        }, nextEnabled ? 'Правило включено' : 'Правило отключено');
+        if (!ok) toggle.checked = !!rule.enabled;
       };
       toggle.onclick = (e) => e.stopPropagation();
     }
@@ -659,18 +695,20 @@ function renderRules() {
     if (upBtn) upBtn.onclick = async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      moveItem(state.rules, idx, idx - 1);
-      renderRules();
-      await persistConfig('Порядок правил обновлён');
+      await applyStateChange((next) => {
+        next.rules = next.rules || [];
+        moveItem(next.rules, idx, idx - 1);
+      }, 'Порядок правил обновлён');
     };
 
     const downBtn = row.querySelector('[data-action="down"]');
     if (downBtn) downBtn.onclick = async (e) => {
       e.preventDefault();
       e.stopPropagation();
-      moveItem(state.rules, idx, idx + 1);
-      renderRules();
-      await persistConfig('Порядок правил обновлён');
+      await applyStateChange((next) => {
+        next.rules = next.rules || [];
+        moveItem(next.rules, idx, idx + 1);
+      }, 'Порядок правил обновлён');
     };
 
     box.appendChild(row);
@@ -748,25 +786,29 @@ function openSettingsEditor() {
       </div>
     `,
     onSave: async () => {
-      state.http = state.http || {};
-      state.transparent = state.transparent || {};
-      state.retention_minutes = Math.max(1, Number($('ed_retention_minutes').value || 7));
-      state.http.listen = $('ed_http_listen').value.trim();
-      state.transparent.listener_port = Number($('ed_listener_port').value || 0);
-      state.transparent.ipv4_listener = $('ed_ipv4_listener').value.trim();
-      state.transparent.ipv6_listener = $('ed_ipv6_listener').value.trim();
-      state.transparent.sniff_bytes = Number($('ed_sniff_bytes').value || 0);
-      state.transparent.sniff_timeout_ms = Number($('ed_sniff_timeout').value || 0);
-      await persistConfig('Параметры сохранены');
-      closeEditor();
+      const ok = await applyStateChange((next) => {
+        next.http = next.http || {};
+        next.transparent = next.transparent || {};
+        next.retention_minutes = Math.max(1, Number($('ed_retention_minutes').value || 7));
+        next.http.listen = $('ed_http_listen').value.trim();
+        next.transparent.listener_port = Number($('ed_listener_port').value || 0);
+        next.transparent.ipv4_listener = $('ed_ipv4_listener').value.trim();
+        next.transparent.ipv6_listener = $('ed_ipv6_listener').value.trim();
+        next.transparent.sniff_bytes = Number($('ed_sniff_bytes').value || 0);
+        next.transparent.sniff_timeout_ms = Number($('ed_sniff_timeout').value || 0);
+      }, 'Параметры сохранены');
+      if (ok) closeEditor();
     },
   });
 }
 
-function openProxyEditor(idx) {
-  const src = clone(state.proxies[idx]);
+function openProxyEditor(target, options = {}) {
+  const isDraft = !Number.isInteger(target) || !!options.isDraft;
+  const idx = Number.isInteger(target) ? target : -1;
+  const base = isDraft ? target : state.proxies[idx];
+  const src = clone(base || makeProxyDraft());
   openEditor({
-    title: 'Редактирование proxy',
+    title: isDraft ? 'Новый proxy' : 'Редактирование proxy',
     hint: 'Поддерживаются HTTP CONNECT и SOCKS5.',
     bodyHTML: `
       <div class="editor-grid two">
@@ -784,9 +826,10 @@ function openProxyEditor(idx) {
       </div>
     `,
     onSave: async () => {
-      state.proxies[idx] = {
-        ...state.proxies[idx],
-        id: $('ed_id').value.trim() || uid('proxy'),
+      const baseProxy = clone(src || makeProxyDraft());
+      const payload = {
+        ...baseProxy,
+        id: $('ed_id').value.trim() || src.id || uid('proxy'),
         name: $('ed_name').value.trim(),
         type: $('ed_type').value,
         address: $('ed_address').value.trim(),
@@ -794,17 +837,24 @@ function openProxyEditor(idx) {
         password: $('ed_password').value,
         enabled: $('ed_enabled').checked,
       };
-      await persistConfig('Прокси сохранён');
-      closeEditor();
+      const ok = await applyStateChange((next) => {
+        next.proxies = next.proxies || [];
+        if (isDraft) next.proxies.push(payload);
+        else next.proxies[idx] = { ...next.proxies[idx], ...payload };
+      }, 'Прокси сохранён');
+      if (ok) closeEditor();
     },
   });
 }
 
-function openChainEditor(idx) {
-  const src = clone(state.chains[idx]);
+function openChainEditor(target, options = {}) {
+  const isDraft = !Number.isInteger(target) || !!options.isDraft;
+  const idx = Number.isInteger(target) ? target : -1;
+  const base = isDraft ? target : state.chains[idx];
+  const src = clone(base || makeChainDraft());
   const proxyIDs = (src.proxy_ids || []).join('; ');
   openEditor({
-    title: 'Редактирование chain',
+    title: isDraft ? 'Новая chain' : 'Редактирование chain',
     hint: 'Proxy IDs перечисляются через ; в том порядке, в котором должны использоваться.',
     bodyHTML: `
       <div class="editor-grid two">
@@ -817,15 +867,20 @@ function openChainEditor(idx) {
       </div>
     `,
     onSave: async () => {
-      state.chains[idx] = {
-        ...state.chains[idx],
-        id: $('ed_id').value.trim() || uid('chain'),
+      const baseChain = clone(src || makeChainDraft());
+      const payload = {
+        ...baseChain,
+        id: $('ed_id').value.trim() || src.id || uid('chain'),
         name: $('ed_name').value.trim(),
         proxy_ids: splitTokens($('ed_proxy_ids').value),
         enabled: $('ed_enabled').checked,
       };
-      await persistConfig('Цепочка сохранена');
-      closeEditor();
+      const ok = await applyStateChange((next) => {
+        next.chains = next.chains || [];
+        if (isDraft) next.chains.push(payload);
+        else next.chains[idx] = { ...next.chains[idx], ...payload };
+      }, 'Цепочка сохранена');
+      if (ok) closeEditor();
     },
   });
 }
@@ -884,16 +939,19 @@ function openRuleEditor(target, options = {}) {
       };
       const delBtn = $('editorDeleteRuleBtn');
       if (delBtn) delBtn.onclick = async () => {
-        state.rules.splice(idx, 1);
-        await persistConfig('Правило удалено');
-        closeEditor();
+        const ok = await applyStateChange((next) => {
+          next.rules = next.rules || [];
+          next.rules.splice(idx, 1);
+        }, 'Правило удалено');
+        if (ok) closeEditor();
       };
     },
     onSave: async () => {
       const action = $('ed_action').value;
+      const baseRule = clone(src || makeRuleDraft());
       const payload = {
-        ...(isDraft ? {} : state.rules[idx]),
-        id: $('ed_id').value.trim() || uid('rule'),
+        ...baseRule,
+        id: $('ed_id').value.trim() || src.id || uid('rule'),
         name: $('ed_name').value.trim(),
         enabled: $('ed_enabled').checked,
         applications: $('ed_apps').value,
@@ -904,15 +962,18 @@ function openRuleEditor(target, options = {}) {
         chain_id: action === 'chain' ? $('ed_chain_id').value : '',
         notes: $('ed_notes').value,
       };
-      state.rules = state.rules || [];
-      if (isDraft) {
-        const at = Number.isInteger(options.insertAt) ? Math.max(0, Math.min(options.insertAt, state.rules.length)) : defaultRuleInsertIndex();
-        state.rules.splice(at, 0, payload);
-      } else {
-        state.rules[idx] = payload;
-      }
-      await persistConfig('Правило сохранено');
-      closeEditor();
+      const ok = await applyStateChange((next) => {
+        next.rules = next.rules || [];
+        if (isDraft) {
+          const at = Number.isInteger(options.insertAt)
+            ? Math.max(0, Math.min(options.insertAt, next.rules.length))
+            : defaultRuleInsertIndex(next.rules);
+          next.rules.splice(at, 0, payload);
+        } else {
+          next.rules[idx] = payload;
+        }
+      }, 'Правило сохранено');
+      if (ok) closeEditor();
     },
   });
 }
@@ -1481,14 +1542,10 @@ function startSnapshotPolling() {
 
 $('settingsBtn').onclick = openSettingsEditor;
 $('addProxyBtn').onclick = () => {
-  state.proxies = state.proxies || [];
-  state.proxies.push({ id: uid('proxy'), name: '', type: 'http', address: '', username: '', password: '', enabled: true, __test_target: 'www.google.com:443' });
-  openProxyEditor(state.proxies.length - 1);
+  openProxyEditor(makeProxyDraft(), { isDraft: true });
 };
 $('addChainBtn').onclick = () => {
-  state.chains = state.chains || [];
-  state.chains.push({ id: uid('chain'), name: '', proxy_ids: [], enabled: true });
-  openChainEditor(state.chains.length - 1);
+  openChainEditor(makeChainDraft(), { isDraft: true });
 };
 $('addRuleBtn').onclick = () => {
   openRuleEditor(makeRuleDraft(), { isDraft: true, insertAt: defaultRuleInsertIndex() });
@@ -1496,7 +1553,10 @@ $('addRuleBtn').onclick = () => {
 $('scrollLogsTopBtn').onclick = () => { $('logs').scrollTop = 0; };
 $('editorCloseBtn').onclick = closeEditor;
 $('editorCancelBtn').onclick = closeEditor;
-$('editorSaveBtn').onclick = async () => { if (typeof ui.editorSave === 'function') await ui.editorSave(); };
+$('editorSaveBtn').onclick = async () => {
+  if (typeof ui.editorSave !== 'function') return;
+  await ui.editorSave();
+};
 $('editorDialog').addEventListener('cancel', (e) => { e.preventDefault(); closeEditor(); });
 window.addEventListener('resize', () => renderActivityChart());
 document.addEventListener('visibilitychange', () => {

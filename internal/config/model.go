@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -151,7 +152,7 @@ func Normalize(cfg *Config) {
 			r.ChainID = ""
 		case ActionChain:
 			r.ProxyID = ""
-		default:
+		case ActionDirect, ActionBlock:
 			r.ProxyID = ""
 			r.ChainID = ""
 		}
@@ -170,7 +171,10 @@ func normalizeProxyType(v string) string {
 }
 
 func normalizeAction(v RuleAction) RuleAction {
-	switch strings.ToLower(strings.TrimSpace(string(v))) {
+	normalized := strings.ToLower(strings.TrimSpace(string(v)))
+	switch normalized {
+	case "", string(ActionDirect):
+		return ActionDirect
 	case string(ActionProxy):
 		return ActionProxy
 	case string(ActionChain):
@@ -178,8 +182,20 @@ func normalizeAction(v RuleAction) RuleAction {
 	case string(ActionBlock):
 		return ActionBlock
 	default:
-		return ActionDirect
+		return RuleAction(normalized)
 	}
+}
+
+func Clone(cfg Config) Config {
+	return cloneConfig(cfg)
+}
+
+func Canonicalize(cfg Config) (Config, error) {
+	Normalize(&cfg)
+	if err := Validate(cfg); err != nil {
+		return Config{}, err
+	}
+	return Clone(cfg), nil
 }
 
 func Validate(cfg Config) error {
@@ -187,13 +203,24 @@ func Validate(cfg Config) error {
 	if cfg.HTTP.Listen == "" {
 		return fmt.Errorf("http.listen is required")
 	}
+	if _, _, err := net.SplitHostPort(cfg.HTTP.Listen); err != nil {
+		return fmt.Errorf("http.listen must be host:port: %v", err)
+	}
 	if cfg.Transparent.ListenerPort < 1 || cfg.Transparent.ListenerPort > 65535 {
 		return fmt.Errorf("transparent.listener_port must be in 1..65535")
+	}
+	if cfg.Transparent.SniffBytes < 1 || cfg.Transparent.SniffBytes > 1<<20 {
+		return fmt.Errorf("transparent.sniff_bytes must be in 1..1048576")
+	}
+	if cfg.Transparent.SniffTimeout < 1 || cfg.Transparent.SniffTimeout > 60000 {
+		return fmt.Errorf("transparent.sniff_timeout_ms must be in 1..60000")
 	}
 	if cfg.RetentionMinutes < 1 || cfg.RetentionMinutes > 1440 {
 		return fmt.Errorf("retention_minutes must be in 1..1440")
 	}
+
 	seenProxy := map[string]struct{}{}
+	enabledProxy := map[string]struct{}{}
 	for _, p := range cfg.Proxies {
 		if p.ID == "" {
 			return fmt.Errorf("proxy id is required")
@@ -205,13 +232,21 @@ func Validate(cfg Config) error {
 		switch p.Type {
 		case "http", "socks5":
 		default:
-			return fmt.Errorf("proxy %q has unsupported type %q", p.Name, p.Type)
+			return fmt.Errorf("proxy %q has unsupported type %q", label(p.Name, p.ID), p.Type)
 		}
 		if p.Address == "" {
-			return fmt.Errorf("proxy %q address is required", p.Name)
+			return fmt.Errorf("proxy %q address is required", label(p.Name, p.ID))
+		}
+		if _, _, err := net.SplitHostPort(p.Address); err != nil {
+			return fmt.Errorf("proxy %q address must be host:port: %v", label(p.Name, p.ID), err)
+		}
+		if p.Enabled {
+			enabledProxy[p.ID] = struct{}{}
 		}
 	}
+
 	seenChain := map[string]struct{}{}
+	enabledChain := map[string]struct{}{}
 	for _, c := range cfg.Chains {
 		if c.ID == "" {
 			return fmt.Errorf("chain id is required")
@@ -220,12 +255,24 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("duplicate chain id %q", c.ID)
 		}
 		seenChain[c.ID] = struct{}{}
+		if c.Enabled && len(c.ProxyIDs) == 0 {
+			return fmt.Errorf("enabled chain %q must contain at least one proxy", label(c.Name, c.ID))
+		}
 		for _, id := range c.ProxyIDs {
 			if _, ok := seenProxy[id]; !ok {
-				return fmt.Errorf("chain %q references unknown proxy %q", c.Name, id)
+				return fmt.Errorf("chain %q references unknown proxy %q", label(c.Name, c.ID), id)
+			}
+			if c.Enabled {
+				if _, ok := enabledProxy[id]; !ok {
+					return fmt.Errorf("enabled chain %q references disabled proxy %q", label(c.Name, c.ID), id)
+				}
 			}
 		}
+		if c.Enabled {
+			enabledChain[c.ID] = struct{}{}
+		}
 	}
+
 	seenRule := map[string]struct{}{}
 	for _, r := range cfg.Rules {
 		if r.ID == "" {
@@ -238,14 +285,37 @@ func Validate(cfg Config) error {
 		switch r.Action {
 		case ActionDirect, ActionProxy, ActionChain, ActionBlock:
 		default:
-			return fmt.Errorf("rule %q has unsupported action %q", r.Name, r.Action)
+			return fmt.Errorf("rule %q has unsupported action %q", label(r.Name, r.ID), r.Action)
 		}
 		if r.Action == ActionProxy && r.ProxyID == "" {
-			return fmt.Errorf("rule %q uses action=proxy but proxy_id is empty", r.Name)
+			return fmt.Errorf("rule %q uses action=proxy but proxy_id is empty", label(r.Name, r.ID))
 		}
 		if r.Action == ActionChain && r.ChainID == "" {
-			return fmt.Errorf("rule %q uses action=chain but chain_id is empty", r.Name)
+			return fmt.Errorf("rule %q uses action=chain but chain_id is empty", label(r.Name, r.ID))
+		}
+		if !r.Enabled {
+			continue
+		}
+		switch r.Action {
+		case ActionProxy:
+			if _, ok := enabledProxy[r.ProxyID]; !ok {
+				return fmt.Errorf("enabled rule %q references unknown or disabled proxy %q", label(r.Name, r.ID), r.ProxyID)
+			}
+		case ActionChain:
+			if _, ok := enabledChain[r.ChainID]; !ok {
+				return fmt.Errorf("enabled rule %q references unknown or disabled chain %q", label(r.Name, r.ID), r.ChainID)
+			}
 		}
 	}
 	return nil
+}
+
+func label(name, id string) string {
+	if v := strings.TrimSpace(name); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(id); v != "" {
+		return v
+	}
+	return ""
 }

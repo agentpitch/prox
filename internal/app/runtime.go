@@ -52,7 +52,7 @@ func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
 		store:               st,
 		monitor:             bus,
 		flows:               proxy.NewFlowTable(),
-		cfg:                 cfg,
+		cfg:                 config.Clone(cfg),
 		engine:              eng,
 		computerName:        computerName,
 		interceptionEnabled: !eng.AllEnabledActionsDirect(),
@@ -64,7 +64,7 @@ func (r *Runtime) Monitor() *monitor.Bus { return r.monitor }
 func (r *Runtime) CurrentConfig() config.Config {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.cfg
+	return config.Clone(r.cfg)
 }
 
 func (r *Runtime) WebUIURL() string {
@@ -76,26 +76,37 @@ func (r *Runtime) TrayView(seconds int) monitor.TrayView {
 }
 
 func (r *Runtime) UpdateConfig(cfg config.Config) error {
+	cfg, err := config.Canonicalize(cfg)
+	if err != nil {
+		return err
+	}
 	eng, err := rules.Compile(cfg, r.computerName)
 	if err != nil {
 		return err
 	}
-	old := r.CurrentConfig()
+
+	r.mu.RLock()
+	old := config.Clone(r.cfg)
 	oldInterception := r.interceptionEnabled
-	if err := r.store.Save(cfg); err != nil {
+	r.mu.RUnlock()
+
+	savedCfg, err := r.store.Save(cfg)
+	if err != nil {
 		return err
 	}
+
 	r.mu.Lock()
-	r.cfg = cfg
+	r.cfg = config.Clone(savedCfg)
 	r.engine = eng
 	r.interceptionEnabled = !eng.AllEnabledActionsDirect()
 	r.mu.Unlock()
-	r.monitor.SetRetentionWindow(time.Duration(cfg.RetentionMinutes) * time.Minute)
+
+	r.monitor.SetRetentionWindow(time.Duration(savedCfg.RetentionMinutes) * time.Minute)
 	r.monitor.AddLog("info", "configuration updated")
-	if old.HTTP.Listen != cfg.HTTP.Listen ||
-		old.Transparent.ListenerPort != cfg.Transparent.ListenerPort ||
-		old.Transparent.IPv4Listener != cfg.Transparent.IPv4Listener ||
-		old.Transparent.IPv6Listener != cfg.Transparent.IPv6Listener {
+	if old.HTTP.Listen != savedCfg.HTTP.Listen ||
+		old.Transparent.ListenerPort != savedCfg.Transparent.ListenerPort ||
+		old.Transparent.IPv4Listener != savedCfg.Transparent.IPv4Listener ||
+		old.Transparent.IPv6Listener != savedCfg.Transparent.IPv6Listener {
 		r.monitor.AddLog("warn", "listener changes require service restart to take effect")
 	}
 	if oldInterception != (!eng.AllEnabledActionsDirect()) {

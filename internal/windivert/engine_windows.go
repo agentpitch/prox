@@ -65,6 +65,7 @@ const (
 	runnerMaxAge            = 45 * time.Second
 	runnerGraceAge          = 8 * time.Second
 	runnerMapCompactDeletes = 256
+	ownerRefreshMaxAge      = 2 * time.Second
 )
 
 func (e *Engine) Start(ctx context.Context) error {
@@ -83,10 +84,10 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	e.classifier = h
 	e.owners = win.NewOwnerCache(2 * time.Second)
+	_ = e.owners.ForceRefresh()
 	e.runners = map[flowKey]*flowRunner{}
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
-	e.owners.Start(ctx)
 	e.wg.Add(2)
 	go e.classifierLoop(ctx)
 	go e.cleanup(ctx)
@@ -219,6 +220,7 @@ func (e *Engine) isLocal(ip netip.Addr) bool {
 
 func (e *Engine) lookup(pkt Packet) (uint32, string, int, bool) {
 	tries := 1
+	_ = e.owners.RefreshIfStale(ownerRefreshMaxAge)
 	if pid, exe, ok := e.owners.Lookup(pkt.Src, pkt.SrcPort, pkt.Dst, pkt.DstPort); ok {
 		return pid, exe, tries, true
 	}

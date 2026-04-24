@@ -45,14 +45,15 @@ func (o *directObserver) Start(ctx context.Context) {
 		list = win.ListTCPConnections
 	}
 	seen := map[string]monitor.Connection{}
+	timer := time.NewTimer(time.Hour)
+	stopAndDrainTimer(timer)
+	defer timer.Stop()
 	for {
 		if o.Monitor.UIActive() {
 			seen = o.scan(list, seen)
-			select {
-			case <-ctx.Done():
+			if !waitObserverTimer(ctx, timer, nil, activeInterval) {
 				o.finalizeAll(seen)
 				return
-			case <-time.After(activeInterval):
 			}
 			continue
 		}
@@ -62,18 +63,46 @@ func (o *directObserver) Start(ctx context.Context) {
 		}
 		wake := o.Monitor.UIWake()
 		if wake == nil {
-			select {
-			case <-ctx.Done():
+			if !waitObserverTimer(ctx, timer, nil, dormantInterval) {
 				return
-			case <-time.After(dormantInterval):
 			}
 			continue
 		}
+		if !waitObserverTimer(ctx, timer, wake, dormantInterval) {
+			return
+		}
+	}
+}
+
+func waitObserverTimer(ctx context.Context, timer *time.Timer, wake <-chan struct{}, d time.Duration) bool {
+	timer.Reset(d)
+	defer stopAndDrainTimer(timer)
+	if wake == nil {
 		select {
 		case <-ctx.Done():
-			return
-		case <-wake:
-		case <-time.After(dormantInterval):
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }

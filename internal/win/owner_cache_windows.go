@@ -83,6 +83,20 @@ func (c *OwnerCache) Start(ctx context.Context) {
 	}()
 }
 
+func (c *OwnerCache) RefreshIfStale(maxAge time.Duration) error {
+	if maxAge <= 0 {
+		return c.ForceRefresh()
+	}
+	now := time.Now().UTC()
+	c.mu.RLock()
+	fresh := !c.lastRefresh.IsZero() && now.Sub(c.lastRefresh) < maxAge
+	c.mu.RUnlock()
+	if fresh {
+		return nil
+	}
+	return c.ForceRefresh()
+}
+
 func (c *OwnerCache) Lookup(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16) (uint32, string, bool) {
 	srcIP = srcIP.Unmap()
 	dstIP = dstIP.Unmap()

@@ -63,6 +63,7 @@ const (
 	ninKeySelect       = 0x0401
 	menuManage         = 1001
 	menuExit           = 1002
+	menuDisableWebUI   = 1003
 	offlineExitAfter   = 15 * time.Second
 	pollInterval       = 2 * time.Second
 	trayHistorySeconds = 12
@@ -73,6 +74,12 @@ type Provider interface {
 	TrayView(seconds int) (monitor.TrayView, error)
 	OpenURL() string
 	RequestStop() error
+}
+
+type WebUIController interface {
+	WebUIRunning() bool
+	EnableWebUI() error
+	DisableWebUI() error
 }
 
 type Options struct {
@@ -341,6 +348,14 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 }
 
 func (h *helper) openManagement() {
+	if ctl := h.webUIController(); ctl != nil {
+		if err := ctl.EnableWebUI(); err != nil {
+			return
+		}
+		if h.provider != nil {
+			h.url = trimTrailingSlash(h.provider.OpenURL())
+		}
+	}
 	if h.url != "" {
 		_ = util.OpenBrowser(h.url)
 	}
@@ -353,8 +368,12 @@ func (h *helper) showContextMenu() {
 	}
 	defer procDestroyMenu.Call(menu)
 	manageText, _ := windows.UTF16PtrFromString("Управление")
+	disableWebUIText, _ := windows.UTF16PtrFromString("Отключить WebUI")
 	exitText, _ := windows.UTF16PtrFromString("Выйти")
 	procAppendMenuW.Call(menu, mfString, menuManage, uintptr(unsafe.Pointer(manageText)))
+	if ctl := h.webUIController(); ctl != nil && ctl.WebUIRunning() {
+		procAppendMenuW.Call(menu, mfString, menuDisableWebUI, uintptr(unsafe.Pointer(disableWebUIText)))
+	}
 	procAppendMenuW.Call(menu, mfString, menuExit, uintptr(unsafe.Pointer(exitText)))
 	anchor, flags := h.menuAnchor()
 	procSetForegroundWindow.Call(uintptr(h.hwnd))
@@ -371,12 +390,28 @@ func (h *helper) showContextMenu() {
 	switch uint32(r1) {
 	case menuManage:
 		h.openManagement()
+	case menuDisableWebUI:
+		h.disableWebUI()
 	case menuExit:
 		go h.requestProgramStop()
 	}
 	if h.iconHandle != 0 {
 		nid := h.notifyData(h.iconHandle, "")
 		procShellNotifyIconW.Call(nimSetFocus, uintptr(unsafe.Pointer(&nid)))
+	}
+}
+
+func (h *helper) webUIController() WebUIController {
+	if h.provider == nil {
+		return nil
+	}
+	ctl, _ := h.provider.(WebUIController)
+	return ctl
+}
+
+func (h *helper) disableWebUI() {
+	if ctl := h.webUIController(); ctl != nil {
+		_ = ctl.DisableWebUI()
 	}
 }
 
@@ -510,6 +545,10 @@ func (h *helper) setOfflineIcon() {
 
 func (h *helper) setTrafficIcon(view monitor.TrayView) {
 	history, rx, tx, peakRx, peakTx := trafficSeries(view.Traffic)
+	signature := trafficSignature(history)
+	if signature == h.lastIconSignature {
+		return
+	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
 	baseline := 13
 	axis := color.NRGBA{R: 148, G: 163, B: 184, A: 210}
@@ -535,7 +574,7 @@ func (h *helper) setTrafficIcon(view monitor.TrayView) {
 		drawFilledSeries(img, history, func(p trafficPoint) int64 { return p.RxBytes }, rxFill, rxLine)
 	}
 	tooltip := fmt.Sprintf("pitchProx · ↓ %s/s (peak %s/s) · ↑ %s/s (peak %s/s)", formatBytes(rx), formatBytes(peakRx), formatBytes(tx), formatBytes(peakTx))
-	_ = h.updateIcon(img, tooltip, trafficSignature(history))
+	_ = h.updateIcon(img, tooltip, signature)
 }
 
 type trafficPoint struct {
@@ -546,25 +585,31 @@ type trafficPoint struct {
 
 func trafficSeries(samples []monitor.TrafficSample) ([]trafficPoint, int64, int64, int64, int64) {
 	now := time.Now().UTC().Truncate(time.Second)
-	buckets := map[int64]monitor.TrafficSample{}
+	history := make([]trafficPoint, 0, trayHistorySeconds)
+	start := now.Add(-time.Duration(trayHistorySeconds-1) * time.Second)
+	for i := trayHistorySeconds - 1; i >= 0; i-- {
+		history = append(history, trafficPoint{Time: now.Add(-time.Duration(i) * time.Second)})
+	}
 	for _, s := range samples {
-		buckets[s.Time.UTC().Truncate(time.Second).Unix()] = s
+		ts := s.Time.UTC().Truncate(time.Second)
+		offset := int(ts.Sub(start) / time.Second)
+		if offset < 0 || offset >= len(history) {
+			continue
+		}
+		history[offset].RxBytes += s.DownBytes
+		history[offset].TxBytes += s.UpBytes
 	}
 	var currentRx, currentTx, peakRx, peakTx int64
-	history := make([]trafficPoint, 0, trayHistorySeconds)
-	for i := trayHistorySeconds - 1; i >= 0; i-- {
-		t := now.Add(-time.Duration(i) * time.Second)
-		s := buckets[t.Unix()]
-		history = append(history, trafficPoint{Time: t, RxBytes: s.DownBytes, TxBytes: s.UpBytes})
-		if s.DownBytes > peakRx {
-			peakRx = s.DownBytes
+	for i, p := range history {
+		if p.RxBytes > peakRx {
+			peakRx = p.RxBytes
 		}
-		if s.UpBytes > peakTx {
-			peakTx = s.UpBytes
+		if p.TxBytes > peakTx {
+			peakTx = p.TxBytes
 		}
-		if i == 0 {
-			currentRx = s.DownBytes
-			currentTx = s.UpBytes
+		if i == len(history)-1 {
+			currentRx = p.RxBytes
+			currentTx = p.TxBytes
 		}
 	}
 	return history, currentRx, currentTx, peakRx, peakTx

@@ -35,6 +35,7 @@ type Server struct {
 	Runtime  Runtime
 	StopFunc func()
 
+	addr     string
 	staticFS fs.FS
 
 	mu        sync.Mutex
@@ -42,6 +43,7 @@ type Server struct {
 	conns     map[net.Conn]struct{}
 	closeCh   chan struct{}
 	closeOnce sync.Once
+	closed    bool
 	wg        sync.WaitGroup
 }
 
@@ -70,6 +72,7 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 	return &Server{
 		Runtime:  rt,
 		StopFunc: stopFunc,
+		addr:     addr,
 		staticFS: sub,
 		conns:    map[net.Conn]struct{}{},
 		closeCh:  make(chan struct{}),
@@ -77,15 +80,54 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 }
 
 func (s *Server) Start() error {
-	cfg := s.Runtime.CurrentConfig()
-	addr := cfg.HTTP.Listen
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve()
+}
+
+func (s *Server) Listen() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	if s.listener != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	addr := s.addr
+	if addr == "" {
+		addr = s.Runtime.CurrentConfig().HTTP.Listen
+	}
+	s.mu.Unlock()
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return ErrClosed
+	}
 	s.listener = ln
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) Serve() error {
+	s.mu.Lock()
+	ln := s.listener
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	if ln == nil {
+		return fmt.Errorf("http server listener is not initialized")
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -95,7 +137,9 @@ func (s *Server) Start() error {
 			}
 			return err
 		}
-		s.trackConn(conn)
+		if !s.trackConn(conn) {
+			continue
+		}
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
@@ -108,8 +152,9 @@ func (s *Server) Start() error {
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
-		close(s.closeCh)
 		s.mu.Lock()
+		s.closed = true
+		close(s.closeCh)
 		ln := s.listener
 		for conn := range s.conns {
 			_ = conn.Close()
@@ -126,10 +171,16 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) trackConn(conn net.Conn) {
+func (s *Server) trackConn(conn net.Conn) bool {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
 	s.conns[conn] = struct{}{}
 	s.mu.Unlock()
+	return true
 }
 
 func (s *Server) untrackConn(conn net.Conn) {

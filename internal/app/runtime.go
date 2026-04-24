@@ -115,9 +115,24 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 	return nil
 }
 
-func (r *Runtime) Start(ctx context.Context) error {
+func (r *Runtime) Start(ctx context.Context) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	r.runCancel = cancel
+	defer func() {
+		if err == nil {
+			return
+		}
+		cancel()
+		r.runCancel = nil
+		if r.divert != nil {
+			_ = r.divert.Close()
+			r.divert = nil
+		}
+		if r.proxyServer != nil {
+			_ = r.proxyServer.Close()
+			r.proxyServer = nil
+		}
+	}()
 	cfg := r.CurrentConfig()
 	r.directObserver = &directObserver{
 		Monitor:         r.monitor,
@@ -154,7 +169,6 @@ func (r *Runtime) Start(ctx context.Context) error {
 		Plan:         r.planFlow,
 	}
 	if err := r.divert.Start(ctx); err != nil {
-		_ = r.proxyServer.Close()
 		return fmt.Errorf("start WinDivert engine: %w", err)
 	}
 	r.monitor.AddLog("info", "runtime started with selective interception fast-path")

@@ -140,14 +140,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	if !ok {
 		return
 	}
-	flow, ok := s.Flows.Lookup(clientAP.Addr(), clientAP.Port())
+	flow, ok := s.Flows.MarkAccepted(clientAP.Addr(), clientAP.Port())
 	if !ok {
 		if s.Monitor != nil {
 			s.Monitor.AddLog("warn", "no flow for redirected connection from %s", clientAP)
 		}
 		return
 	}
-	s.Flows.Touch(flow.ClientIP, flow.ClientPort)
 	defer s.Flows.Delete(flow.ClientIP, flow.ClientPort)
 
 	br, sniff, err := PeekAndSniff(conn, s.SniffBytes, s.SniffTimeout)

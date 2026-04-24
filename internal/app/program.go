@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"runtime/debug"
 	"sync"
 
 	"github.com/openai/pitchprox/internal/httpapi"
@@ -49,13 +48,14 @@ func (p *Program) Start(ctx context.Context) error {
 func (p *Program) WebUIRunning() bool {
 	p.httpMu.Lock()
 	defer p.httpMu.Unlock()
-	return p.http != nil
+	return p.http != nil && p.http.WebUIEnabled()
 }
 
 func (p *Program) EnableWebUI() error {
 	p.httpMu.Lock()
 	defer p.httpMu.Unlock()
 	if p.http != nil {
+		p.http.SetWebUIEnabled(true)
 		return nil
 	}
 	srv, err := httpapi.New(p.runtime.CurrentConfig().HTTP.Listen, p.runtime, p.RequestStop)
@@ -86,19 +86,22 @@ func (p *Program) EnableWebUI() error {
 func (p *Program) DisableWebUI() error {
 	p.httpMu.Lock()
 	srv := p.http
-	p.http = nil
 	p.httpMu.Unlock()
 	if srv == nil {
 		return nil
 	}
-	p.runtime.Monitor().MarkUIInactive()
-	err := srv.Close()
-	debug.FreeOSMemory()
-	return err
+	srv.SetWebUIEnabled(false)
+	return nil
 }
 
 func (p *Program) Stop() error {
-	_ = p.DisableWebUI()
+	p.httpMu.Lock()
+	srv := p.http
+	p.http = nil
+	p.httpMu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+	}
 	if p.runtime != nil {
 		_ = p.runtime.Stop()
 	}

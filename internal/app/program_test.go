@@ -40,14 +40,18 @@ func TestProgramCanDisableAndReenableWebUI(t *testing.T) {
 	if prog.WebUIRunning() {
 		t.Fatal("WebUIRunning = true after disable")
 	}
-	if canDial(cfg.HTTP.Listen) {
-		t.Fatal("web UI socket still accepts connections after disable")
+	waitHTTPHealth(t, cfg.HTTP.Listen)
+	if status := httpStatus(t, "http://"+cfg.HTTP.Listen+"/"); status != http.StatusServiceUnavailable {
+		t.Fatalf("GET / status after disable = %d, want %d", status, http.StatusServiceUnavailable)
 	}
 
 	if err := prog.EnableWebUI(); err != nil {
 		t.Fatalf("EnableWebUI: %v", err)
 	}
 	waitHTTPHealth(t, cfg.HTTP.Listen)
+	if status := httpStatus(t, "http://"+cfg.HTTP.Listen+"/"); status != http.StatusOK {
+		t.Fatalf("GET / status after re-enable = %d, want %d", status, http.StatusOK)
+	}
 	if !prog.WebUIRunning() {
 		t.Fatal("WebUIRunning = false after re-enable")
 	}
@@ -84,11 +88,13 @@ func waitHTTPHealth(t *testing.T, addr string) {
 	t.Fatalf("timed out waiting for %s", url)
 }
 
-func canDial(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+func httpStatus(t *testing.T, url string) int {
+	t.Helper()
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(url)
 	if err != nil {
-		return false
+		t.Fatalf("GET %s: %v", url, err)
 	}
-	_ = conn.Close()
-	return true
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

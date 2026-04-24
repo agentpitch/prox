@@ -162,6 +162,25 @@ func TestHostWildcardAndRangeMatching(t *testing.T) {
 	}
 }
 
+func TestIPv4StarGlobCompilesToRange(t *testing.T) {
+	hosts, any, err := parseHosts("192.168.*.*")
+	if err != nil {
+		t.Fatalf("parseHosts: %v", err)
+	}
+	if any || len(hosts) != 1 {
+		t.Fatalf("hosts = %+v any=%v, want one concrete range", hosts, any)
+	}
+	if hosts[0].kind != hostIPRange {
+		t.Fatalf("host kind = %d, want hostIPRange", hosts[0].kind)
+	}
+	if !hosts[0].ip.IsValid() || !hosts[0].end.IsValid() {
+		t.Fatalf("range bounds invalid: %+v", hosts[0])
+	}
+	if hosts[0].ip.String() != "192.168.0.0" || hosts[0].end.String() != "192.168.255.255" {
+		t.Fatalf("range = %s-%s, want 192.168.0.0-192.168.255.255", hosts[0].ip, hosts[0].end)
+	}
+}
+
 func TestExactUserSyntaxExamples(t *testing.T) {
 	cfg := config.Config{Rules: []config.Rule{{
 		ID:      "r1",

@@ -14,6 +14,7 @@ type Flow struct {
 	OriginalIP   netip.Addr
 	OriginalPort uint16
 	IPv6         bool
+	Accepted     bool // owned by an accepted transparent connection; deleted on connection close.
 	CreatedAt    time.Time
 	LastSeen     time.Time
 }
@@ -30,6 +31,14 @@ type FlowTable struct {
 }
 
 const flowMapCompactDeletes = 256
+
+type RedirectDirection uint8
+
+const (
+	RedirectNone RedirectDirection = iota
+	RedirectAppToListener
+	RedirectListenerToApp
+)
 
 func NewFlowTable() *FlowTable { return &FlowTable{flows: map[flowKey]Flow{}} }
 
@@ -51,14 +60,43 @@ func (t *FlowTable) Lookup(clientIP netip.Addr, clientPort uint16) (Flow, bool) 
 	return f, ok
 }
 
-func (t *FlowTable) Touch(clientIP netip.Addr, clientPort uint16) {
+func (t *FlowTable) Len() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.flows)
+}
+
+func (t *FlowTable) MarkAccepted(clientIP netip.Addr, clientPort uint16) (Flow, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	k := makeFlowKey(clientIP, clientPort)
-	if f, ok := t.flows[k]; ok {
-		f.LastSeen = time.Now().UTC()
-		t.flows[k] = f
+	f, ok := t.flows[k]
+	if !ok {
+		return Flow{}, false
 	}
+	f.Accepted = true
+	f.LastSeen = time.Now().UTC()
+	t.flows[k] = f
+	return f, true
+}
+
+func (t *FlowTable) RedirectPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16, listenerPort uint16) (Flow, RedirectDirection, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if srcPort == listenerPort {
+		f, ok := t.flows[makeFlowKey(dstIP, dstPort)]
+		if ok {
+			return f, RedirectListenerToApp, true
+		}
+	}
+	f, ok := t.flows[makeFlowKey(srcIP, srcPort)]
+	if !ok {
+		return Flow{}, RedirectNone, false
+	}
+	if f.OriginalIP == dstIP && f.OriginalPort == dstPort {
+		return f, RedirectAppToListener, true
+	}
+	return Flow{}, RedirectNone, false
 }
 
 func (t *FlowTable) Delete(clientIP netip.Addr, clientPort uint16) {
@@ -67,32 +105,12 @@ func (t *FlowTable) Delete(clientIP netip.Addr, clientPort uint16) {
 	t.deleteLocked(makeFlowKey(clientIP, clientPort))
 }
 
-func (t *FlowTable) FindAppPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16) (Flow, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	f, ok := t.flows[makeFlowKey(srcIP, srcPort)]
-	if !ok {
-		return Flow{}, false
-	}
-	if f.OriginalIP == dstIP && f.OriginalPort == dstPort {
-		return f, true
-	}
-	return Flow{}, false
-}
-
-func (t *FlowTable) FindListenerPacket(dstIP netip.Addr, dstPort uint16) (Flow, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	f, ok := t.flows[makeFlowKey(dstIP, dstPort)]
-	return f, ok
-}
-
 func (t *FlowTable) Cleanup(maxAge time.Duration) {
 	cutoff := time.Now().UTC().Add(-maxAge)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for k, f := range t.flows {
-		if f.LastSeen.Before(cutoff) {
+		if !f.Accepted && f.LastSeen.Before(cutoff) {
 			t.deleteLocked(k)
 		}
 	}
@@ -109,7 +127,9 @@ func (t *FlowTable) deleteLocked(k flowKey) {
 
 func (t *FlowTable) compactMaybeLocked() {
 	if len(t.flows) == 0 {
-		t.flows = map[flowKey]Flow{}
+		if t.deletes >= flowMapCompactDeletes {
+			t.flows = map[flowKey]Flow{}
+		}
 		t.deletes = 0
 		return
 	}

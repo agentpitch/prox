@@ -185,7 +185,7 @@ func (r CompiledRule) matchHost(hostname string, ip netip.Addr, computerName str
 		return true
 	}
 	h := strings.ToLower(strings.TrimSpace(hostname))
-	ipStr := strings.ToLower(ip.String())
+	ipStr := ""
 	for _, p := range r.hosts {
 		switch p.kind {
 		case hostAny:
@@ -215,6 +215,9 @@ func (r CompiledRule) matchHost(hostname string, ip netip.Addr, computerName str
 				return true
 			}
 		case hostGlobIP:
+			if ipStr == "" && ip.IsValid() {
+				ipStr = strings.ToLower(ip.String())
+			}
 			if ip.IsValid() && wildcardMatch(p.raw, ipStr) {
 				return true
 			}

@@ -207,4 +207,6 @@ The tray icon is a miniature filled graph:
   - `Disable WebUI` / `Отключить WebUI` when WebUI is currently running
   - `Выйти`
 
+`Disable WebUI` / `Отключить WebUI` disables static WebUI pages, configuration API, snapshots, and SSE streams while keeping the lightweight health/tray/control endpoints available. This lets both desktop tray and standalone `tray --url` mode re-enable WebUI on double click.
+
 `Выйти` stops the whole desktop runtime, not only the tray icon.

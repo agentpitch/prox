@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"path"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,9 @@ type Server struct {
 	closeOnce sync.Once
 	closed    bool
 	wg        sync.WaitGroup
+
+	webUIMu      sync.RWMutex
+	webUIEnabled bool
 }
 
 type proxyTestRequest struct {
@@ -70,12 +74,13 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		Runtime:  rt,
-		StopFunc: stopFunc,
-		addr:     addr,
-		staticFS: sub,
-		conns:    map[net.Conn]struct{}{},
-		closeCh:  make(chan struct{}),
+		Runtime:      rt,
+		StopFunc:     stopFunc,
+		addr:         addr,
+		staticFS:     sub,
+		conns:        map[net.Conn]struct{}{},
+		closeCh:      make(chan struct{}),
+		webUIEnabled: true,
 	}, nil
 }
 
@@ -198,6 +203,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		writeText(conn, 400, err.Error())
 		return
 	}
+	if !s.WebUIEnabled() && !isWebUIControlPath(req.Path) {
+		writeText(conn, 503, "WebUI disabled")
+		return
+	}
 	if shouldMarkUIActive(req.Path) {
 		s.Runtime.Monitor().MarkUIActive()
 	}
@@ -218,6 +227,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleProxyTest(conn, req)
 	case "/api/control/stop":
 		s.handleControlStop(conn, req)
+	case "/api/control/webui/status":
+		s.handleWebUIStatus(conn)
+	case "/api/control/webui/enable":
+		s.handleWebUIEnable(conn, req)
+	case "/api/control/webui/disable":
+		s.handleWebUIDisable(conn, req)
 	default:
 		if strings.HasPrefix(req.Path, "/api/") {
 			writeText(conn, 404, "not found")
@@ -229,6 +244,52 @@ func (s *Server) handleConn(conn net.Conn) {
 
 func (s *Server) handleHealth(conn net.Conn) {
 	writeJSON(conn, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) WebUIEnabled() bool {
+	s.webUIMu.RLock()
+	defer s.webUIMu.RUnlock()
+	return s.webUIEnabled
+}
+
+func (s *Server) SetWebUIEnabled(enabled bool) {
+	s.webUIMu.Lock()
+	changed := s.webUIEnabled != enabled
+	s.webUIEnabled = enabled
+	s.webUIMu.Unlock()
+	if !enabled {
+		s.Runtime.Monitor().DisableUI()
+		debug.FreeOSMemory()
+	}
+	if changed {
+		state := "disabled"
+		if enabled {
+			state = "enabled"
+		}
+		s.Runtime.Monitor().AddLog("info", "WebUI %s", state)
+	}
+}
+
+func (s *Server) handleWebUIStatus(conn net.Conn) {
+	writeJSON(conn, 200, map[string]bool{"enabled": s.WebUIEnabled()})
+}
+
+func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	s.SetWebUIEnabled(true)
+	writeJSON(conn, 200, map[string]bool{"enabled": true})
+}
+
+func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	s.SetWebUIEnabled(false)
+	writeJSON(conn, 200, map[string]bool{"enabled": false})
 }
 
 func (s *Server) handleConfig(conn net.Conn, req request) {
@@ -568,9 +629,18 @@ func shouldMarkUIActive(path string) bool {
 		return false
 	}
 	switch path {
-	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility":
+	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable":
 		return false
 	default:
 		return true
+	}
+}
+
+func isWebUIControlPath(path string) bool {
+	switch path {
+	case "/api/health", "/api/tray", "/api/control/stop", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable":
+		return true
+	default:
+		return false
 	}
 }

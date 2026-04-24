@@ -182,6 +182,16 @@ func (b *Bus) MarkUIInactive() {
 	b.mu.Unlock()
 }
 
+func (b *Bus) DisableUI() {
+	b.mu.Lock()
+	b.uiActiveUntil = time.Time{}
+	for id, ch := range b.subs {
+		close(ch)
+		delete(b.subs, id)
+	}
+	b.mu.Unlock()
+}
+
 func (b *Bus) UIActive() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -495,7 +505,9 @@ func (b *Bus) deleteActiveLocked(id string) {
 
 func (b *Bus) compactActiveMaybeLocked() {
 	if len(b.active) == 0 {
-		b.active = map[string]Connection{}
+		if b.activeDeletes >= mapCompactDeletes {
+			b.active = map[string]Connection{}
+		}
 		b.activeDeletes = 0
 		return
 	}
@@ -512,7 +524,9 @@ func (b *Bus) compactActiveMaybeLocked() {
 
 func (b *Bus) compactTrafficLiveMaybeLocked() {
 	if len(b.trafficLive) == 0 {
-		b.trafficLive = map[int64]TrafficSample{}
+		if b.trafficDeletes >= mapCompactDeletes {
+			b.trafficLive = map[int64]TrafficSample{}
+		}
 		b.trafficDeletes = 0
 		return
 	}

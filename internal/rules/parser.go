@@ -163,6 +163,10 @@ func parseHosts(input string) ([]hostPattern, bool, error) {
 			out = append(out, hostPattern{kind: hostExactIP, raw: token, ip: ip})
 			continue
 		}
+		if start, end, ok := parseIPv4StarGlobRange(token); ok {
+			out = append(out, hostPattern{kind: hostIPRange, raw: token, ip: start, end: end})
+			continue
+		}
 		if looksLikeIPGlob(token) {
 			out = append(out, hostPattern{kind: hostGlobIP, raw: strings.ToLower(token)})
 			continue
@@ -238,4 +242,32 @@ func looksLikeIPGlob(s string) bool {
 		return false
 	}
 	return true
+}
+
+func parseIPv4StarGlobRange(s string) (netip.Addr, netip.Addr, bool) {
+	if strings.ContainsAny(s, ":?") || !strings.Contains(s, "*") {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	var lo, hi [4]byte
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		switch part {
+		case "*":
+			lo[i], hi[i] = 0, 255
+		default:
+			if strings.Contains(part, "*") {
+				return netip.Addr{}, netip.Addr{}, false
+			}
+			n, err := strconv.Atoi(part)
+			if err != nil || n < 0 || n > 255 {
+				return netip.Addr{}, netip.Addr{}, false
+			}
+			lo[i], hi[i] = byte(n), byte(n)
+		}
+	}
+	return netip.AddrFrom4(lo), netip.AddrFrom4(hi), true
 }

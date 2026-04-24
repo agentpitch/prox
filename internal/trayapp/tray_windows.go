@@ -82,6 +82,10 @@ type WebUIController interface {
 	DisableWebUI() error
 }
 
+type remoteWebUIController struct {
+	url string
+}
+
 type Options struct {
 	URL      string
 	Provider Provider
@@ -402,17 +406,57 @@ func (h *helper) showContextMenu() {
 }
 
 func (h *helper) webUIController() WebUIController {
-	if h.provider == nil {
+	if h.provider != nil {
+		ctl, _ := h.provider.(WebUIController)
+		return ctl
+	}
+	if h.url == "" {
 		return nil
 	}
-	ctl, _ := h.provider.(WebUIController)
-	return ctl
+	return remoteWebUIController{url: h.url}
 }
 
 func (h *helper) disableWebUI() {
 	if ctl := h.webUIController(); ctl != nil {
 		_ = ctl.DisableWebUI()
 	}
+}
+
+func (c remoteWebUIController) WebUIRunning() bool {
+	body, status, err := httpJSONRequest("GET", trimTrailingSlash(c.url)+"/api/control/webui/status", nil)
+	if err != nil || status != 200 {
+		return false
+	}
+	var payload struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Enabled
+}
+
+func (c remoteWebUIController) EnableWebUI() error {
+	return c.setWebUI(true)
+}
+
+func (c remoteWebUIController) DisableWebUI() error {
+	return c.setWebUI(false)
+}
+
+func (c remoteWebUIController) setWebUI(enabled bool) error {
+	action := "disable"
+	if enabled {
+		action = "enable"
+	}
+	_, status, err := httpJSONRequest("POST", trimTrailingSlash(c.url)+"/api/control/webui/"+action, []byte(`{}`))
+	if err != nil {
+		return err
+	}
+	if status != 200 && status != 204 {
+		return fmt.Errorf("webui %s status: %d", action, status)
+	}
+	return nil
 }
 
 func (h *helper) menuAnchor() (point, uintptr) {

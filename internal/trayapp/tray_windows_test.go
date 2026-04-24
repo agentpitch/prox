@@ -3,6 +3,9 @@
 package trayapp
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,5 +33,55 @@ func TestTrafficSeriesUsesFixedWindowWithoutMapGrowth(t *testing.T) {
 	}
 	if peakTx != 15 || peakRx != 27 {
 		t.Fatalf("peaks = tx=%d rx=%d, want tx=15 rx=27", peakTx, peakRx)
+	}
+}
+
+func TestRemoteWebUIController(t *testing.T) {
+	var enabled atomic.Bool
+	enabled.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/control/webui/status":
+			w.Header().Set("Content-Type", "application/json")
+			if enabled.Load() {
+				_, _ = w.Write([]byte(`{"enabled":true}`))
+			} else {
+				_, _ = w.Write([]byte(`{"enabled":false}`))
+			}
+		case "/api/control/webui/enable":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			enabled.Store(true)
+			_, _ = w.Write([]byte(`{"enabled":true}`))
+		case "/api/control/webui/disable":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			enabled.Store(false)
+			_, _ = w.Write([]byte(`{"enabled":false}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	controller := remoteWebUIController{url: server.URL}
+	if !controller.WebUIRunning() {
+		t.Fatal("WebUIRunning = false, want true")
+	}
+	if err := controller.DisableWebUI(); err != nil {
+		t.Fatalf("DisableWebUI: %v", err)
+	}
+	if controller.WebUIRunning() {
+		t.Fatal("WebUIRunning = true after disable")
+	}
+	if err := controller.EnableWebUI(); err != nil {
+		t.Fatalf("EnableWebUI: %v", err)
+	}
+	if !controller.WebUIRunning() {
+		t.Fatal("WebUIRunning = false after enable")
 	}
 }

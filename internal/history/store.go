@@ -3,6 +3,7 @@ package history
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,10 +55,12 @@ type SnapshotOptions struct {
 }
 
 const (
-	flushInterval      = 3 * time.Second
-	pruneInterval      = time.Minute
-	maxInitialLogQuery = 5000
-	segmentLayout      = "2006010215"
+	flushInterval               = 3 * time.Second
+	pruneInterval               = time.Minute
+	maxInitialConnectionQuery   = 2048
+	connectionQueryPruneTrigger = maxInitialConnectionQuery * 2
+	maxInitialLogQuery          = 5000
+	segmentLayout               = "2006010215"
 )
 
 func Open(path string, retention time.Duration) (*Store, error) {
@@ -417,7 +420,7 @@ func (s *Store) queryConnections(cutoff time.Time) ([]ConnectionRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	agg := map[string]connectionAggregate{}
+	agg := make(map[string]connectionAggregate, maxInitialConnectionQuery)
 	for _, file := range files {
 		if err := readSegmentFile(file, func(item ConnectionRecord) {
 			if item.LastUpdatedAt.UTC().Before(cutoff) {
@@ -468,10 +471,14 @@ func (s *Store) queryConnections(cutoff time.Time) ([]ConnectionRecord, error) {
 				current.Item.State = "closed"
 			}
 			agg[key] = current
+			if len(agg) > connectionQueryPruneTrigger {
+				pruneConnectionAggregates(agg, maxInitialConnectionQuery)
+			}
 		}); err != nil {
 			return nil, fmt.Errorf("query connections: %w", err)
 		}
 	}
+	pruneConnectionAggregates(agg, maxInitialConnectionQuery)
 	out := make([]ConnectionRecord, 0, len(agg))
 	for _, item := range agg {
 		out = append(out, item.Item)
@@ -485,27 +492,84 @@ func (s *Store) queryConnections(cutoff time.Time) ([]ConnectionRecord, error) {
 	return out, nil
 }
 
+func pruneConnectionAggregates(agg map[string]connectionAggregate, limit int) {
+	if limit <= 0 || len(agg) <= limit {
+		return
+	}
+	type rankedConnection struct {
+		Key           string
+		LastUpdatedAt time.Time
+		CreatedAt     time.Time
+	}
+	ranked := make([]rankedConnection, 0, len(agg))
+	for key, item := range agg {
+		ranked = append(ranked, rankedConnection{
+			Key:           key,
+			LastUpdatedAt: item.Item.LastUpdatedAt,
+			CreatedAt:     item.Item.CreatedAt,
+		})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].LastUpdatedAt.Equal(ranked[j].LastUpdatedAt) {
+			return ranked[i].CreatedAt.After(ranked[j].CreatedAt)
+		}
+		return ranked[i].LastUpdatedAt.After(ranked[j].LastUpdatedAt)
+	})
+	for _, item := range ranked[limit:] {
+		delete(agg, item.Key)
+	}
+}
+
 func (s *Store) queryLogs(cutoff time.Time) ([]LogRecord, error) {
 	files, err := s.segmentFiles("logs", cutoff)
 	if err != nil {
 		return nil, err
 	}
-	items := make([]LogRecord, 0, 128)
+	recent := make(logRecordMinHeap, 0, maxInitialLogQuery)
 	for _, file := range files {
 		if err := readSegmentFile(file, func(item LogRecord) {
 			if item.Time.UTC().Before(cutoff) {
 				return
 			}
-			items = append(items, item)
+			if len(recent) < maxInitialLogQuery {
+				heap.Push(&recent, item)
+				return
+			}
+			if item.Time.After(recent[0].Time) {
+				heap.Pop(&recent)
+				heap.Push(&recent, item)
+			}
 		}); err != nil {
 			return nil, fmt.Errorf("query logs: %w", err)
 		}
 	}
+	items := []LogRecord(recent)
 	sort.Slice(items, func(i, j int) bool { return items[i].Time.After(items[j].Time) })
-	if len(items) > maxInitialLogQuery {
-		items = items[:maxInitialLogQuery]
-	}
 	return trimLogs(items), nil
+}
+
+type logRecordMinHeap []LogRecord
+
+func (h logRecordMinHeap) Len() int { return len(h) }
+
+func (h logRecordMinHeap) Less(i, j int) bool {
+	return h[i].Time.Before(h[j].Time)
+}
+
+func (h logRecordMinHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *logRecordMinHeap) Push(x any) {
+	*h = append(*h, x.(LogRecord))
+}
+
+func (h *logRecordMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 func (s *Store) queryTraffic(cutoff time.Time, bucketSeconds int) ([]TrafficSample, TrafficTotals, error) {

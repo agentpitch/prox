@@ -98,6 +98,8 @@ type Bus struct {
 	trafficLive      map[int64]TrafficSample
 	subs             map[int]chan []byte
 	nextSubID        int
+	activeDeletes    int
+	trafficDeletes   int
 	uiActiveUntil    time.Time
 	uiWake           chan struct{}
 	retentionWindow  time.Duration
@@ -112,6 +114,8 @@ const (
 	maxRetention             = 24 * time.Hour
 	snapshotTrafficMaxPoints = 120
 	trayKeepWindow           = 2 * time.Minute
+	openingMaxAge            = 2 * time.Minute
+	mapCompactDeletes        = 256
 	pruneActiveEvery         = 15 * time.Second
 	pruneTrafficEvery        = 15 * time.Second
 )
@@ -234,7 +238,7 @@ func (b *Bus) UpsertConnection(c Connection) {
 				c.BytesDown = old.BytesDown
 			}
 		}
-		delete(b.active, c.ID)
+		b.deleteActiveLocked(c.ID)
 	}
 	b.mu.Unlock()
 
@@ -245,7 +249,7 @@ func (b *Bus) UpsertConnection(c Connection) {
 
 func (b *Bus) DeleteConnection(id string) {
 	b.mu.Lock()
-	delete(b.active, id)
+	b.deleteActiveLocked(id)
 	b.mu.Unlock()
 }
 
@@ -440,8 +444,10 @@ func (b *Bus) pruneTrafficLiveLocked(now time.Time) {
 	for ts := range b.trafficLive {
 		if ts < cutoff {
 			delete(b.trafficLive, ts)
+			b.trafficDeletes++
 		}
 	}
+	b.compactTrafficLiveMaybeLocked()
 }
 
 func (b *Bus) pruneActiveMaybeLocked(now time.Time) {
@@ -455,7 +461,7 @@ func (b *Bus) pruneActiveLocked(now time.Time) {
 	b.lastActivePrune = now
 	for id, c := range b.active {
 		if shouldExpireConnection(now, c, b.retentionWindowLocked()) {
-			delete(b.active, id)
+			b.deleteActiveLocked(id)
 		}
 	}
 }
@@ -469,11 +475,56 @@ func shouldExpireConnection(now time.Time, c Connection, keepFor time.Duration) 
 		last = now
 	}
 	switch strings.ToLower(strings.TrimSpace(c.State)) {
-	case "open", "opening":
+	case "open":
 		return false
+	case "opening":
+		return now.Sub(last) > openingMaxAge
 	default:
 		return now.Sub(last) > keepFor
 	}
+}
+
+func (b *Bus) deleteActiveLocked(id string) {
+	if _, ok := b.active[id]; !ok {
+		return
+	}
+	delete(b.active, id)
+	b.activeDeletes++
+	b.compactActiveMaybeLocked()
+}
+
+func (b *Bus) compactActiveMaybeLocked() {
+	if len(b.active) == 0 {
+		b.active = map[string]Connection{}
+		b.activeDeletes = 0
+		return
+	}
+	if b.activeDeletes < mapCompactDeletes {
+		return
+	}
+	next := make(map[string]Connection, len(b.active))
+	for id, item := range b.active {
+		next[id] = item
+	}
+	b.active = next
+	b.activeDeletes = 0
+}
+
+func (b *Bus) compactTrafficLiveMaybeLocked() {
+	if len(b.trafficLive) == 0 {
+		b.trafficLive = map[int64]TrafficSample{}
+		b.trafficDeletes = 0
+		return
+	}
+	if b.trafficDeletes < mapCompactDeletes {
+		return
+	}
+	next := make(map[int64]TrafficSample, len(b.trafficLive))
+	for ts, item := range b.trafficLive {
+		next[ts] = item
+	}
+	b.trafficLive = next
+	b.trafficDeletes = 0
 }
 
 func (b *Bus) Subscribe() (int, <-chan []byte, func()) {

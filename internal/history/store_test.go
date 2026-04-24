@@ -1,6 +1,7 @@
 package history
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -174,5 +175,72 @@ func TestStoreSnapshotBucketsTraffic(t *testing.T) {
 	}
 	if snap.TrafficTotals.UpBytes != 100 || snap.TrafficTotals.DownBytes != 1000 {
 		t.Fatalf("traffic totals = %+v, want up=100 down=1000", snap.TrafficTotals)
+	}
+}
+
+func TestStoreSnapshotCapsHistoryPayload(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	totalConnections := connectionQueryPruneTrigger + 100
+	for i := 0; i < totalConnections; i++ {
+		ts := base.Add(time.Duration(i) * time.Millisecond)
+		store.RecordConnection(ConnectionRecord{
+			ID:            fmt.Sprintf("conn-%d", i),
+			PID:           uint32(i + 1),
+			ExePath:       "demo.exe",
+			OriginalIP:    "203.0.113.10",
+			OriginalPort:  uint16(1000 + i),
+			Action:        config.ActionDirect,
+			State:         "closed",
+			CreatedAt:     ts,
+			LastUpdatedAt: ts,
+			Count:         1,
+		})
+	}
+
+	totalLogs := maxInitialLogQuery + 100
+	for i := 0; i < totalLogs; i++ {
+		ts := base.Add(time.Duration(i) * time.Millisecond)
+		store.RecordLog(LogRecord{
+			Time:    ts,
+			Level:   "info",
+			Message: fmt.Sprintf("log-%d", i),
+			PID:     uint32(i + 1),
+		})
+	}
+
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+
+	snap, err := store.Snapshot(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	if got := len(snap.Connections); got != maxInitialConnectionQuery {
+		t.Fatalf("connections len = %d, want capped %d", got, maxInitialConnectionQuery)
+	}
+	if got := snap.Connections[0].ID; got != fmt.Sprintf("conn-%d", totalConnections-1) {
+		t.Fatalf("newest connection = %q, want latest", got)
+	}
+	if got := len(snap.Logs); got != maxInitialLogQuery {
+		t.Fatalf("logs len = %d, want capped %d", got, maxInitialLogQuery)
+	}
+	if got := snap.Logs[0].Message; got != "log-100" {
+		t.Fatalf("oldest kept log = %q, want log-100", got)
+	}
+	if got := snap.Logs[len(snap.Logs)-1].Message; got != fmt.Sprintf("log-%d", totalLogs-1) {
+		t.Fatalf("newest kept log = %q, want latest", got)
 	}
 }

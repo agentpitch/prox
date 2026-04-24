@@ -201,7 +201,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	dialer, err := BuildDialer(cfg, route.Action, route.ProxyID, route.ChainID)
 	if err != nil {
 		if s.Monitor != nil {
-			s.Monitor.AddLog("error", "build dialer failed: %v", err)
+			failed := baseConn
+			failed.State = "error"
+			s.Monitor.UpsertConnection(failed)
+			s.Monitor.AddConnectionLog("error", failed, "build dialer failed action=%s proxy=%s chain=%s err=%v", route.Action, route.ProxyID, route.ChainID, err)
 		}
 		return
 	}

@@ -78,6 +78,15 @@ func (p programTrayProvider) TrayView(seconds int) (monitor.TrayView, error) {
 	return p.prog.Runtime().TrayView(seconds), nil
 }
 func (p programTrayProvider) OpenURL() string { return p.prog.Runtime().WebUIURL() }
+func (p programTrayProvider) WebUIRunning() bool {
+	return p.prog.WebUIRunning()
+}
+func (p programTrayProvider) EnableWebUI() error {
+	return p.prog.EnableWebUI()
+}
+func (p programTrayProvider) DisableWebUI() error {
+	return p.prog.DisableWebUI()
+}
 func (p programTrayProvider) RequestStop() error {
 	p.prog.RequestStop()
 	return nil

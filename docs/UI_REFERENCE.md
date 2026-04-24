@@ -204,6 +204,7 @@ The tray icon is a miniature filled graph:
 - double click: open WebUI in the default browser
 - right click: context menu
   - `Управление`
+  - `Disable WebUI` / `Отключить WebUI` when WebUI is currently running
   - `Выйти`
 
 `Выйти` stops the whole desktop runtime, not only the tray icon.

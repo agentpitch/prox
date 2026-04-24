@@ -10,6 +10,12 @@ type Provider interface {
 	RequestStop() error
 }
 
+type WebUIController interface {
+	WebUIRunning() bool
+	EnableWebUI() error
+	DisableWebUI() error
+}
+
 type Options struct {
 	URL      string
 	Provider Provider

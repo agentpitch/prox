@@ -127,6 +127,7 @@ func (r *Runtime) Start(ctx context.Context) error {
 		Decide:          r.directConnectionView,
 	}
 	go r.directObserver.Start(ctx)
+	go startIdleMemoryTrimmer(ctx, r.monitor)
 
 	if !r.interceptionEnabled {
 		r.monitor.AddLog("info", "runtime started in optimized observer-only mode (all enabled rules are direct)")

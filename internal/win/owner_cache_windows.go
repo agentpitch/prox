@@ -161,7 +161,22 @@ func (c *OwnerCache) ForceRefresh() error {
 	c.v4Local = v4Local
 	c.v6Exact = v6Exact
 	c.v6Local = v6Local
-	c.lastRefresh = time.Now().UTC()
+	now := time.Now().UTC()
+	c.exeByPID = compactExeCache(c.exeByPID, now)
+	c.lastRefresh = now
 	c.mu.Unlock()
 	return nil
+}
+
+func compactExeCache(cache map[uint32]exeCacheEntry, now time.Time) map[uint32]exeCacheEntry {
+	if len(cache) == 0 {
+		return map[uint32]exeCacheEntry{}
+	}
+	next := map[uint32]exeCacheEntry{}
+	for pid, entry := range cache {
+		if now.Before(entry.Expires) {
+			next[pid] = entry
+		}
+	}
+	return next
 }

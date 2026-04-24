@@ -24,9 +24,12 @@ type flowKey struct {
 }
 
 type FlowTable struct {
-	mu    sync.RWMutex
-	flows map[flowKey]Flow
+	mu      sync.RWMutex
+	flows   map[flowKey]Flow
+	deletes int
 }
+
+const flowMapCompactDeletes = 256
 
 func NewFlowTable() *FlowTable { return &FlowTable{flows: map[flowKey]Flow{}} }
 
@@ -61,7 +64,7 @@ func (t *FlowTable) Touch(clientIP netip.Addr, clientPort uint16) {
 func (t *FlowTable) Delete(clientIP netip.Addr, clientPort uint16) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.flows, makeFlowKey(clientIP, clientPort))
+	t.deleteLocked(makeFlowKey(clientIP, clientPort))
 }
 
 func (t *FlowTable) FindAppPacket(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16) (Flow, bool) {
@@ -90,9 +93,35 @@ func (t *FlowTable) Cleanup(maxAge time.Duration) {
 	defer t.mu.Unlock()
 	for k, f := range t.flows {
 		if f.LastSeen.Before(cutoff) {
-			delete(t.flows, k)
+			t.deleteLocked(k)
 		}
 	}
+}
+
+func (t *FlowTable) deleteLocked(k flowKey) {
+	if _, ok := t.flows[k]; !ok {
+		return
+	}
+	delete(t.flows, k)
+	t.deletes++
+	t.compactMaybeLocked()
+}
+
+func (t *FlowTable) compactMaybeLocked() {
+	if len(t.flows) == 0 {
+		t.flows = map[flowKey]Flow{}
+		t.deletes = 0
+		return
+	}
+	if t.deletes < flowMapCompactDeletes {
+		return
+	}
+	next := make(map[flowKey]Flow, len(t.flows))
+	for k, flow := range t.flows {
+		next[k] = flow
+	}
+	t.flows = next
+	t.deletes = 0
 }
 
 func makeFlowKey(ip netip.Addr, port uint16) flowKey {

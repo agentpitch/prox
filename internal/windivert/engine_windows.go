@@ -42,8 +42,9 @@ type Engine struct {
 	servicePID uint32
 	owners     *win.OwnerCache
 
-	mu      sync.Mutex
-	runners map[flowKey]*flowRunner
+	mu            sync.Mutex
+	runners       map[flowKey]*flowRunner
+	runnerDeletes int
 }
 
 type flowKey struct {
@@ -60,9 +61,10 @@ type flowRunner struct {
 }
 
 const (
-	classifierFilter = "outbound and tcp and !loopback and !impostor and tcp.Syn and !tcp.Ack and !tcp.Rst"
-	runnerMaxAge     = 45 * time.Second
-	runnerGraceAge   = 8 * time.Second
+	classifierFilter        = "outbound and tcp and !loopback and !impostor and tcp.Syn and !tcp.Ack and !tcp.Rst"
+	runnerMaxAge            = 45 * time.Second
+	runnerGraceAge          = 8 * time.Second
+	runnerMapCompactDeletes = 256
 )
 
 func (e *Engine) Start(ctx context.Context) error {
@@ -81,10 +83,10 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	e.classifier = h
 	e.owners = win.NewOwnerCache(2 * time.Second)
-	_ = e.owners.ForceRefresh()
 	e.runners = map[flowKey]*flowRunner{}
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
+	e.owners.Start(ctx)
 	e.wg.Add(2)
 	go e.classifierLoop(ctx)
 	go e.cleanup(ctx)
@@ -199,7 +201,7 @@ func (e *Engine) cleanup(ctx context.Context) {
 				_, active := e.Flows.Lookup(r.flow.ClientIP, r.flow.ClientPort)
 				if idle > runnerMaxAge || (!active && idle > runnerGraceAge) {
 					r.close()
-					delete(e.runners, k)
+					e.deleteRunnerLocked(k)
 				}
 			}
 			e.mu.Unlock()
@@ -249,7 +251,7 @@ func (e *Engine) ensureRunner(ctx context.Context, flow proxy.Flow) error {
 			return nil
 		}
 		existing.close()
-		delete(e.runners, k)
+		e.deleteRunnerLocked(k)
 	}
 	filter := buildFlowFilter(flow, e.ListenerPort)
 	h, err := Open(filter, LayerNetwork, 100, 0)
@@ -263,6 +265,32 @@ func (e *Engine) ensureRunner(ctx context.Context, flow proxy.Flow) error {
 	go e.runnerLoop(ctx, runner)
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *Engine) deleteRunnerLocked(k flowKey) {
+	if _, ok := e.runners[k]; !ok {
+		return
+	}
+	delete(e.runners, k)
+	e.runnerDeletes++
+	e.compactRunnersMaybeLocked()
+}
+
+func (e *Engine) compactRunnersMaybeLocked() {
+	if len(e.runners) == 0 {
+		e.runners = map[flowKey]*flowRunner{}
+		e.runnerDeletes = 0
+		return
+	}
+	if e.runnerDeletes < runnerMapCompactDeletes {
+		return
+	}
+	next := make(map[flowKey]*flowRunner, len(e.runners))
+	for k, runner := range e.runners {
+		next[k] = runner
+	}
+	e.runners = next
+	e.runnerDeletes = 0
 }
 
 func (e *Engine) runnerLoop(ctx context.Context, runner *flowRunner) {

@@ -43,6 +43,9 @@ func (s *TCPSnapshotter) ListTCPConnections() ([]TCPConnection, error) {
 		s = defaultTCPSnapshotter
 	}
 	now := time.Now().UTC()
+	s.mu.Lock()
+	s.exeByPID = compactExeCache(s.exeByPID, now)
+	s.mu.Unlock()
 	items := make([]TCPConnection, 0, 128)
 
 	if rows, err := loadTCP4Table(tcpTableOwnerPIDAll); err == nil {

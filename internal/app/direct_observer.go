@@ -47,7 +47,7 @@ func (o *directObserver) Start(ctx context.Context) {
 	seen := map[string]monitor.Connection{}
 	for {
 		if o.Monitor.UIActive() {
-			o.scan(list, seen)
+			seen = o.scan(list, seen)
 			select {
 			case <-ctx.Done():
 				o.finalizeAll(seen)
@@ -58,7 +58,7 @@ func (o *directObserver) Start(ctx context.Context) {
 		}
 		if len(seen) > 0 {
 			o.finalizeAll(seen)
-			clear(seen)
+			seen = map[string]monitor.Connection{}
 		}
 		wake := o.Monitor.UIWake()
 		if wake == nil {
@@ -78,11 +78,11 @@ func (o *directObserver) Start(ctx context.Context) {
 	}
 }
 
-func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map[string]monitor.Connection) {
+func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map[string]monitor.Connection) map[string]monitor.Connection {
 	items, err := list()
 	if err != nil {
 		o.Monitor.AddLog("warn", "tcp observer: %v", err)
-		return
+		return seen
 	}
 	next := make(map[string]monitor.Connection, len(items))
 	for _, item := range items {
@@ -115,12 +115,7 @@ func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map
 		closed.State = "closed"
 		o.Monitor.UpsertConnection(closed)
 	}
-	for k := range seen {
-		delete(seen, k)
-	}
-	for id, item := range next {
-		seen[id] = item
-	}
+	return next
 }
 
 func (o *directObserver) finalizeAll(seen map[string]monitor.Connection) {

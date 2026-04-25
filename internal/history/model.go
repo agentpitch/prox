@@ -69,3 +69,10 @@ type SnapshotData struct {
 	TrafficTotals TrafficTotals
 	RuleStats     []RuleActivity
 }
+
+type NewConnectionOptions struct {
+	Baseline time.Duration
+	Recent   time.Duration
+	Limit    int
+	Live     []ConnectionRecord
+}

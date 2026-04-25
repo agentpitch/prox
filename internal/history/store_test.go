@@ -244,3 +244,215 @@ func TestStoreSnapshotCapsHistoryPayload(t *testing.T) {
 		t.Fatalf("newest kept log = %q, want latest", got)
 	}
 }
+
+func TestStoreNewConnectionsUsesBaseline(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 7*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	exe := `C:\Apps\demo.exe`
+	store.RecordConnection(ConnectionRecord{
+		ID:            "old-same",
+		PID:           101,
+		ExePath:       exe,
+		OriginalIP:    "198.51.100.10",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-3 * time.Minute),
+		LastUpdatedAt: now.Add(-3 * time.Minute),
+		Count:         1,
+	})
+	store.RecordConnection(ConnectionRecord{
+		ID:            "recent-same-new-pid",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "198.51.100.10",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-30 * time.Second),
+		LastUpdatedAt: now.Add(-30 * time.Second),
+		Count:         1,
+	})
+	store.RecordConnection(ConnectionRecord{
+		ID:            "recent-new",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "203.0.113.20",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-30 * time.Second),
+		LastUpdatedAt: now.Add(-30 * time.Second),
+		Count:         1,
+	})
+	store.RecordConnection(ConnectionRecord{
+		ID:            "outside-baseline-old",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "192.0.2.55",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-10 * time.Minute),
+		LastUpdatedAt: now.Add(-10 * time.Minute),
+		Count:         1,
+	})
+	store.RecordConnection(ConnectionRecord{
+		ID:            "outside-baseline-recent",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "192.0.2.55",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-30 * time.Second),
+		LastUpdatedAt: now.Add(-30 * time.Second),
+		Count:         1,
+	})
+
+	items, err := store.NewConnections(NewConnectionOptions{
+		Baseline: 7 * time.Minute,
+		Recent:   time.Minute,
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatalf("new connections: %v", err)
+	}
+
+	got := map[string]bool{}
+	for _, item := range items {
+		got[item.OriginalIP] = true
+	}
+	if got["198.51.100.10"] {
+		t.Fatal("same exe/address/port with a different recent PID was reported as new")
+	}
+	for _, ip := range []string{"203.0.113.20", "192.0.2.55"} {
+		if !got[ip] {
+			t.Fatalf("new connection %s was not reported; got %+v", ip, items)
+		}
+	}
+	if len(items) != 2 {
+		t.Fatalf("new connections len = %d, want 2: %+v", len(items), items)
+	}
+}
+
+func TestStoreNewConnectionsIncludesLiveRecords(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 7*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	exe := `C:\Apps\live.exe`
+	store.RecordConnection(ConnectionRecord{
+		ID:            "history-same",
+		PID:           303,
+		ExePath:       exe,
+		OriginalIP:    "198.51.100.30",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-2 * time.Minute),
+		LastUpdatedAt: now.Add(-2 * time.Minute),
+		Count:         1,
+	})
+
+	items, err := store.NewConnections(NewConnectionOptions{
+		Baseline: 7 * time.Minute,
+		Recent:   time.Minute,
+		Limit:    10,
+		Live: []ConnectionRecord{
+			{
+				ID:            "live-suppressed",
+				PID:           404,
+				ExePath:       exe,
+				OriginalIP:    "198.51.100.30",
+				OriginalPort:  443,
+				Action:        config.ActionDirect,
+				State:         "open",
+				CreatedAt:     now,
+				LastUpdatedAt: now,
+				Count:         1,
+			},
+			{
+				ID:            "live-new",
+				PID:           404,
+				ExePath:       exe,
+				OriginalIP:    "203.0.113.40",
+				OriginalPort:  443,
+				Action:        config.ActionDirect,
+				State:         "open",
+				CreatedAt:     now,
+				LastUpdatedAt: now,
+				Count:         1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("new connections: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("new connections len = %d, want 1: %+v", len(items), items)
+	}
+	if items[0].OriginalIP != "203.0.113.40" {
+		t.Fatalf("new live connection = %s, want 203.0.113.40", items[0].OriginalIP)
+	}
+	if items[0].State != "open" {
+		t.Fatalf("new live connection state = %q, want open", items[0].State)
+	}
+}
+
+func TestStoreNewConnectionsRequiresWindowLongerThanRecent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	store.RecordConnection(ConnectionRecord{
+		ID:            "recent",
+		PID:           505,
+		ExePath:       `C:\Apps\short.exe`,
+		OriginalIP:    "203.0.113.50",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-30 * time.Second),
+		LastUpdatedAt: now.Add(-30 * time.Second),
+		Count:         1,
+	})
+
+	items, err := store.NewConnections(NewConnectionOptions{
+		Baseline: time.Minute,
+		Recent:   time.Minute,
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatalf("new connections: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("new connections len = %d, want 0 when baseline is not longer than recent: %+v", len(items), items)
+	}
+}

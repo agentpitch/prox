@@ -144,8 +144,11 @@ The `Все` tab shows only connections that matched an explicit rule other than
 - `Direct`
 - `Block`
 - `Ещё`
+- `Новые`
 
 `Ещё` means connections without an explicit non-default rule match.
+
+`Новые` shows application/address/port signatures that first appeared during the last minute. The backend compares that last minute against the currently selected retained history window, for example 7 minutes. If the selected window is not longer than one minute, the tab remains empty because there is no earlier baseline to compare with.
 
 ### Additional filters
 

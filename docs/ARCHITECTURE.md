@@ -240,6 +240,8 @@ It controls:
 
 The default is 7 minutes.
 
+The WebUI `Новые` connection tab reuses the retained connection segments. It reports application/address/port signatures first seen during the last minute, but only when the selected retention window is longer than one minute so there is an earlier baseline inside the same window.
+
 ## 7. Data location summary
 
 Portable files next to the executable:

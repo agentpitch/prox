@@ -40,17 +40,21 @@ Optional query parameters:
 Fields:
 
 - `connections`
+- `new_connections`
 - `logs`
 - `traffic`
 - `traffic_totals`
 - `traffic_bucket_seconds`
 - `rule_stats`
 - `retention_minutes`
+- `new_baseline_minutes`
+- `new_recent_minutes`
 
 Notes:
 
 - `traffic` is a bounded bucketed series for the full retention window rather than a raw per-second dump.
 - `traffic_bucket_seconds` tells the WebUI how many seconds each traffic bucket represents.
+- `new_connections` contains application/address/port signatures first seen during `new_recent_minutes`; the comparison baseline is the currently configured retained history window reported as `new_baseline_minutes`. If the retained window is not longer than the recent window, the result is empty.
 
 This is heavier than tray data and is intended for the WebUI, not for the tray.
 

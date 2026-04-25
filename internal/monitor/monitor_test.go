@@ -1,8 +1,11 @@
 package monitor
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/openai/pitchprox/internal/config"
 )
 
 func TestSnapshotTrafficBucketSeconds(t *testing.T) {
@@ -64,5 +67,70 @@ func TestActiveMapCompactsAfterDeletes(t *testing.T) {
 	}
 	if b.active == nil {
 		t.Fatal("active map should be reset to an empty map, not nil")
+	}
+}
+
+func TestSnapshotIncludesNewConnections(t *testing.T) {
+	b, err := NewBus(filepath.Join(t.TempDir(), "pitchProx.history"))
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	defer func() {
+		if err := b.Close(); err != nil {
+			t.Fatalf("close bus: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	exe := `C:\Apps\demo.exe`
+	b.UpsertConnection(Connection{
+		ID:            "history-same",
+		PID:           101,
+		ExePath:       exe,
+		OriginalIP:    "198.51.100.10",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "closed",
+		CreatedAt:     now.Add(-2 * time.Minute),
+		LastUpdatedAt: now.Add(-2 * time.Minute),
+		Count:         1,
+	})
+	b.UpsertConnection(Connection{
+		ID:            "live-suppressed",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "198.51.100.10",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "open",
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+		Count:         1,
+	})
+	b.UpsertConnection(Connection{
+		ID:            "live-new",
+		PID:           202,
+		ExePath:       exe,
+		OriginalIP:    "203.0.113.40",
+		OriginalPort:  443,
+		Action:        config.ActionDirect,
+		State:         "open",
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+		Count:         1,
+	})
+
+	snap := b.SnapshotWithOptions(SnapshotOptions{IncludeLogs: false})
+	if snap.NewBaselineMinutes != 7 {
+		t.Fatalf("new baseline minutes = %d, want 7", snap.NewBaselineMinutes)
+	}
+	if snap.NewRecentMinutes != 1 {
+		t.Fatalf("new recent minutes = %d, want 1", snap.NewRecentMinutes)
+	}
+	if len(snap.NewConnections) != 1 {
+		t.Fatalf("new connections len = %d, want 1: %+v", len(snap.NewConnections), snap.NewConnections)
+	}
+	if snap.NewConnections[0].OriginalIP != "203.0.113.40" {
+		t.Fatalf("new connection ip = %s, want 203.0.113.40", snap.NewConnections[0].OriginalIP)
 	}
 }

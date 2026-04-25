@@ -106,6 +106,7 @@ details.rule-row>summary::-webkit-details-marker{display:none}
 #connectionsTable tbody tr:hover{background:#fafafa}
 #connectionsTable tbody tr.conn-proxy{background:linear-gradient(0deg,rgba(238,251,246,.9),rgba(238,251,246,.9))}
 #connectionsTable tbody tr.conn-block{background:linear-gradient(0deg,rgba(255,244,244,.94),rgba(255,244,244,.94))}
+#connectionsTable tbody tr.conn-new{box-shadow:inset 3px 0 0 #0ea5e9}
 .copy-cell{position:relative;cursor:pointer}
 .copy-cell .copy-btn{opacity:0;transition:opacity .15s ease;border:none;background:transparent;padding:0;margin-left:6px;font-size:13px;line-height:1;color:#6b7280;cursor:pointer}
 .copy-cell:hover .copy-btn,.copy-cell:focus-within .copy-btn{opacity:1}

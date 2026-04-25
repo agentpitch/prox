@@ -49,6 +49,14 @@ type connectionAggregate struct {
 	SawError    bool
 }
 
+type noveltyAggregate struct {
+	Item        ConnectionRecord
+	FirstSeen   time.Time
+	BlockedOnly bool
+	SawError    bool
+	HasOpen     bool
+}
+
 type SnapshotOptions struct {
 	IncludeLogs          bool
 	TrafficBucketSeconds int
@@ -59,6 +67,8 @@ const (
 	pruneInterval               = time.Minute
 	maxInitialConnectionQuery   = 2048
 	connectionQueryPruneTrigger = maxInitialConnectionQuery * 2
+	maxNewConnectionQuery       = 512
+	newConnectionPruneTrigger   = maxNewConnectionQuery * 16
 	maxInitialLogQuery          = 5000
 	segmentLayout               = "2006010215"
 )
@@ -183,6 +193,111 @@ func (s *Store) SnapshotWithOptions(retention time.Duration, options SnapshotOpt
 	}
 	if out.RuleStats, err = s.queryRuleStats(cutoff); err != nil {
 		return SnapshotData{}, err
+	}
+	return out, nil
+}
+
+func (s *Store) NewConnections(options NewConnectionOptions) ([]ConnectionRecord, error) {
+	baseline := options.Baseline
+	if baseline < time.Minute {
+		baseline = time.Duration(s.retention.Load())
+	}
+	recent := options.Recent
+	if recent < time.Minute {
+		recent = time.Minute
+	}
+	if baseline <= recent {
+		return nil, nil
+	}
+	limit := options.Limit
+	if limit <= 0 || limit > maxNewConnectionQuery {
+		limit = maxNewConnectionQuery
+	}
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-baseline)
+	recentCutoff := now.Add(-recent)
+	candidates := make(map[string]noveltyAggregate, min(maxNewConnectionQuery, limit*2))
+	recordTimes := func(item ConnectionRecord) (time.Time, time.Time) {
+		ts := item.LastUpdatedAt.UTC()
+		if ts.IsZero() {
+			ts = now
+		}
+		firstSeen := item.CreatedAt.UTC()
+		if firstSeen.IsZero() {
+			firstSeen = ts
+		}
+		return firstSeen, ts
+	}
+	collectRecent := func(item ConnectionRecord) {
+		firstSeen, ts := recordTimes(item)
+		if ts.Before(cutoff) || ts.Before(recentCutoff) || firstSeen.Before(recentCutoff) {
+			return
+		}
+		key := connectionNoveltyKey(item)
+		if key == "" {
+			return
+		}
+		mergeNoveltyAggregate(candidates, key, item, ts)
+		if len(candidates) > newConnectionPruneTrigger {
+			pruneNoveltyAggregates(candidates, newConnectionPruneTrigger/2)
+		}
+	}
+
+	recentFiles, err := s.segmentFiles("connections", recentCutoff)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range recentFiles {
+		if err := readSegmentFile(file, collectRecent); err != nil {
+			return nil, fmt.Errorf("query new connections: %w", err)
+		}
+	}
+	for _, item := range options.Live {
+		collectRecent(item)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	baselineFiles, err := s.segmentFiles("connections", cutoff)
+	if err != nil {
+		return nil, err
+	}
+	markOld := func(item ConnectionRecord) {
+		firstSeen, ts := recordTimes(item)
+		if ts.Before(cutoff) || (!ts.Before(recentCutoff) && !firstSeen.Before(recentCutoff)) {
+			return
+		}
+		key := connectionNoveltyKey(item)
+		if key == "" {
+			return
+		}
+		delete(candidates, key)
+	}
+	for _, file := range baselineFiles {
+		if err := readSegmentFile(file, markOld); err != nil {
+			return nil, fmt.Errorf("query new connections baseline: %w", err)
+		}
+		if len(candidates) == 0 {
+			return nil, nil
+		}
+	}
+
+	out := make([]ConnectionRecord, 0, min(len(candidates), limit))
+	for _, item := range candidates {
+		out = append(out, item.Item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LastUpdatedAt.Equal(out[j].LastUpdatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].LastUpdatedAt.After(out[j].LastUpdatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -518,6 +633,95 @@ func pruneConnectionAggregates(agg map[string]connectionAggregate, limit int) {
 	for _, item := range ranked[limit:] {
 		delete(agg, item.Key)
 	}
+}
+
+func mergeNoveltyAggregate(agg map[string]noveltyAggregate, key string, item ConnectionRecord, ts time.Time) {
+	firstSeen := item.CreatedAt.UTC()
+	if firstSeen.IsZero() {
+		firstSeen = ts
+	}
+	state := strings.ToLower(strings.TrimSpace(item.State))
+	count := item.Count
+	if count <= 0 {
+		count = 1
+	}
+	item.CreatedAt = firstSeen
+	item.LastUpdatedAt = ts
+	item.Count = count
+	current, ok := agg[key]
+	if !ok {
+		agg[key] = noveltyAggregate{
+			Item:        item,
+			FirstSeen:   firstSeen,
+			BlockedOnly: state == "blocked",
+			SawError:    state == "error",
+			HasOpen:     state == "open" || state == "opening",
+		}
+		return
+	}
+	totalUp := current.Item.BytesUp + item.BytesUp
+	totalDown := current.Item.BytesDown + item.BytesDown
+	totalCount := current.Item.Count + count
+	if firstSeen.Before(current.FirstSeen) {
+		current.FirstSeen = firstSeen
+	}
+	if ts.After(current.Item.LastUpdatedAt) {
+		current.Item = item
+	}
+	current.Item.CreatedAt = current.FirstSeen
+	current.Item.BytesUp = totalUp
+	current.Item.BytesDown = totalDown
+	current.Item.Count = totalCount
+	current.BlockedOnly = current.BlockedOnly && state == "blocked"
+	current.SawError = current.SawError || state == "error"
+	current.HasOpen = current.HasOpen || state == "open" || state == "opening"
+	switch {
+	case current.SawError:
+		current.Item.State = "error"
+	case current.HasOpen:
+		current.Item.State = "open"
+	case current.BlockedOnly:
+		current.Item.State = "blocked"
+	default:
+		current.Item.State = "closed"
+	}
+	agg[key] = current
+}
+
+func pruneNoveltyAggregates(agg map[string]noveltyAggregate, limit int) {
+	if limit <= 0 || len(agg) <= limit {
+		return
+	}
+	type rankedNovelty struct {
+		Key           string
+		LastUpdatedAt time.Time
+	}
+	ranked := make([]rankedNovelty, 0, len(agg))
+	for key, item := range agg {
+		ranked = append(ranked, rankedNovelty{Key: key, LastUpdatedAt: item.Item.LastUpdatedAt})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].LastUpdatedAt.After(ranked[j].LastUpdatedAt) })
+	for _, item := range ranked[limit:] {
+		delete(agg, item.Key)
+	}
+}
+
+func connectionNoveltyKey(item ConnectionRecord) string {
+	app := strings.ToLower(strings.TrimSpace(item.ExePath))
+	if app == "" && item.PID != 0 {
+		app = fmt.Sprintf("pid:%d", item.PID)
+	}
+	if app == "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSpace(item.OriginalIP))
+	if host == "" {
+		host = strings.ToLower(strings.TrimSpace(item.Hostname))
+	}
+	if host == "" || item.OriginalPort == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s\x1f%s\x1f%d", app, host, item.OriginalPort)
 }
 
 func (s *Store) queryLogs(cutoff time.Time) ([]LogRecord, error) {

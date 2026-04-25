@@ -71,12 +71,15 @@ type RuleActivity struct {
 
 type Snapshot struct {
 	Connections          []Connection    `json:"connections"`
+	NewConnections       []Connection    `json:"new_connections"`
 	Logs                 []LogEntry      `json:"logs"`
 	Traffic              []TrafficSample `json:"traffic"`
 	TrafficTotals        TrafficTotals   `json:"traffic_totals"`
 	TrafficBucketSeconds int             `json:"traffic_bucket_seconds"`
 	RuleStats            []RuleActivity  `json:"rule_stats"`
 	RetentionMinutes     int             `json:"retention_minutes"`
+	NewBaselineMinutes   int             `json:"new_baseline_minutes"`
+	NewRecentMinutes     int             `json:"new_recent_minutes"`
 }
 
 type SnapshotOptions struct {
@@ -112,6 +115,7 @@ const (
 	uiVerboseWindow          = 90 * time.Second
 	defaultRetention         = 7 * time.Minute
 	maxRetention             = 24 * time.Hour
+	newConnectionRecent      = time.Minute
 	snapshotTrafficMaxPoints = 120
 	trayKeepWindow           = 2 * time.Minute
 	openingMaxAge            = 2 * time.Minute
@@ -368,6 +372,8 @@ func (b *Bus) SnapshotWithOptions(options SnapshotOptions) Snapshot {
 	b.mu.Unlock()
 
 	trafficBucketSeconds := snapshotTrafficBucketSeconds(retention)
+	newBaseline := newConnectionBaselineWindow(retention)
+	newRecent := newConnectionRecentWindow(newBaseline)
 	data, err := b.history.SnapshotWithOptions(retention, history.SnapshotOptions{
 		IncludeLogs:          options.IncludeLogs,
 		TrafficBucketSeconds: trafficBucketSeconds,
@@ -378,11 +384,29 @@ func (b *Bus) SnapshotWithOptions(options SnapshotOptions) Snapshot {
 			Connections:          sortConnections(active),
 			TrafficBucketSeconds: trafficBucketSeconds,
 			RetentionMinutes:     int(retention / time.Minute),
+			NewBaselineMinutes:   int(newBaseline / time.Minute),
+			NewRecentMinutes:     int(newRecent / time.Minute),
 		}
 	}
 	conns := active
 	for _, item := range data.Connections {
 		conns = append(conns, fromHistoryConnection(item))
+	}
+	liveRecords := make([]history.ConnectionRecord, 0, len(active))
+	for _, item := range active {
+		liveRecords = append(liveRecords, toHistoryConnection(item))
+	}
+	var newConnections []Connection
+	if items, err := b.history.NewConnections(history.NewConnectionOptions{
+		Baseline: newBaseline,
+		Recent:   newRecent,
+		Limit:    512,
+		Live:     liveRecords,
+	}); err == nil {
+		newConnections = make([]Connection, 0, len(items))
+		for _, item := range items {
+			newConnections = append(newConnections, fromHistoryConnection(item))
+		}
 	}
 	var logs []LogEntry
 	if options.IncludeLogs {
@@ -401,13 +425,30 @@ func (b *Bus) SnapshotWithOptions(options SnapshotOptions) Snapshot {
 	}
 	return Snapshot{
 		Connections:          sortConnections(conns),
+		NewConnections:       sortConnections(newConnections),
 		Logs:                 logs,
 		Traffic:              traffic,
 		TrafficTotals:        TrafficTotals(data.TrafficTotals),
 		TrafficBucketSeconds: trafficBucketSeconds,
 		RuleStats:            ruleStats,
 		RetentionMinutes:     int(retention / time.Minute),
+		NewBaselineMinutes:   int(newBaseline / time.Minute),
+		NewRecentMinutes:     int(newRecent / time.Minute),
 	}
+}
+
+func newConnectionBaselineWindow(retention time.Duration) time.Duration {
+	return normalizeRetentionWindow(retention)
+}
+
+func newConnectionRecentWindow(baseline time.Duration) time.Duration {
+	if baseline < time.Minute {
+		return time.Minute
+	}
+	if baseline < newConnectionRecent {
+		return baseline
+	}
+	return newConnectionRecent
 }
 
 func snapshotTrafficBucketSeconds(retention time.Duration) int {

@@ -1,5 +1,5 @@
 let state = null;
-let snapshot = { connections: [], logs: [], traffic: [], traffic_totals: { up_bytes: 0, down_bytes: 0 }, traffic_bucket_seconds: 1, rule_stats: [] };
+let snapshot = { connections: [], new_connections: [], logs: [], traffic: [], traffic_totals: { up_bytes: 0, down_bytes: 0 }, traffic_bucket_seconds: 1, rule_stats: [], new_baseline_minutes: 7, new_recent_minutes: 1 };
 let logEntries = [];
 let ui = {
   connFilter: sessionStorage.getItem('pitchprox_conn_filter') || 'all',
@@ -30,6 +30,24 @@ function retentionMinutes() {
 
 function retentionWindowMs() {
   return retentionMinutes() * 60 * 1000;
+}
+
+function newConnectionBaselineMinutes() {
+  const n = Number(snapshot?.new_baseline_minutes || 0);
+  if (Number.isFinite(n) && n >= 1) return Math.round(n);
+  return retentionMinutes();
+}
+
+function newConnectionRecentMinutes() {
+  const n = Number(snapshot?.new_recent_minutes || 0);
+  if (Number.isFinite(n) && n >= 1) return Math.round(n);
+  return Math.min(1, newConnectionBaselineMinutes());
+}
+
+function newConnectionWindowText() {
+  const recent = newConnectionRecentMinutes();
+  const recentText = recent === 1 ? 'последнюю минуту' : `последние ${formatMinutesRu(recent)}`;
+  return `новые за ${recentText}; сравнение в окне истории ${formatMinutesRu(newConnectionBaselineMinutes())}`;
 }
 
 function formatMinutesRu(n = retentionMinutes()) {
@@ -111,6 +129,7 @@ function actionLabel(action) {
   if (a === 'proxy') return 'Proxy';
   if (a === 'block') return 'Block';
   if (a === 'more') return 'Ещё';
+  if (a === 'new') return 'Новые';
   return 'Direct';
 }
 function actionFilterKey(action) {
@@ -181,6 +200,8 @@ function scopeMatchesFilter(item, filter = ui.connFilter) {
       return isMatchedRuleItem(item);
     case 'more':
       return isMoreItem(item);
+    case 'new':
+      return true;
     default:
       return true;
   }
@@ -781,7 +802,7 @@ function openSettingsEditor() {
       <div class="editor-grid two">
         <label>Интервал накопления (мин)
           <input id="ed_retention_minutes" type="number" min="1" max="1440" value="${escapeHtml(src.retention_minutes || 7)}">
-          <span class="hint">Один и тот же интервал используется для истории соединений, графика трафика и статистики правил.</span>
+          <span class="hint">Один и тот же интервал используется для истории соединений, графика трафика и статистики правил. Вкладка «Новые» сравнивает последнюю минуту с этим окном; окно должно быть больше минуты.</span>
         </label>
       </div>
     `,
@@ -1045,15 +1066,43 @@ function collapseConnections(rows) {
   });
 }
 
-function baseFocusedConnections() {
-  return (snapshot.connections || []).filter(connectionMatchesFocus);
+function connectionsForFilter(filter = ui.connFilter) {
+  if (filter === 'new') return snapshot.new_connections || [];
+  return snapshot.connections || [];
 }
 
-function searchedFocusedConnections() {
-  return baseFocusedConnections().filter(connectionMatchesSearch);
+function connectionNoveltyKey(item) {
+  const app = String(item?.exe_path || '').trim().toLowerCase() || (item?.pid ? `pid:${item.pid}` : '');
+  const host = String(item?.original_ip || item?.hostname || item?.host || '').trim().toLowerCase();
+  const port = Number(item?.original_port || item?.port || 0);
+  if (!app || !host || !port) return '';
+  return `${app}\u001f${host}\u001f${port}`;
+}
+
+function newConnectionKeySet() {
+  const keys = new Set();
+  for (const item of snapshot.new_connections || []) {
+    const app = String(item?.exe_path || '').trim().toLowerCase() || (item?.pid ? `pid:${item.pid}` : '');
+    const port = Number(item?.original_port || item?.port || 0);
+    if (!app || !port) continue;
+    for (const rawHost of [item?.original_ip, item?.hostname, item?.host]) {
+      const host = String(rawHost || '').trim().toLowerCase();
+      if (host) keys.add(`${app}\u001f${host}\u001f${port}`);
+    }
+  }
+  return keys;
+}
+
+function baseFocusedConnections(filter = ui.connFilter) {
+  return connectionsForFilter(filter).filter(connectionMatchesFocus);
+}
+
+function searchedFocusedConnections(filter = ui.connFilter) {
+  return baseFocusedConnections(filter).filter(connectionMatchesSearch);
 }
 
 function filteredConnections() {
+  if (ui.connFilter === 'new') return searchedFocusedConnections('new');
   return searchedFocusedConnections().filter((c) => scopeMatchesFilter(c, ui.connFilter)).filter((c) => {
     if (ui.connFilter === 'proxy' || ui.connFilter === 'direct' || ui.connFilter === 'block') {
       return actionMatchesFilter(c.action, ui.connFilter);
@@ -1063,8 +1112,10 @@ function filteredConnections() {
 }
 
 function filteredLogs() {
+  const newKeys = ui.connFilter === 'new' ? newConnectionKeySet() : null;
   return (logEntries || []).filter((entry) => {
     if (!logMatchesFocus(entry)) return false;
+    if (newKeys && !newKeys.has(connectionNoveltyKey(entry))) return false;
     if (!scopeMatchesFilter(entry, ui.connFilter)) return false;
     if (ui.connFilter === 'proxy' || ui.connFilter === 'direct' || ui.connFilter === 'block') {
       return actionMatchesFilter(entry.action, ui.connFilter);
@@ -1160,11 +1211,12 @@ function renderConnectionSearch() {
 }
 
 function renderConnectionTabs() {
-  const distinct = collapseConnections(searchedFocusedConnections());
+  const distinct = collapseConnections(searchedFocusedConnections('all'));
+  const newDistinct = collapseConnections(searchedFocusedConnections('new'));
   const ruleFocused = !!(ui.focus?.ruleId || ui.focus?.ruleName);
   const inScope = ruleFocused ? distinct : distinct.filter((c) => isMatchedRuleItem(c));
   const more = ruleFocused ? [] : distinct.filter((c) => isMoreItem(c));
-  const counts = { all: inScope.length, proxy: 0, direct: 0, block: 0, more: more.length };
+  const counts = { all: inScope.length, proxy: 0, direct: 0, block: 0, more: more.length, new: newDistinct.length };
   for (const c of inScope) {
     const a = normalizeAction(c.action);
     if (a === 'block') counts.block++;
@@ -1177,6 +1229,7 @@ function renderConnectionTabs() {
     ['direct', `Direct (${counts.direct})`],
     ['block', `Block (${counts.block})`],
     ['more', `Ещё (${counts.more})`],
+    ['new', `Новые (${counts.new})`],
   ];
   $('connectionTabs').innerHTML = tabs.map(([key, label]) => `<button type="button" class="tab ${ui.connFilter === key ? 'active' : ''}" data-filter="${key}">${label}</button>`).join('');
   $('connectionTabs').querySelectorAll('[data-filter]').forEach((btn) => {
@@ -1195,10 +1248,12 @@ function renderConnectionTabs() {
 }
 
 function connectionRowClass(c) {
+  const classes = [];
+  if (ui.connFilter === 'new') classes.push('conn-new');
   const a = normalizeAction(c.action);
-  if (a === 'block') return 'conn-block';
-  if (a === 'proxy' || a === 'chain') return 'conn-proxy';
-  return '';
+  if (a === 'block') classes.push('conn-block');
+  if (a === 'proxy' || a === 'chain') classes.push('conn-proxy');
+  return classes.join(' ');
 }
 
 async function copyText(text) {
@@ -1230,6 +1285,13 @@ function renderConnections() {
   const rows = collapseConnections(rawRows);
   const tbody = $('connectionsTable').querySelector('tbody');
   if (!rows.length) {
+    if (ui.connFilter === 'new') {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Новых соединений в текущем окне нет.</td></tr>';
+      const searchInfo = ui.connSearch.trim() ? ` · поиск: ${ui.connSearch.trim()}` : '';
+      const windowWarning = newConnectionBaselineMinutes() <= newConnectionRecentMinutes() ? ' Окно истории должно быть больше минуты.' : '';
+      $('connectionSummary').textContent = `Вкладка «Новые» показывает адреса, впервые появившиеся у приложения: ${newConnectionWindowText()}${searchInfo}.${windowWarning}`;
+      return;
+    }
     tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Нет соединений в текущем фильтре.</td></tr>';
     const searchInfo = ui.connSearch.trim() ? ` · поиск: ${ui.connSearch.trim()}` : '';
     $('connectionSummary').textContent = `История соединений хранится ${formatMinutesRu()}. По умолчанию показаны соединения, попавшие под явные правила; вкладка «Ещё» показывает остальное${searchInfo}.`;
@@ -1288,7 +1350,9 @@ function renderConnections() {
   const blockCount = rows.filter((c) => normalizeAction(c.action) === 'block').length;
   const groupedAway = Math.max(0, rawRows.length - rows.length);
   const focusText = describeFocus().join(' · ');
-  const scopeLabel = ui.focus?.ruleId ? `правило ${ui.focus.ruleName || ui.focus.ruleId}` : (ui.connFilter === 'more' ? 'вкладка Ещё' : (ui.connFilter === 'all' ? 'явные правила' : actionLabel(ui.connFilter))); 
+  const scopeLabel = ui.connFilter === 'new'
+    ? newConnectionWindowText()
+    : (ui.focus?.ruleId ? `правило ${ui.focus.ruleName || ui.focus.ruleId}` : (ui.connFilter === 'more' ? 'вкладка Ещё' : (ui.connFilter === 'all' ? 'явные правила' : actionLabel(ui.connFilter))));
   const searchText = ui.connSearch.trim();
   $('connectionSummary').textContent = `Показано ${rows.length}${groupedAway > 0 ? ` (сгруппировано ${groupedAway} дубл.)` : ''} · ${scopeLabel} · proxy ${proxyCount} · block ${blockCount} · история ${formatMinutesRu()}${searchText ? ` · поиск: ${searchText}` : ''}${focusText ? ` · ${focusText}` : ''}`;
 }
@@ -1303,7 +1367,8 @@ function renderLogs(options = {}) {
   const lines = items.slice().reverse().map((entry) => `[${formatDateTime(entry.time)}] [${String(entry.level || '').toUpperCase()}]${logMetaText(entry)} ${entry.message}`);
   box.textContent = lines.join('\n');
   const parts = ['Лог в реальном времени', 'до 100 последних записей на процесс'];
-  if (ui.connFilter === 'more') parts.push('вкладка: Ещё');
+  if (ui.connFilter === 'new') parts.push('вкладка: Новые');
+  else if (ui.connFilter === 'more') parts.push('вкладка: Ещё');
   else if (ui.connFilter !== 'all') parts.push(`вкладка: ${actionLabel(ui.connFilter)}`);
   else parts.push('вкладка: Все по правилам');
   const focusText = describeFocus().join(' · ');

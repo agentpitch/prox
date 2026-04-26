@@ -122,7 +122,8 @@ details.rule-row>summary::-webkit-details-marker{display:none}
 .stat-rx{background:#effcf6;border-color:#b7ead7}
 .stat-tx{background:#eff6ff;border-color:#bfdbfe}
 .stat-total{background:#f9fafb}
-.tabs{display:flex;gap:8px;flex-wrap:wrap}
+.tabs{display:flex;gap:8px;flex:0 0 auto;flex-wrap:nowrap;min-width:0}
+.tab{white-space:nowrap}
 .tab.active{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8}
 .empty-state{padding:14px;text-align:center;color:var(--muted)}
 .editor-dialog{width:min(900px,calc(100vw - 32px));border:none;padding:0;background:transparent}
@@ -162,7 +163,6 @@ details.rule-row>summary::-webkit-details-marker{display:none}
   .proxy-target input{min-width:0}
   .proxy-buttons{width:100%;justify-content:flex-start}
   .activity-stats{flex-wrap:wrap}
-  .connection-search{max-width:100%;min-width:0;width:100%}
 }
 
 .focus-bar{display:none;align-items:center;justify-content:space-between;gap:10px;padding:0 0 12px;flex-wrap:wrap}
@@ -183,12 +183,19 @@ details.rule-row>summary::-webkit-details-marker{display:none}
 .rule-filter-btn:hover{text-decoration:underline;background:transparent}
 #connectionsTable td .action-filter-btn,#connectionsTable td .rule-filter-btn{font:inherit}
 
-.connection-filter-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-start;min-width:0;width:100%}
-.connection-search{position:relative;display:flex;align-items:center;min-width:min(420px,100%);flex:1 1 360px;max-width:520px}
+.connection-filter-tools{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;justify-content:flex-start;min-width:0;width:100%}
+#connectionTabs{gap:6px}
+#connectionTabs .tab{padding:8px 10px}
+.connection-search{position:relative;display:flex;align-items:center;min-width:180px;flex:0 1 300px;max-width:320px}
 .connection-search input{min-width:0;padding-right:36px}
 .connection-search .search-clear{position:absolute;top:50%;right:8px;transform:translateY(-50%);width:24px;height:24px;padding:0;border:none;border-radius:999px;background:transparent;color:#6b7280;font-size:18px;line-height:1;display:inline-flex;align-items:center;justify-content:center;opacity:0;pointer-events:none}
 .connection-search .search-clear:hover{background:#f3f4f6;color:#111827}
 .connection-search .search-clear.visible{opacity:1;pointer-events:auto}
+@media (max-width: 760px){
+  .connection-filter-tools{flex-wrap:wrap}
+  .tabs{flex:1 1 100%;flex-wrap:wrap}
+  .connection-search{flex:1 1 100%;max-width:100%;min-width:0;width:100%}
+}
 .rule-row.rule-disabled .list-title > span:nth-child(2){text-decoration:line-through;color:#7c2d12}
 
 

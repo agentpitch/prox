@@ -1224,12 +1224,12 @@ function renderConnectionTabs() {
     else counts.proxy++;
   }
   const tabs = [
+    ['new', `Новые (${counts.new})`],
     ['all', `Все (${counts.all})`],
     ['proxy', `Proxy / Chain (${counts.proxy})`],
     ['direct', `Direct (${counts.direct})`],
     ['block', `Block (${counts.block})`],
     ['more', `Ещё (${counts.more})`],
-    ['new', `Новые (${counts.new})`],
   ];
   $('connectionTabs').innerHTML = tabs.map(([key, label]) => `<button type="button" class="tab ${ui.connFilter === key ? 'active' : ''}" data-filter="${key}">${label}</button>`).join('');
   $('connectionTabs').querySelectorAll('[data-filter]').forEach((btn) => {

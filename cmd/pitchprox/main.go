@@ -32,7 +32,7 @@ func main() {
 
 	switch cmd {
 	case "run":
-		if !util.IsElevated() {
+		if !util.IsElevated() && os.Getenv("PITCHPROX_ALLOW_UNELEVATED") != "1" {
 			must(util.RelaunchSelfElevated(os.Args[1:]))
 			return
 		}
@@ -86,6 +86,15 @@ func (p programTrayProvider) EnableWebUI() error {
 }
 func (p programTrayProvider) DisableWebUI() error {
 	return p.prog.DisableWebUI()
+}
+func (p programTrayProvider) ServicePaused() bool {
+	return p.prog.ServicePaused()
+}
+func (p programTrayProvider) PauseService() error {
+	return p.prog.PauseService()
+}
+func (p programTrayProvider) ResumeService() error {
+	return p.prog.ResumeService()
 }
 func (p programTrayProvider) RequestStop() error {
 	p.prog.RequestStop()

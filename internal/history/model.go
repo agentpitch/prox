@@ -28,6 +28,27 @@ type ConnectionRecord struct {
 	Count         int64
 }
 
+type DroppedRecord struct {
+	DropID     string
+	DroppedAt  time.Time
+	Connection ConnectionRecord
+}
+
+type DroppedQuery struct {
+	Search string
+	Offset int
+	Limit  int
+}
+
+type DroppedResult struct {
+	Items     []DroppedRecord
+	Total     int
+	Offset    int
+	Limit     int
+	MaxBytes  int64
+	FileBytes int64
+}
+
 type LogRecord struct {
 	Time         time.Time
 	Level        string

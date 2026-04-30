@@ -456,3 +456,123 @@ func TestStoreNewConnectionsRequiresWindowLongerThanRecent(t *testing.T) {
 		t.Fatalf("new connections len = %d, want 0 when baseline is not longer than recent: %+v", len(items), items)
 	}
 }
+
+func TestStoreDroppedConnectionsSearchPaginationAndDelete(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		store.RecordDroppedConnection(ConnectionRecord{
+			ID:            fmt.Sprintf("blocked-%d", i),
+			PID:           uint32(900 + i),
+			ExePath:       fmt.Sprintf(`C:\Apps\blocked-%d.exe`, i),
+			OriginalIP:    fmt.Sprintf("203.0.113.%d", i+1),
+			OriginalPort:  443,
+			Hostname:      fmt.Sprintf("blocked-%d.example", i),
+			RuleID:        "deny",
+			RuleName:      "Deny rule",
+			Action:        config.ActionBlock,
+			State:         "blocked",
+			CreatedAt:     ts,
+			LastUpdatedAt: ts,
+			Count:         1,
+		})
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+
+	all, err := store.DroppedConnections(DroppedQuery{Limit: 2})
+	if err != nil {
+		t.Fatalf("dropped connections: %v", err)
+	}
+	if all.Total != 3 || len(all.Items) != 2 {
+		t.Fatalf("dropped page total=%d len=%d, want total=3 len=2", all.Total, len(all.Items))
+	}
+	if all.Items[0].Connection.ID != "blocked-2" {
+		t.Fatalf("newest dropped id = %q, want blocked-2", all.Items[0].Connection.ID)
+	}
+
+	filtered, err := store.DroppedConnections(DroppedQuery{Search: "blocked-1 443 deny", Limit: 100})
+	if err != nil {
+		t.Fatalf("filtered dropped connections: %v", err)
+	}
+	if filtered.Total != 1 || filtered.Items[0].Connection.ID != "blocked-1" {
+		t.Fatalf("filtered dropped = total %d items %+v, want blocked-1", filtered.Total, filtered.Items)
+	}
+
+	if err := store.DeleteDroppedConnections([]string{filtered.Items[0].DropID}); err != nil {
+		t.Fatalf("delete dropped: %v", err)
+	}
+	afterDelete, err := store.DroppedConnections(DroppedQuery{Search: "blocked-1", Limit: 100})
+	if err != nil {
+		t.Fatalf("dropped after delete: %v", err)
+	}
+	if afterDelete.Total != 0 {
+		t.Fatalf("deleted dropped total = %d, want 0", afterDelete.Total)
+	}
+}
+
+func TestStoreDroppedConnectionsHonorsSizeLimit(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "pitchProx.history")
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+	store.SetDroppedLogMaxBytes(2 * 1024)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 40; i++ {
+		ts := now.Add(time.Duration(i) * time.Second)
+		store.RecordDroppedConnection(ConnectionRecord{
+			ID:            fmt.Sprintf("limited-%02d", i),
+			PID:           uint32(1200 + i),
+			ExePath:       fmt.Sprintf(`C:\VeryLongApplicationPath\limited-%02d-worker-with-extra-context.exe`, i),
+			OriginalIP:    fmt.Sprintf("198.51.100.%d", i+1),
+			OriginalPort:  uint16(1000 + i),
+			Hostname:      fmt.Sprintf("limited-%02d.example.test", i),
+			RuleID:        "limited-deny",
+			RuleName:      "Limited deny",
+			Action:        config.ActionBlock,
+			State:         "blocked",
+			CreatedAt:     ts,
+			LastUpdatedAt: ts,
+			Count:         1,
+		})
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush store: %v", err)
+	}
+
+	result, err := store.DroppedConnections(DroppedQuery{Limit: 100})
+	if err != nil {
+		t.Fatalf("dropped limited: %v", err)
+	}
+	if result.FileBytes > result.MaxBytes {
+		t.Fatalf("dropped file bytes = %d, want <= %d", result.FileBytes, result.MaxBytes)
+	}
+	if result.Total == 0 {
+		t.Fatalf("dropped limited total = 0, want newest records kept")
+	}
+	if got := result.Items[0].Connection.ID; got != "limited-39" {
+		t.Fatalf("newest kept dropped = %q, want limited-39", got)
+	}
+	if result.Total >= 40 {
+		t.Fatalf("dropped total = %d, want old records compacted", result.Total)
+	}
+}

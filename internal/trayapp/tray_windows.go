@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/png"
 	"io"
 	"net"
 	"net/url"
@@ -59,11 +58,16 @@ const (
 	tpmRightButton     = 0x0002
 	tpmReturnCmd       = 0x0100
 	tpmNoNotify        = 0x0080
+	swpNoSize          = 0x0001
+	swpNoMove          = 0x0002
+	swpNoActivate      = 0x0010
 	monitorDefaultNear = 0x00000002
 	ninKeySelect       = 0x0401
 	menuManage         = 1001
 	menuExit           = 1002
 	menuDisableWebUI   = 1003
+	menuPauseService   = 1004
+	menuResumeService  = 1005
 	offlineExitAfter   = 15 * time.Second
 	pollInterval       = 2 * time.Second
 	trayHistorySeconds = 12
@@ -80,6 +84,12 @@ type WebUIController interface {
 	WebUIRunning() bool
 	EnableWebUI() error
 	DisableWebUI() error
+}
+
+type ServiceController interface {
+	ServicePaused() bool
+	PauseService() error
+	ResumeService() error
 }
 
 type remoteWebUIController struct {
@@ -169,6 +179,7 @@ var (
 	procDestroyMenu         = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyMenu")
 	procGetCursorPos        = windows.NewLazySystemDLL("user32.dll").NewProc("GetCursorPos")
 	procSetForegroundWindow = windows.NewLazySystemDLL("user32.dll").NewProc("SetForegroundWindow")
+	procSetWindowPos        = windows.NewLazySystemDLL("user32.dll").NewProc("SetWindowPos")
 	procMonitorFromPoint    = windows.NewLazySystemDLL("user32.dll").NewProc("MonitorFromPoint")
 	procGetMonitorInfoW     = windows.NewLazySystemDLL("user32.dll").NewProc("GetMonitorInfoW")
 	procLoadImageW          = windows.NewLazySystemDLL("user32.dll").NewProc("LoadImageW")
@@ -177,6 +188,8 @@ var (
 	procCreateMutexW        = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
 	currentTrayMu           sync.Mutex
 	currentTray             *helper
+	hwndTopmost             = ^uintptr(0)
+	hwndNotopmost           = ^uintptr(1)
 )
 
 type helper struct {
@@ -339,6 +352,12 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		case menuManage:
 			h.openManagement()
 			return 0
+		case menuPauseService:
+			h.pauseService()
+			return 0
+		case menuResumeService:
+			h.openManagement()
+			return 0
 		case menuExit:
 			go h.requestProgramStop()
 			return 0
@@ -352,6 +371,11 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 }
 
 func (h *helper) openManagement() {
+	if ctl := h.serviceController(); ctl != nil && ctl.ServicePaused() {
+		if err := ctl.ResumeService(); err != nil {
+			return
+		}
+	}
 	if ctl := h.webUIController(); ctl != nil {
 		if err := ctl.EnableWebUI(); err != nil {
 			return
@@ -373,13 +397,26 @@ func (h *helper) showContextMenu() {
 	defer procDestroyMenu.Call(menu)
 	manageText, _ := windows.UTF16PtrFromString("Управление")
 	disableWebUIText, _ := windows.UTF16PtrFromString("Отключить WebUI")
+	pauseText, _ := windows.UTF16PtrFromString("Приостановить")
+	resumeText, _ := windows.UTF16PtrFromString("Запустить")
 	exitText, _ := windows.UTF16PtrFromString("Выйти")
-	procAppendMenuW.Call(menu, mfString, menuManage, uintptr(unsafe.Pointer(manageText)))
-	if ctl := h.webUIController(); ctl != nil && ctl.WebUIRunning() {
-		procAppendMenuW.Call(menu, mfString, menuDisableWebUI, uintptr(unsafe.Pointer(disableWebUIText)))
+	paused := false
+	if ctl := h.serviceController(); ctl != nil {
+		paused = ctl.ServicePaused()
+	}
+	if paused {
+		procAppendMenuW.Call(menu, mfString, menuResumeService, uintptr(unsafe.Pointer(resumeText)))
+	} else {
+		procAppendMenuW.Call(menu, mfString, menuManage, uintptr(unsafe.Pointer(manageText)))
+		procAppendMenuW.Call(menu, mfString, menuPauseService, uintptr(unsafe.Pointer(pauseText)))
+		if ctl := h.webUIController(); ctl != nil && ctl.WebUIRunning() {
+			procAppendMenuW.Call(menu, mfString, menuDisableWebUI, uintptr(unsafe.Pointer(disableWebUIText)))
+		}
 	}
 	procAppendMenuW.Call(menu, mfString, menuExit, uintptr(unsafe.Pointer(exitText)))
 	anchor, flags := h.menuAnchor()
+	h.setContextMenuOwnerTopmost(true)
+	defer h.setContextMenuOwnerTopmost(false)
 	procSetForegroundWindow.Call(uintptr(h.hwnd))
 	r1, _, _ := procTrackPopupMenu.Call(
 		menu,
@@ -394,6 +431,10 @@ func (h *helper) showContextMenu() {
 	switch uint32(r1) {
 	case menuManage:
 		h.openManagement()
+	case menuPauseService:
+		h.pauseService()
+	case menuResumeService:
+		h.openManagement()
 	case menuDisableWebUI:
 		h.disableWebUI()
 	case menuExit:
@@ -403,6 +444,25 @@ func (h *helper) showContextMenu() {
 		nid := h.notifyData(h.iconHandle, "")
 		procShellNotifyIconW.Call(nimSetFocus, uintptr(unsafe.Pointer(&nid)))
 	}
+}
+
+func (h *helper) setContextMenuOwnerTopmost(topmost bool) {
+	if h == nil || h.hwnd == 0 {
+		return
+	}
+	insertAfter := hwndNotopmost
+	if topmost {
+		insertAfter = hwndTopmost
+	}
+	procSetWindowPos.Call(
+		uintptr(h.hwnd),
+		insertAfter,
+		0,
+		0,
+		0,
+		0,
+		swpNoMove|swpNoSize|swpNoActivate,
+	)
 }
 
 func (h *helper) webUIController() WebUIController {
@@ -416,10 +476,28 @@ func (h *helper) webUIController() WebUIController {
 	return remoteWebUIController{url: h.url}
 }
 
+func (h *helper) serviceController() ServiceController {
+	if h.provider != nil {
+		ctl, _ := h.provider.(ServiceController)
+		return ctl
+	}
+	if h.url == "" {
+		return nil
+	}
+	return remoteWebUIController{url: h.url}
+}
+
 func (h *helper) disableWebUI() {
 	if ctl := h.webUIController(); ctl != nil {
 		_ = ctl.DisableWebUI()
 	}
+}
+
+func (h *helper) pauseService() {
+	if ctl := h.serviceController(); ctl != nil {
+		_ = ctl.PauseService()
+	}
+	h.setPausedIcon()
 }
 
 func (c remoteWebUIController) WebUIRunning() bool {
@@ -455,6 +533,43 @@ func (c remoteWebUIController) setWebUI(enabled bool) error {
 	}
 	if status != 200 && status != 204 {
 		return fmt.Errorf("webui %s status: %d", action, status)
+	}
+	return nil
+}
+
+func (c remoteWebUIController) ServicePaused() bool {
+	body, status, err := httpJSONRequest("GET", trimTrailingSlash(c.url)+"/api/control/service/status", nil)
+	if err != nil || status != 200 {
+		return false
+	}
+	var payload struct {
+		Paused bool `json:"paused"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Paused
+}
+
+func (c remoteWebUIController) PauseService() error {
+	return c.setServicePaused(true)
+}
+
+func (c remoteWebUIController) ResumeService() error {
+	return c.setServicePaused(false)
+}
+
+func (c remoteWebUIController) setServicePaused(paused bool) error {
+	action := "resume"
+	if paused {
+		action = "pause"
+	}
+	_, status, err := httpJSONRequest("POST", trimTrailingSlash(c.url)+"/api/control/service/"+action, []byte(`{}`))
+	if err != nil {
+		return err
+	}
+	if status != 200 && status != 204 {
+		return fmt.Errorf("service %s status: %d", action, status)
 	}
 	return nil
 }
@@ -496,6 +611,11 @@ func (h *helper) pollLoop() {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for range ticker.C {
+		if ctl := h.serviceController(); ctl != nil && ctl.ServicePaused() {
+			h.offlineFrom = time.Time{}
+			h.setPausedIcon()
+			continue
+		}
 		view, err := h.fetchTrayView()
 		if err != nil {
 			if h.provider != nil {
@@ -587,6 +707,39 @@ func (h *helper) setOfflineIcon() {
 	_ = h.updateIcon(img, "pitchProx: сервис недоступен", "offline")
 }
 
+func (h *helper) setPausedIcon() {
+	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	bg := color.NRGBA{R: 17, G: 24, B: 39, A: 255}
+	border := color.NRGBA{R: 248, G: 113, B: 113, A: 255}
+	muted := color.NRGBA{R: 156, G: 163, B: 175, A: 255}
+	red := color.NRGBA{R: 220, G: 38, B: 38, A: 255}
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			switch {
+			case x == 0 || x == 15 || y == 0 || y == 15:
+				img.SetNRGBA(x, y, border)
+			default:
+				img.SetNRGBA(x, y, bg)
+			}
+		}
+	}
+	for x := 5; x <= 10; x++ {
+		img.SetNRGBA(x, 4, muted)
+		img.SetNRGBA(x, 11, muted)
+	}
+	for y := 5; y <= 10; y++ {
+		img.SetNRGBA(5, y, muted)
+		img.SetNRGBA(10, y, muted)
+	}
+	for i := 2; i <= 13; i++ {
+		img.SetNRGBA(i, i, red)
+		if i+1 < 16 {
+			img.SetNRGBA(i+1, i, red)
+		}
+	}
+	_ = h.updateIcon(img, "pitchProx: сервис приостановлен", "paused")
+}
+
 func (h *helper) setTrafficIcon(view monitor.TrayView) {
 	history, rx, tx, peakRx, peakTx := trafficSeries(view.Traffic)
 	signature := trafficSignature(history)
@@ -594,18 +747,19 @@ func (h *helper) setTrafficIcon(view monitor.TrayView) {
 		return
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	drawTrafficIconFrame(img)
 	baseline := 13
-	axis := color.NRGBA{R: 148, G: 163, B: 184, A: 210}
+	axis := color.NRGBA{R: 226, G: 232, B: 240, A: 255}
 	for x := 1; x < 15; x++ {
 		img.SetNRGBA(x, baseline+1, axis)
 	}
 	for y := 1; y < 15; y++ {
 		img.SetNRGBA(1, y, axis)
 	}
-	rxFill := color.NRGBA{R: 34, G: 197, B: 94, A: 150}
-	rxLine := color.NRGBA{R: 22, G: 163, B: 74, A: 255}
-	txFill := color.NRGBA{R: 59, G: 130, B: 246, A: 150}
-	txLine := color.NRGBA{R: 37, G: 99, B: 235, A: 255}
+	rxFill := color.NRGBA{R: 20, G: 83, B: 45, A: 255}
+	rxLine := color.NRGBA{R: 74, G: 222, B: 128, A: 255}
+	txFill := color.NRGBA{R: 30, G: 64, B: 175, A: 255}
+	txLine := color.NRGBA{R: 147, G: 197, B: 253, A: 255}
 	drawRxFirst := rx >= tx
 	if rx == tx {
 		drawRxFirst = peakRx >= peakTx
@@ -619,6 +773,25 @@ func (h *helper) setTrafficIcon(view monitor.TrayView) {
 	}
 	tooltip := fmt.Sprintf("pitchProx · ↓ %s/s (peak %s/s) · ↑ %s/s (peak %s/s)", formatBytes(rx), formatBytes(peakRx), formatBytes(tx), formatBytes(peakTx))
 	_ = h.updateIcon(img, tooltip, signature)
+}
+
+func drawTrafficIconFrame(img *image.NRGBA) {
+	bg := color.NRGBA{R: 15, G: 23, B: 42, A: 245}
+	border := color.NRGBA{R: 248, G: 250, B: 252, A: 240}
+	shadow := color.NRGBA{R: 2, G: 6, B: 23, A: 255}
+	bounds := img.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			switch {
+			case x == bounds.Min.X || x == bounds.Max.X-1 || y == bounds.Min.Y || y == bounds.Max.Y-1:
+				img.SetNRGBA(x, y, border)
+			case x == bounds.Min.X+1 || y == bounds.Max.Y-2:
+				img.SetNRGBA(x, y, shadow)
+			default:
+				img.SetNRGBA(x, y, bg)
+			}
+		}
+	}
 }
 
 type trafficPoint struct {
@@ -805,25 +978,75 @@ func copyWide(dst []uint16, s string) {
 }
 
 func encodeICO(img image.Image) ([]byte, error) {
-	var pngBuf bytes.Buffer
-	if err := png.Encode(&pngBuf, img); err != nil {
-		return nil, err
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	if width <= 0 || height <= 0 || width > 256 || height > 256 {
+		return nil, fmt.Errorf("unsupported icon size: %dx%d", width, height)
 	}
-	pngData := pngBuf.Bytes()
-	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(0))
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
-	buf.WriteByte(16)
-	buf.WriteByte(16)
-	buf.WriteByte(0)
-	buf.WriteByte(0)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(32))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(pngData)))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(22))
-	buf.Write(pngData)
-	return buf.Bytes(), nil
+
+	const (
+		iconDirSize      = 6
+		iconDirEntrySize = 16
+		bitmapHeaderSize = 40
+		bitsPerPixel     = 32
+	)
+	maskStride := ((width + 31) / 32) * 4
+	xorBytes := width * height * 4
+	maskBytes := maskStride * height
+	imageBytes := bitmapHeaderSize + xorBytes + maskBytes
+	out := make([]byte, 0, iconDirSize+iconDirEntrySize+imageBytes)
+
+	out = appendUint16LE(out, 0) // reserved
+	out = appendUint16LE(out, 1) // icon
+	out = appendUint16LE(out, 1) // one image
+	out = append(out, iconDimensionByte(width), iconDimensionByte(height), 0, 0)
+	out = appendUint16LE(out, 1)
+	out = appendUint16LE(out, bitsPerPixel)
+	out = appendUint32LE(out, uint32(imageBytes))
+	out = appendUint32LE(out, iconDirSize+iconDirEntrySize)
+
+	out = appendUint32LE(out, bitmapHeaderSize)
+	out = appendUint32LE(out, uint32(width))
+	out = appendUint32LE(out, uint32(height*2)) // ICO DIB height includes XOR and AND masks.
+	out = appendUint16LE(out, 1)
+	out = appendUint16LE(out, bitsPerPixel)
+	out = appendUint32LE(out, 0) // BI_RGB
+	out = appendUint32LE(out, uint32(xorBytes+maskBytes))
+	out = appendUint32LE(out, 0)
+	out = appendUint32LE(out, 0)
+	out = appendUint32LE(out, 0)
+	out = appendUint32LE(out, 0)
+
+	for y := bounds.Max.Y - 1; y >= bounds.Min.Y; y-- {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			out = append(out, c.B, c.G, c.R, c.A)
+		}
+	}
+	for i := 0; i < maskBytes; i++ {
+		out = append(out, 0)
+	}
+	return out, nil
+}
+
+func iconDimensionByte(v int) byte {
+	if v == 256 {
+		return 0
+	}
+	return byte(v)
+}
+
+func appendUint16LE(dst []byte, v uint16) []byte {
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], v)
+	return append(dst, buf[:]...)
+}
+
+func appendUint32LE(dst []byte, v uint32) []byte {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], v)
+	return append(dst, buf[:]...)
 }
 
 func (h *helper) quit() {

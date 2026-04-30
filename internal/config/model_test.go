@@ -64,6 +64,9 @@ func TestNormalizeClearsUnusedRouteTargets(t *testing.T) {
 	if cfg.Rules[0].ProxyID != "" || cfg.Rules[0].ChainID != "" {
 		t.Fatalf("direct rule retained route targets: %+v", cfg.Rules[0])
 	}
+	if cfg.DroppedLogMaxBytes != DefaultDroppedLogMaxBytes {
+		t.Fatalf("dropped log max = %d, want default %d", cfg.DroppedLogMaxBytes, DefaultDroppedLogMaxBytes)
+	}
 }
 
 func TestNormalizeCanonicalizesProxyAndChainActions(t *testing.T) {
@@ -116,5 +119,17 @@ func TestValidateEnabledChainCannotBeEmpty(t *testing.T) {
 	cfg.Rules[0] = Rule{ID: "r1", Name: "Chain rule", Enabled: true, Applications: "*", TargetHosts: "Any", TargetPorts: "443", Action: ActionChain, ChainID: "c1"}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "must contain at least one proxy") {
 		t.Fatalf("expected empty chain validation error, got %v", err)
+	}
+}
+
+func TestValidateDroppedLogMaxBytesRange(t *testing.T) {
+	cfg := testValidConfig()
+	cfg.DroppedLogMaxBytes = MinDroppedLogMaxBytes - 1
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "dropped_log_max_bytes") {
+		t.Fatalf("expected dropped log size validation error, got %v", err)
+	}
+	cfg.DroppedLogMaxBytes = DefaultDroppedLogMaxBytes
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("expected valid dropped log size, got %v", err)
 	}
 }

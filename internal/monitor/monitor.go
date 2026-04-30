@@ -111,6 +111,15 @@ type Bus struct {
 	lastTrafficPrune time.Time
 }
 
+type DiagnosticStats struct {
+	ActiveConnections  int                     `json:"active_connections"`
+	TrafficLiveBuckets int                     `json:"traffic_live_buckets"`
+	Subscribers        int                     `json:"subscribers"`
+	UIActive           bool                    `json:"ui_active"`
+	RetentionSeconds   int64                   `json:"retention_seconds"`
+	History            history.DiagnosticStats `json:"history"`
+}
+
 const (
 	uiVerboseWindow          = 90 * time.Second
 	defaultRetention         = 7 * time.Minute
@@ -173,6 +182,27 @@ func (b *Bus) SetRetentionWindow(d time.Duration) {
 	}
 }
 
+func (b *Bus) SetDroppedLogMaxBytes(n int64) {
+	if b == nil || b.history == nil {
+		return
+	}
+	b.history.SetDroppedLogMaxBytes(n)
+}
+
+func (b *Bus) DroppedConnections(query history.DroppedQuery) (history.DroppedResult, error) {
+	if b == nil || b.history == nil {
+		return history.DroppedResult{}, nil
+	}
+	return b.history.DroppedConnections(query)
+}
+
+func (b *Bus) DeleteDroppedConnections(ids []string) error {
+	if b == nil || b.history == nil {
+		return nil
+	}
+	return b.history.DeleteDroppedConnections(ids)
+}
+
 func (b *Bus) MarkUIActive() {
 	b.mu.Lock()
 	b.uiActiveUntil = time.Now().UTC().Add(uiVerboseWindow)
@@ -196,6 +226,29 @@ func (b *Bus) DisableUI() {
 	b.mu.Unlock()
 }
 
+func (b *Bus) CloseActiveConnections() {
+	if b == nil {
+		return
+	}
+	b.mu.RLock()
+	active := make([]Connection, 0, len(b.active))
+	for _, c := range b.active {
+		active = append(active, c)
+	}
+	b.mu.RUnlock()
+
+	for _, c := range active {
+		c.State = "closed"
+		b.UpsertConnection(c)
+	}
+
+	b.mu.Lock()
+	b.trafficLive = map[int64]TrafficSample{}
+	b.trafficDeletes = 0
+	b.lastTrafficPrune = time.Time{}
+	b.mu.Unlock()
+}
+
 func (b *Bus) UIActive() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -211,6 +264,27 @@ func (b *Bus) UIWake() <-chan struct{} {
 	ch := b.uiWake
 	b.mu.RUnlock()
 	return ch
+}
+
+func (b *Bus) DiagnosticStats() DiagnosticStats {
+	if b == nil {
+		return DiagnosticStats{}
+	}
+	now := time.Now().UTC()
+	b.mu.RLock()
+	out := DiagnosticStats{
+		ActiveConnections:  len(b.active),
+		TrafficLiveBuckets: len(b.trafficLive),
+		Subscribers:        len(b.subs),
+		UIActive:           b.uiActiveLocked(now),
+		RetentionSeconds:   int64(b.retentionWindowLocked() / time.Second),
+	}
+	hist := b.history
+	b.mu.RUnlock()
+	if hist != nil {
+		out.History = hist.DiagnosticStats()
+	}
+	return out
 }
 
 func (b *Bus) UpsertConnection(c Connection) {
@@ -257,7 +331,11 @@ func (b *Bus) UpsertConnection(c Connection) {
 	b.mu.Unlock()
 
 	if persist && b.history != nil {
-		b.history.RecordConnection(toHistoryConnection(c))
+		record := toHistoryConnection(c)
+		b.history.RecordConnection(record)
+		if state == "blocked" {
+			b.history.RecordDroppedConnection(record)
+		}
 	}
 }
 

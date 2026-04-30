@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -125,6 +127,91 @@ func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {
 	}
 	if status := httpStatus(t, client, "http://"+addr+"/api/control/webui/status"); status != http.StatusOK {
 		t.Fatalf("GET webui status = %d, want 200", status)
+	}
+	if status := httpStatus(t, client, "http://"+addr+"/api/control/service/status"); status != http.StatusOK {
+		t.Fatalf("GET service status = %d, want 200", status)
+	}
+}
+
+func TestServerDroppedConnectionsAPI(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	rt := newFakeRuntime(t, addr)
+	now := time.Now().UTC().Truncate(time.Second)
+	rt.mon.UpsertConnection(monitor.Connection{
+		ID:            "blocked-api-1",
+		PID:           77,
+		ExePath:       `C:\Apps\blocked-api.exe`,
+		OriginalIP:    "203.0.113.77",
+		OriginalPort:  443,
+		Hostname:      "blocked-api.example",
+		RuleID:        "deny",
+		RuleName:      "Deny",
+		Action:        config.ActionBlock,
+		State:         "blocked",
+		CreatedAt:     now,
+		LastUpdatedAt: now,
+		Count:         1,
+	})
+
+	srv, err := New(addr, rt, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	defer func() {
+		_ = srv.Close()
+		<-done
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/api/dropped?q=blocked-api&limit=100")
+	if err != nil {
+		t.Fatalf("GET dropped: %v", err)
+	}
+	var page droppedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("decode dropped: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET dropped status = %d, want 200", resp.StatusCode)
+	}
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("dropped page total=%d len=%d, want one item", page.Total, len(page.Items))
+	}
+
+	body, _ := json.Marshal(droppedDeleteRequest{IDs: []string{page.Items[0].DropID}})
+	req, err := http.NewRequest(http.MethodDelete, "http://"+addr+"/api/dropped", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new delete request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE dropped: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE dropped status = %d, want 200", resp.StatusCode)
+	}
+
+	resp, err = client.Get("http://" + addr + "/api/dropped?q=blocked-api&limit=100")
+	if err != nil {
+		t.Fatalf("GET dropped after delete: %v", err)
+	}
+	page = droppedResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("decode dropped after delete: %v", err)
+	}
+	_ = resp.Body.Close()
+	if page.Total != 0 {
+		t.Fatalf("dropped total after delete = %d, want 0", page.Total)
 	}
 }
 

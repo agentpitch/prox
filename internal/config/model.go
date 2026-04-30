@@ -17,14 +17,15 @@ const (
 )
 
 type Config struct {
-	Version          int               `json:"version"`
-	UpdatedAt        time.Time         `json:"updated_at"`
-	RetentionMinutes int               `json:"retention_minutes"`
-	HTTP             HTTPConfig        `json:"http"`
-	Transparent      TransparentConfig `json:"transparent"`
-	Proxies          []ProxyProfile    `json:"proxies"`
-	Chains           []ProxyChain      `json:"chains"`
-	Rules            []Rule            `json:"rules"`
+	Version            int               `json:"version"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	RetentionMinutes   int               `json:"retention_minutes"`
+	DroppedLogMaxBytes int64             `json:"dropped_log_max_bytes"`
+	HTTP               HTTPConfig        `json:"http"`
+	Transparent        TransparentConfig `json:"transparent"`
+	Proxies            []ProxyProfile    `json:"proxies"`
+	Chains             []ProxyChain      `json:"chains"`
+	Rules              []Rule            `json:"rules"`
 }
 
 type HTTPConfig struct {
@@ -71,9 +72,10 @@ type Rule struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Version:          1,
-		UpdatedAt:        time.Now().UTC(),
-		RetentionMinutes: 7,
+		Version:            1,
+		UpdatedAt:          time.Now().UTC(),
+		RetentionMinutes:   7,
+		DroppedLogMaxBytes: DefaultDroppedLogMaxBytes,
 		HTTP: HTTPConfig{
 			Listen: "127.0.0.1:18080",
 		},
@@ -108,6 +110,12 @@ func DefaultConfig() Config {
 	}
 }
 
+const (
+	DefaultDroppedLogMaxBytes = int64(10 * 1024 * 1024)
+	MinDroppedLogMaxBytes     = int64(1024)
+	MaxDroppedLogMaxBytes     = int64(1024 * 1024 * 1024)
+)
+
 func Normalize(cfg *Config) {
 	if cfg == nil {
 		return
@@ -117,6 +125,9 @@ func Normalize(cfg *Config) {
 	}
 	if cfg.RetentionMinutes <= 0 {
 		cfg.RetentionMinutes = 7
+	}
+	if cfg.DroppedLogMaxBytes <= 0 {
+		cfg.DroppedLogMaxBytes = DefaultDroppedLogMaxBytes
 	}
 	cfg.HTTP.Listen = strings.TrimSpace(cfg.HTTP.Listen)
 	cfg.Transparent.IPv4Listener = strings.TrimSpace(cfg.Transparent.IPv4Listener)
@@ -217,6 +228,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.RetentionMinutes < 1 || cfg.RetentionMinutes > 1440 {
 		return fmt.Errorf("retention_minutes must be in 1..1440")
+	}
+	if cfg.DroppedLogMaxBytes < MinDroppedLogMaxBytes || cfg.DroppedLogMaxBytes > MaxDroppedLogMaxBytes {
+		return fmt.Errorf("dropped_log_max_bytes must be in %d..%d", MinDroppedLogMaxBytes, MaxDroppedLogMaxBytes)
 	}
 
 	seenProxy := map[string]struct{}{}

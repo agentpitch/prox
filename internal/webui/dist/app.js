@@ -4,6 +4,20 @@ let logEntries = [];
 let ui = {
   connFilter: sessionStorage.getItem('pitchprox_conn_filter') || 'all',
   connSearch: sessionStorage.getItem('pitchprox_conn_search') || '',
+  dropped: {
+    open: false,
+    search: sessionStorage.getItem('pitchprox_dropped_search') || '',
+    offset: 0,
+    limit: 100,
+    total: null,
+    items: [],
+    fileBytes: 0,
+    maxBytes: 10 * 1024 * 1024,
+    selected: new Set(),
+    loading: false,
+    error: '',
+    searchTimer: null,
+  },
   focus: { pid: null, exePath: '', ruleId: '', ruleName: '' },
   snapshotTimer: null,
   events: null,
@@ -15,6 +29,8 @@ let ui = {
   statusMessage: '',
   statusTone: 'muted',
   statusTimer: null,
+  servicePaused: false,
+  serviceBusy: false,
 };
 
 const SNAPSHOT_POLL_MS = 7000;
@@ -26,6 +42,15 @@ function retentionMinutesFor(source = state) {
 
 function retentionMinutes() {
   return retentionMinutesFor(state);
+}
+
+function droppedLogMaxBytesFor(source = state) {
+  const n = Number(source?.dropped_log_max_bytes || 0);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 10 * 1024 * 1024;
+}
+
+function droppedLogMaxMBFor(source = state) {
+  return Math.max(1, Math.round(droppedLogMaxBytesFor(source) / (1024 * 1024)));
 }
 
 function retentionWindowMs() {
@@ -66,6 +91,51 @@ async function api(path, opts = {}) {
   if (!res.ok) throw new Error(await res.text());
   if (res.status === 204) return null;
   return res.json();
+}
+
+function renderServicePauseToggle() {
+  const toggle = $('servicePauseToggle');
+  if (!toggle) return;
+  toggle.checked = !!ui.servicePaused;
+  toggle.disabled = !!ui.serviceBusy;
+  document.body.classList.toggle('service-paused', !!ui.servicePaused);
+}
+
+async function loadServiceStatus() {
+  const data = await api('/api/control/service/status');
+  ui.servicePaused = !!data.paused;
+  renderServicePauseToggle();
+  updateStatusLine();
+  return data;
+}
+
+async function setServicePaused(paused) {
+  ui.serviceBusy = true;
+  renderServicePauseToggle();
+  try {
+    if (paused) {
+      leaveLiveMode(false);
+    }
+    const action = paused ? 'pause' : 'resume';
+    const data = await api(`/api/control/service/${action}`, { method: 'POST', body: '{}' });
+    ui.servicePaused = !!data.paused;
+    renderServicePauseToggle();
+    if (ui.servicePaused) {
+      flashStatus('Сервис приостановлен', 'warn', 6000);
+      return;
+    }
+    flashStatus('Сервис запущен', 'muted');
+    await loadConfig();
+    await loadSnapshot();
+    await enterLiveMode(false);
+  } catch (e) {
+    console.error(e);
+    flashStatus(`Не удалось ${paused ? 'приостановить' : 'запустить'} сервис: ${e.message}`, 'error', 7000);
+    await loadServiceStatus().catch(() => {});
+  } finally {
+    ui.serviceBusy = false;
+    renderServicePauseToggle();
+  }
 }
 
 function clone(v) { return JSON.parse(JSON.stringify(v)); }
@@ -377,6 +447,11 @@ function updateStatusLine() {
     el.className = ui.statusTone === 'error' ? 'status-error' : (ui.statusTone === 'warn' ? 'status-warn' : 'muted');
     return;
   }
+  if (ui.servicePaused) {
+    el.textContent = 'Сервис приостановлен. Слежение, правила и WebUI-обновления остановлены.';
+    el.className = 'status-warn';
+    return;
+  }
   if (!state) {
     el.textContent = 'Загрузка…';
     el.className = 'muted';
@@ -414,6 +489,7 @@ function collectConfig(source = state) {
     version: src.version || 1,
     updated_at: src.updated_at,
     retention_minutes: retentionMinutesFor(src),
+    dropped_log_max_bytes: droppedLogMaxBytesFor(src),
     http: stripUIFields(src.http || {}),
     transparent: stripUIFields(src.transparent || {}),
     proxies: (src.proxies || []).map(stripUIFields),
@@ -502,6 +578,7 @@ async function loadSnapshot(options = {}) {
 }
 
 function renderAll() {
+  renderServicePauseToggle();
   updateStatusLine();
   renderRules();
   renderProxies();
@@ -782,7 +859,7 @@ function closeEditor() {
 }
 
 function openSettingsEditor() {
-  const src = clone({ retention_minutes: state.retention_minutes || 7, http: state.http || {}, transparent: state.transparent || {} });
+  const src = clone({ retention_minutes: state.retention_minutes || 7, dropped_log_max_bytes: droppedLogMaxBytesFor(state), http: state.http || {}, transparent: state.transparent || {} });
   openEditor({
     title: 'Параметры',
     hint: 'Конфиг автоматически сохраняется рядом с pitchProx.exe в файл pitchProx.config.json.',
@@ -800,6 +877,12 @@ function openSettingsEditor() {
         <label>Sniff timeout (ms)<input id="ed_sniff_timeout" type="number" value="${escapeHtml(src.transparent.sniff_timeout_ms || 1500)}"></label>
       </div>
       <div class="editor-grid two">
+        <label>Лимит журнала «Отброшены» (МБ)
+          <input id="ed_dropped_log_mb" type="number" min="1" max="1024" value="${escapeHtml(droppedLogMaxMBFor(src))}">
+          <span class="hint">По умолчанию 10 МБ. При достижении лимита старые заблокированные соединения вытесняются новыми.</span>
+        </label>
+      </div>
+      <div class="editor-grid two">
         <label>Интервал накопления (мин)
           <input id="ed_retention_minutes" type="number" min="1" max="1440" value="${escapeHtml(src.retention_minutes || 7)}">
           <span class="hint">Один и тот же интервал используется для истории соединений, графика трафика и статистики правил. Вкладка «Новые» сравнивает последнюю минуту с этим окном; окно должно быть больше минуты.</span>
@@ -811,6 +894,7 @@ function openSettingsEditor() {
         next.http = next.http || {};
         next.transparent = next.transparent || {};
         next.retention_minutes = Math.max(1, Number($('ed_retention_minutes').value || 7));
+        next.dropped_log_max_bytes = Math.max(1, Number($('ed_dropped_log_mb').value || 10)) * 1024 * 1024;
         next.http.listen = $('ed_http_listen').value.trim();
         next.transparent.listener_port = Number($('ed_listener_port').value || 0);
         next.transparent.ipv4_listener = $('ed_ipv4_listener').value.trim();
@@ -1210,6 +1294,184 @@ function renderConnectionSearch() {
   syncClear();
 }
 
+function buildDroppedURL() {
+  const params = new URLSearchParams();
+  params.set('offset', String(ui.dropped.offset || 0));
+  params.set('limit', String(ui.dropped.limit || 100));
+  const q = String(ui.dropped.search || '').trim();
+  if (q) params.set('q', q);
+  return `/api/dropped?${params.toString()}`;
+}
+
+async function loadDropped(options = {}) {
+  if (options.resetOffset) ui.dropped.offset = 0;
+  ui.dropped.loading = true;
+  ui.dropped.error = '';
+  renderDroppedDialog();
+  try {
+    const data = await api(buildDroppedURL());
+    ui.dropped.items = Array.isArray(data.items) ? data.items : [];
+    ui.dropped.total = Number(data.total || 0);
+    ui.dropped.offset = Number(data.offset || 0);
+    ui.dropped.limit = Number(data.limit || ui.dropped.limit || 100);
+    ui.dropped.fileBytes = Number(data.file_bytes || 0);
+    ui.dropped.maxBytes = Number(data.max_bytes || droppedLogMaxBytesFor(state));
+    const visible = new Set(ui.dropped.items.map((item) => item.drop_id));
+    ui.dropped.selected = new Set(Array.from(ui.dropped.selected).filter((id) => visible.has(id)));
+  } catch (e) {
+    console.error(e);
+    ui.dropped.error = e.message || String(e);
+  } finally {
+    ui.dropped.loading = false;
+    renderDroppedDialog();
+    renderConnectionTabs();
+  }
+}
+
+function scheduleDroppedLoad() {
+  if (ui.dropped.searchTimer) clearTimeout(ui.dropped.searchTimer);
+  ui.dropped.searchTimer = setTimeout(() => {
+    ui.dropped.searchTimer = null;
+    void loadDropped({ resetOffset: true });
+  }, 250);
+}
+
+function openDroppedDialog() {
+  ui.dropped.open = true;
+  ui.dropped.offset = 0;
+  ui.dropped.selected = new Set();
+  const dialog = $('droppedDialog');
+  if (dialog && !dialog.open) dialog.showModal();
+  renderDroppedDialog();
+  void loadDropped({ resetOffset: true });
+  setTimeout(() => $('droppedSearch')?.focus(), 0);
+}
+
+function closeDroppedDialog() {
+  ui.dropped.open = false;
+  if (ui.dropped.searchTimer) {
+    clearTimeout(ui.dropped.searchTimer);
+    ui.dropped.searchTimer = null;
+  }
+  const dialog = $('droppedDialog');
+  if (dialog?.open) dialog.close();
+}
+
+function formatDroppedDate(ts) {
+  try {
+    return new Date(ts).toLocaleString();
+  } catch {
+    return String(ts || '');
+  }
+}
+
+function droppedPageText() {
+  const total = Number(ui.dropped.total || 0);
+  if (!total) return '0 / 0';
+  const from = Math.min(total, Number(ui.dropped.offset || 0) + 1);
+  const to = Math.min(total, Number(ui.dropped.offset || 0) + Number(ui.dropped.limit || 100));
+  return `${from}-${to} / ${total}`;
+}
+
+function renderDroppedDialog() {
+  const dialog = $('droppedDialog');
+  if (!dialog) return;
+  const input = $('droppedSearch');
+  const clearBtn = $('clearDroppedSearchBtn');
+  if (input && input.value !== ui.dropped.search) input.value = ui.dropped.search;
+  if (clearBtn) {
+    const hasValue = !!String(ui.dropped.search || '').trim();
+    clearBtn.disabled = !hasValue;
+    clearBtn.classList.toggle('visible', hasValue);
+  }
+  renderDroppedRows();
+  const meta = $('droppedMeta');
+  if (meta) {
+    const parts = [];
+    if (ui.dropped.loading) parts.push('Загрузка...');
+    else if (ui.dropped.error) parts.push(`Ошибка: ${ui.dropped.error}`);
+    else parts.push(`Показано ${ui.dropped.items.length} из ${ui.dropped.total ?? 0}`);
+    parts.push(`файл ${formatBytes(ui.dropped.fileBytes)} / ${formatBytes(ui.dropped.maxBytes)}`);
+    if (String(ui.dropped.search || '').trim()) parts.push(`поиск: ${ui.dropped.search.trim()}`);
+    meta.textContent = parts.join(' · ');
+    meta.className = ui.dropped.error ? 'hint status-error' : 'hint';
+  }
+  const prevBtn = $('droppedPrevBtn');
+  const nextBtn = $('droppedNextBtn');
+  const page = $('droppedPage');
+  const deleteBtn = $('droppedDeleteBtn');
+  if (prevBtn) prevBtn.disabled = ui.dropped.loading || (ui.dropped.offset || 0) <= 0;
+  if (nextBtn) nextBtn.disabled = ui.dropped.loading || ((ui.dropped.offset || 0) + (ui.dropped.limit || 100) >= (ui.dropped.total || 0));
+  if (page) page.textContent = droppedPageText();
+  if (deleteBtn) {
+    const n = ui.dropped.selected.size;
+    deleteBtn.disabled = ui.dropped.loading || n === 0;
+    deleteBtn.textContent = n > 0 ? `Удалить выбранные (${n})` : 'Удалить выбранные';
+  }
+}
+
+function renderDroppedRows() {
+  const tbody = $('droppedTable')?.querySelector('tbody');
+  if (!tbody) return;
+  if (ui.dropped.loading && !ui.dropped.items.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Загрузка...</td></tr>';
+    return;
+  }
+  if (ui.dropped.error) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-state status-error">${escapeHtml(ui.dropped.error)}</td></tr>`;
+    return;
+  }
+  if (!ui.dropped.items.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">Отброшенных соединений нет.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = ui.dropped.items.map((c) => {
+    const host = c.hostname || c.original_ip || '—';
+    const proc = shortExe(c.exe_path) || c.exe_path || '—';
+    const fullProc = c.exe_path || proc;
+    const checked = ui.dropped.selected.has(c.drop_id) ? 'checked' : '';
+    return `
+      <tr>
+        <td title="${escapeHtml(formatDroppedDate(c.dropped_at))}">${escapeHtml(formatDroppedDate(c.dropped_at))}</td>
+        <td>${escapeHtml(String(c.pid || ''))}</td>
+        <td title="${escapeHtml(fullProc)}">${escapeHtml(proc)}</td>
+        <td title="${escapeHtml(host)}">${escapeHtml(truncate(host, 44))}</td>
+        <td>${escapeHtml(String(c.original_port || ''))}</td>
+        <td title="${escapeHtml(c.rule_name || c.rule_id || '')}">${escapeHtml(truncate(c.rule_name || c.rule_id || '—', 28))}</td>
+        <td><span class="action-badge ${actionBadgeClass(c.action || 'block')}">${escapeHtml(actionLabel(c.action || 'block'))}</span></td>
+        <td class="dropped-check-cell"><input type="checkbox" data-drop-id="${escapeHtml(c.drop_id)}" ${checked} aria-label="Выбрать запись"></td>
+      </tr>
+    `;
+  }).join('');
+  tbody.querySelectorAll('[data-drop-id]').forEach((box) => {
+    box.onchange = () => {
+      const id = box.getAttribute('data-drop-id') || '';
+      if (!id) return;
+      if (box.checked) ui.dropped.selected.add(id);
+      else ui.dropped.selected.delete(id);
+      renderDroppedDialog();
+    };
+  });
+}
+
+async function deleteSelectedDropped() {
+  const ids = Array.from(ui.dropped.selected);
+  if (!ids.length) return;
+  ui.dropped.loading = true;
+  renderDroppedDialog();
+  try {
+    await api('/api/dropped', { method: 'DELETE', body: JSON.stringify({ ids }) });
+    ui.dropped.selected = new Set();
+    await loadDropped();
+    flashStatus('Выбранные отброшенные соединения удалены');
+  } catch (e) {
+    console.error(e);
+    ui.dropped.error = e.message || String(e);
+    ui.dropped.loading = false;
+    renderDroppedDialog();
+  }
+}
+
 function renderConnectionTabs() {
   const distinct = collapseConnections(searchedFocusedConnections('all'));
   const newDistinct = collapseConnections(searchedFocusedConnections('new'));
@@ -1231,7 +1493,9 @@ function renderConnectionTabs() {
     ['block', `Block (${counts.block})`],
     ['more', `Ещё (${counts.more})`],
   ];
-  $('connectionTabs').innerHTML = tabs.map(([key, label]) => `<button type="button" class="tab ${ui.connFilter === key ? 'active' : ''}" data-filter="${key}">${label}</button>`).join('');
+  const droppedCount = Number.isFinite(Number(ui.dropped.total)) && ui.dropped.total !== null ? ` (${ui.dropped.total})` : '';
+  $('connectionTabs').innerHTML = tabs.map(([key, label]) => `<button type="button" class="tab ${ui.connFilter === key ? 'active' : ''}" data-filter="${key}">${label}</button>`).join('') +
+    `<button type="button" class="tab dropped-tab" data-dropped="1">Отброшены${droppedCount}</button>`;
   $('connectionTabs').querySelectorAll('[data-filter]').forEach((btn) => {
     btn.onclick = () => {
       const next = btn.dataset.filter;
@@ -1245,6 +1509,8 @@ function renderConnectionTabs() {
       renderLogs();
     };
   });
+  const droppedBtn = $('connectionTabs').querySelector('[data-dropped]');
+  if (droppedBtn) droppedBtn.onclick = openDroppedDialog;
 }
 
 function connectionRowClass(c) {
@@ -1410,7 +1676,7 @@ function handleLiveEvent(event) {
 
 function startLiveEvents() {
   ui.eventsWanted = true;
-  if (document.hidden) return;
+  if (document.hidden || ui.servicePaused) return;
   if (ui.events) {
     ui.events.close();
     ui.events = null;
@@ -1432,7 +1698,7 @@ function startLiveEvents() {
     if (ui.events === es) {
       es.close();
       ui.events = null;
-      if (ui.eventsWanted && !document.hidden) {
+      if (ui.eventsWanted && !document.hidden && !ui.servicePaused) {
         ui.eventsRetryTimer = setTimeout(() => startLiveEvents(), 1500);
       }
     }
@@ -1477,7 +1743,7 @@ function leaveLiveMode(keepalive = false) {
 }
 
 async function enterLiveMode(forceFullSnapshot = false) {
-  if (document.hidden) return;
+  if (document.hidden || ui.servicePaused) return;
   void postUIVisibility(true);
   if (forceFullSnapshot) {
     await loadSnapshot();
@@ -1601,6 +1867,7 @@ async function refreshSnapshot(options = { includeLogs: false }) {
 }
 
 function startSnapshotPolling() {
+  if (ui.servicePaused) return;
   stopSnapshotPolling();
   ui.snapshotTimer = setInterval(() => refreshSnapshot({ includeLogs: !ui.events }), SNAPSHOT_POLL_MS);
 }
@@ -1616,6 +1883,50 @@ $('addRuleBtn').onclick = () => {
   openRuleEditor(makeRuleDraft(), { isDraft: true, insertAt: defaultRuleInsertIndex() });
 };
 $('scrollLogsTopBtn').onclick = () => { $('logs').scrollTop = 0; };
+const servicePauseToggle = $('servicePauseToggle');
+if (servicePauseToggle) {
+  servicePauseToggle.onchange = () => {
+    void setServicePaused(servicePauseToggle.checked);
+  };
+}
+$('droppedCloseBtn').onclick = closeDroppedDialog;
+$('droppedSearch').oninput = () => {
+  ui.dropped.search = $('droppedSearch').value || '';
+  sessionStorage.setItem('pitchprox_dropped_search', ui.dropped.search);
+  ui.dropped.selected = new Set();
+  renderDroppedDialog();
+  scheduleDroppedLoad();
+};
+$('droppedSearch').onkeydown = (e) => {
+  if (e.key === 'Escape' && ui.dropped.search) {
+    e.preventDefault();
+    ui.dropped.search = '';
+    $('droppedSearch').value = '';
+    sessionStorage.setItem('pitchprox_dropped_search', ui.dropped.search);
+    ui.dropped.selected = new Set();
+    void loadDropped({ resetOffset: true });
+  }
+};
+$('clearDroppedSearchBtn').onclick = () => {
+  if (!ui.dropped.search) return;
+  ui.dropped.search = '';
+  $('droppedSearch').value = '';
+  sessionStorage.setItem('pitchprox_dropped_search', ui.dropped.search);
+  ui.dropped.selected = new Set();
+  void loadDropped({ resetOffset: true });
+  $('droppedSearch').focus();
+};
+$('droppedPrevBtn').onclick = () => {
+  ui.dropped.offset = Math.max(0, (ui.dropped.offset || 0) - (ui.dropped.limit || 100));
+  ui.dropped.selected = new Set();
+  void loadDropped();
+};
+$('droppedNextBtn').onclick = () => {
+  ui.dropped.offset = (ui.dropped.offset || 0) + (ui.dropped.limit || 100);
+  ui.dropped.selected = new Set();
+  void loadDropped();
+};
+$('droppedDeleteBtn').onclick = () => { void deleteSelectedDropped(); };
 $('editorCloseBtn').onclick = closeEditor;
 $('editorCancelBtn').onclick = closeEditor;
 $('editorSaveBtn').onclick = async () => {
@@ -1623,6 +1934,7 @@ $('editorSaveBtn').onclick = async () => {
   await ui.editorSave();
 };
 $('editorDialog').addEventListener('cancel', (e) => { e.preventDefault(); closeEditor(); });
+$('droppedDialog').addEventListener('cancel', (e) => { e.preventDefault(); closeDroppedDialog(); });
 window.addEventListener('resize', () => renderActivityChart());
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
@@ -1636,6 +1948,8 @@ window.addEventListener('beforeunload', () => {
 });
 
 (async function init() {
+  await loadServiceStatus().catch(() => {});
+  if (ui.servicePaused) return;
   await loadConfig();
   await loadSnapshot();
   await enterLiveMode(false);

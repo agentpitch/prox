@@ -19,6 +19,12 @@
       </div>
       <div id="statusLine" class="muted">Автосохранение включено…</div>
     </div>
+    <div class="top-actions">
+      <label class="service-pause-toggle">
+        <span>Приостановить</span>
+        <input id="servicePauseToggle" type="checkbox" aria-label="Приостановить сервис">
+      </label>
+    </div>
   </header>
 
   <main class="layout">
@@ -125,6 +131,38 @@
         </div>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="droppedDialog" class="dropped-dialog">
+    <div class="dropped-shell">
+      <div class="editor-head">
+        <div>
+          <div class="card-title">Отброшены</div>
+          <div id="droppedMeta" class="hint">Заблокированные соединения.</div>
+        </div>
+        <button id="droppedCloseBtn" type="button" class="ghost">Закрыть</button>
+      </div>
+      <div class="dropped-toolbar">
+        <div class="connection-search dropped-search" role="search">
+          <input id="droppedSearch" type="text" placeholder="Поиск по дате, PID, процессу, host, port, rule, action" autocomplete="off" spellcheck="false" />
+          <button id="clearDroppedSearchBtn" type="button" class="search-clear" aria-label="Очистить поиск">×</button>
+        </div>
+      </div>
+      <div class="dropped-list-wrap">
+        <table id="droppedTable">
+          <thead><tr><th>Дата</th><th>PID</th><th>Процесс</th><th>Host/IP</th><th>Port</th><th>Rule</th><th>Action</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="dropped-actions">
+        <div class="dropped-pager">
+          <button id="droppedPrevBtn" type="button">Назад</button>
+          <span id="droppedPage" class="hint">0 / 0</span>
+          <button id="droppedNextBtn" type="button">Вперёд</button>
+        </div>
+        <button id="droppedDeleteBtn" type="button" class="rule-delete-btn">Удалить выбранные</button>
+      </div>
+    </div>
   </dialog>
 
   <script src="/app.js"></script>

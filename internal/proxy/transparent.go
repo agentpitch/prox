@@ -38,6 +38,9 @@ type Server struct {
 	listeners []net.Listener
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
+
+	activeMu    sync.Mutex
+	activeConns map[net.Conn]struct{}
 }
 
 var relayBufPool = sync.Pool{New: func() any {
@@ -99,6 +102,7 @@ func (s *Server) Close() error {
 		s.cancel()
 	}
 	s.closeListeners()
+	s.closeActiveConns()
 	s.wg.Wait()
 	return nil
 }
@@ -135,7 +139,9 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
+	s.trackActiveConn(conn)
 	defer conn.Close()
+	defer s.untrackActiveConn(conn)
 	clientAP, ok := addrPortFromNetAddr(conn.RemoteAddr())
 	if !ok {
 		return
@@ -219,7 +225,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		return
 	}
+	s.trackActiveConn(upstream)
 	defer upstream.Close()
+	defer s.untrackActiveConn(upstream)
 
 	if s.Monitor != nil {
 		opened := baseConn
@@ -266,6 +274,39 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		closed.BytesDown = downBytes
 		s.Monitor.UpsertConnection(closed)
 		s.Monitor.AddConnectionLog("info", closed, "closed pid=%d exe=%s action=%s host=%s dst=%s:%d bytes_up=%d bytes_down=%d", flow.PID, flow.ExePath, route.Action, displayHost(route.Hostname, flow.OriginalIP), flow.OriginalIP, flow.OriginalPort, upBytes, downBytes)
+	}
+}
+
+func (s *Server) trackActiveConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.activeMu.Lock()
+	if s.activeConns == nil {
+		s.activeConns = map[net.Conn]struct{}{}
+	}
+	s.activeConns[conn] = struct{}{}
+	s.activeMu.Unlock()
+}
+
+func (s *Server) untrackActiveConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.activeMu.Lock()
+	delete(s.activeConns, conn)
+	s.activeMu.Unlock()
+}
+
+func (s *Server) closeActiveConns() {
+	s.activeMu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		conns = append(conns, conn)
+	}
+	s.activeMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 }
 

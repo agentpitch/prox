@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/openai/pitchprox/internal/config"
+	"github.com/openai/pitchprox/internal/history"
 	"github.com/openai/pitchprox/internal/monitor"
 	"github.com/openai/pitchprox/internal/proxy"
 	embedded "github.com/openai/pitchprox/internal/webui"
@@ -33,8 +34,11 @@ type Runtime interface {
 }
 
 type Server struct {
-	Runtime  Runtime
-	StopFunc func()
+	Runtime    Runtime
+	StopFunc   func()
+	PauseFunc  func() error
+	ResumeFunc func() error
+	PausedFunc func() bool
 
 	addr     string
 	staticFS fs.FS
@@ -66,6 +70,43 @@ type request struct {
 
 type uiVisibilityRequest struct {
 	Active bool `json:"active"`
+}
+
+type droppedDeleteRequest struct {
+	IDs []string `json:"ids"`
+}
+
+type droppedConnectionDTO struct {
+	DropID        string            `json:"drop_id"`
+	DroppedAt     time.Time         `json:"dropped_at"`
+	ID            string            `json:"id"`
+	PID           uint32            `json:"pid"`
+	ExePath       string            `json:"exe_path"`
+	SourceIP      string            `json:"source_ip"`
+	SourcePort    uint16            `json:"source_port"`
+	OriginalIP    string            `json:"original_ip"`
+	OriginalPort  uint16            `json:"original_port"`
+	Hostname      string            `json:"hostname,omitempty"`
+	RuleID        string            `json:"rule_id,omitempty"`
+	RuleName      string            `json:"rule_name,omitempty"`
+	Action        config.RuleAction `json:"action"`
+	ProxyID       string            `json:"proxy_id,omitempty"`
+	ChainID       string            `json:"chain_id,omitempty"`
+	State         string            `json:"state"`
+	BytesUp       int64             `json:"bytes_up"`
+	BytesDown     int64             `json:"bytes_down"`
+	CreatedAt     time.Time         `json:"created_at"`
+	LastUpdatedAt time.Time         `json:"last_updated_at"`
+	Count         int64             `json:"count,omitempty"`
+}
+
+type droppedResponse struct {
+	Items     []droppedConnectionDTO `json:"items"`
+	Total     int                    `json:"total"`
+	Offset    int                    `json:"offset"`
+	Limit     int                    `json:"limit"`
+	MaxBytes  int64                  `json:"max_bytes"`
+	FileBytes int64                  `json:"file_bytes"`
 }
 
 func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
@@ -217,6 +258,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleConfig(conn, req)
 	case "/api/snapshot":
 		s.handleSnapshot(conn, req)
+	case "/api/dropped":
+		s.handleDropped(conn, req)
 	case "/api/tray":
 		s.handleTray(conn)
 	case "/api/events":
@@ -233,6 +276,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleWebUIEnable(conn, req)
 	case "/api/control/webui/disable":
 		s.handleWebUIDisable(conn, req)
+	case "/api/control/service/status":
+		s.handleServiceStatus(conn)
+	case "/api/control/service/pause":
+		s.handleServicePause(conn, req)
+	case "/api/control/service/resume":
+		s.handleServiceResume(conn, req)
 	default:
 		if strings.HasPrefix(req.Path, "/api/") {
 			writeText(conn, 404, "not found")
@@ -271,7 +320,7 @@ func (s *Server) SetWebUIEnabled(enabled bool) {
 }
 
 func (s *Server) handleWebUIStatus(conn net.Conn) {
-	writeJSON(conn, 200, map[string]bool{"enabled": s.WebUIEnabled()})
+	writeJSON(conn, 200, map[string]bool{"enabled": s.WebUIEnabled(), "paused": s.ServicePaused()})
 }
 
 func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
@@ -279,8 +328,14 @@ func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
 		writeEmpty(conn, 405)
 		return
 	}
+	if s.ServicePaused() && s.ResumeFunc != nil {
+		if err := s.ResumeFunc(); err != nil {
+			writeText(conn, 500, err.Error())
+			return
+		}
+	}
 	s.SetWebUIEnabled(true)
-	writeJSON(conn, 200, map[string]bool{"enabled": true})
+	writeJSON(conn, 200, map[string]bool{"enabled": true, "paused": s.ServicePaused()})
 }
 
 func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
@@ -290,6 +345,58 @@ func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
 	}
 	s.SetWebUIEnabled(false)
 	writeJSON(conn, 200, map[string]bool{"enabled": false})
+}
+
+func (s *Server) ServicePaused() bool {
+	if s.PausedFunc == nil {
+		return false
+	}
+	return s.PausedFunc()
+}
+
+func (s *Server) handleServiceStatus(conn net.Conn) {
+	writeJSON(conn, 200, map[string]bool{
+		"paused":        s.ServicePaused(),
+		"webui_enabled": s.WebUIEnabled(),
+	})
+}
+
+func (s *Server) handleServicePause(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	if s.PauseFunc == nil {
+		writeText(conn, 501, "service pause is not available")
+		return
+	}
+	if err := s.PauseFunc(); err != nil {
+		writeText(conn, 500, err.Error())
+		return
+	}
+	writeJSON(conn, 200, map[string]bool{
+		"paused":        s.ServicePaused(),
+		"webui_enabled": s.WebUIEnabled(),
+	})
+}
+
+func (s *Server) handleServiceResume(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	if s.ResumeFunc == nil {
+		writeText(conn, 501, "service resume is not available")
+		return
+	}
+	if err := s.ResumeFunc(); err != nil {
+		writeText(conn, 500, err.Error())
+		return
+	}
+	writeJSON(conn, 200, map[string]bool{
+		"paused":        s.ServicePaused(),
+		"webui_enabled": s.WebUIEnabled(),
+	})
 }
 
 func (s *Server) handleConfig(conn net.Conn, req request) {
@@ -318,6 +425,105 @@ func (s *Server) handleSnapshot(conn net.Conn, req request) {
 		includeLogs = false
 	}
 	writeJSON(conn, 200, s.Runtime.Monitor().SnapshotWithOptions(monitor.SnapshotOptions{IncludeLogs: includeLogs}))
+}
+
+func (s *Server) handleDropped(conn net.Conn, req request) {
+	switch req.Method {
+	case "GET":
+		offset, err := parseNonNegativeInt(req.Query.Get("offset"), 0)
+		if err != nil {
+			writeText(conn, 400, "invalid offset")
+			return
+		}
+		limit, err := parseNonNegativeInt(req.Query.Get("limit"), 100)
+		if err != nil {
+			writeText(conn, 400, "invalid limit")
+			return
+		}
+		result, err := s.Runtime.Monitor().DroppedConnections(history.DroppedQuery{
+			Search: req.Query.Get("q"),
+			Offset: offset,
+			Limit:  limit,
+		})
+		if err != nil {
+			writeText(conn, 500, err.Error())
+			return
+		}
+		writeJSON(conn, 200, toDroppedResponse(result))
+	case "DELETE":
+		var payload droppedDeleteRequest
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &payload); err != nil {
+				writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
+				return
+			}
+		}
+		if len(payload.IDs) > 1000 {
+			writeText(conn, 400, "too many ids")
+			return
+		}
+		if err := s.Runtime.Monitor().DeleteDroppedConnections(payload.IDs); err != nil {
+			writeText(conn, 500, err.Error())
+			return
+		}
+		writeJSON(conn, 200, map[string]any{"deleted": len(payload.IDs)})
+	default:
+		writeEmpty(conn, 405)
+	}
+}
+
+func parseNonNegativeInt(raw string, fallback int) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("invalid integer")
+	}
+	return v, nil
+}
+
+func toDroppedResponse(result history.DroppedResult) droppedResponse {
+	items := make([]droppedConnectionDTO, 0, len(result.Items))
+	for _, item := range result.Items {
+		items = append(items, toDroppedConnectionDTO(item))
+	}
+	return droppedResponse{
+		Items:     items,
+		Total:     result.Total,
+		Offset:    result.Offset,
+		Limit:     result.Limit,
+		MaxBytes:  result.MaxBytes,
+		FileBytes: result.FileBytes,
+	}
+}
+
+func toDroppedConnectionDTO(item history.DroppedRecord) droppedConnectionDTO {
+	c := item.Connection
+	return droppedConnectionDTO{
+		DropID:        item.DropID,
+		DroppedAt:     item.DroppedAt,
+		ID:            c.ID,
+		PID:           c.PID,
+		ExePath:       c.ExePath,
+		SourceIP:      c.SourceIP,
+		SourcePort:    c.SourcePort,
+		OriginalIP:    c.OriginalIP,
+		OriginalPort:  c.OriginalPort,
+		Hostname:      c.Hostname,
+		RuleID:        c.RuleID,
+		RuleName:      c.RuleName,
+		Action:        c.Action,
+		ProxyID:       c.ProxyID,
+		ChainID:       c.ChainID,
+		State:         c.State,
+		BytesUp:       c.BytesUp,
+		BytesDown:     c.BytesDown,
+		CreatedAt:     c.CreatedAt,
+		LastUpdatedAt: c.LastUpdatedAt,
+		Count:         c.Count,
+	}
 }
 
 func (s *Server) handleTray(conn net.Conn) {
@@ -629,7 +835,7 @@ func shouldMarkUIActive(path string) bool {
 		return false
 	}
 	switch path {
-	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable":
+	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable", "/api/control/service/status", "/api/control/service/pause", "/api/control/service/resume":
 		return false
 	default:
 		return true
@@ -638,7 +844,7 @@ func shouldMarkUIActive(path string) bool {
 
 func isWebUIControlPath(path string) bool {
 	switch path {
-	case "/api/health", "/api/tray", "/api/control/stop", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable":
+	case "/api/health", "/api/tray", "/api/control/stop", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable", "/api/control/service/status", "/api/control/service/pause", "/api/control/service/resume":
 		return true
 	default:
 		return false

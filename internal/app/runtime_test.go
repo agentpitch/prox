@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -149,5 +150,41 @@ func TestRuntimeUpdateConfigRefreshesUpdatedAt(t *testing.T) {
 	second := rt.CurrentConfig().UpdatedAt
 	if !second.After(first) {
 		t.Fatalf("updated_at did not advance: first=%v second=%v", first, second)
+	}
+}
+
+func TestRuntimeUpdateConfigRestartsRunningObserverModeForTransparentChange(t *testing.T) {
+	tmp := t.TempDir()
+	rt, err := NewRuntime(filepath.Join(tmp, "config.json"), filepath.Join(tmp, "history"))
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer func() { _ = rt.Stop() }()
+
+	cfg := runtimeTestConfig()
+	if err := rt.UpdateConfig(cfg); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	rt.runMu.RLock()
+	oldFlows := rt.flows
+	rt.runMu.RUnlock()
+
+	cfg.Transparent.SniffBytes++
+	if err := rt.UpdateConfig(cfg); err != nil {
+		t.Fatalf("UpdateConfig with transparent change: %v", err)
+	}
+	if !rt.Running() {
+		t.Fatal("runtime is not running after transparent config restart")
+	}
+	rt.runMu.RLock()
+	newFlows := rt.flows
+	rt.runMu.RUnlock()
+	if newFlows == nil || newFlows == oldFlows {
+		t.Fatal("runtime restart did not replace flow table")
 	}
 }

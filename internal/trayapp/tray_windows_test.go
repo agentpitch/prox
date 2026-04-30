@@ -3,6 +3,9 @@
 package trayapp
 
 import (
+	"encoding/binary"
+	"image"
+	"image/color"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -11,6 +14,42 @@ import (
 
 	"github.com/openai/pitchprox/internal/monitor"
 )
+
+func TestEncodeICOUsesUncompressedDIB(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	img.SetNRGBA(0, 15, color.NRGBA{R: 11, G: 22, B: 33, A: 44})
+
+	data, err := encodeICO(img)
+	if err != nil {
+		t.Fatalf("encodeICO: %v", err)
+	}
+	const (
+		iconHeader = 6 + 16
+		dibHeader  = 40
+		xorBytes   = 16 * 16 * 4
+		maskBytes  = 16 * 4
+		wantLen    = iconHeader + dibHeader + xorBytes + maskBytes
+	)
+	if len(data) != wantLen {
+		t.Fatalf("ico len = %d, want %d", len(data), wantLen)
+	}
+	if got := binary.LittleEndian.Uint16(data[2:4]); got != 1 {
+		t.Fatalf("icon type = %d, want 1", got)
+	}
+	if got := binary.LittleEndian.Uint32(data[14:18]); got != dibHeader+xorBytes+maskBytes {
+		t.Fatalf("image bytes = %d, want %d", got, dibHeader+xorBytes+maskBytes)
+	}
+	if got := binary.LittleEndian.Uint32(data[22:26]); got != dibHeader {
+		t.Fatalf("DIB header size = %d, want %d", got, dibHeader)
+	}
+	if got := binary.LittleEndian.Uint32(data[30:34]); got != 32 {
+		t.Fatalf("DIB height = %d, want 32", got)
+	}
+	firstPixel := data[iconHeader+dibHeader : iconHeader+dibHeader+4]
+	if got := [4]byte{firstPixel[0], firstPixel[1], firstPixel[2], firstPixel[3]}; got != [4]byte{33, 22, 11, 44} {
+		t.Fatalf("first BGRA pixel = %v, want [33 22 11 44]", got)
+	}
+}
 
 func TestTrafficSeriesUsesFixedWindowWithoutMapGrowth(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
@@ -36,8 +75,21 @@ func TestTrafficSeriesUsesFixedWindowWithoutMapGrowth(t *testing.T) {
 	}
 }
 
+func TestTrafficIconFrameUsesHighContrastPixels(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	drawTrafficIconFrame(img)
+
+	if got := img.NRGBAAt(0, 0); got.A < 200 || got.R < 220 {
+		t.Fatalf("border pixel = %#v, want bright opaque border", got)
+	}
+	if got := img.NRGBAAt(8, 8); got.A < 230 || got.R > 40 || got.G > 60 || got.B < 30 {
+		t.Fatalf("background pixel = %#v, want dark opaque background", got)
+	}
+}
+
 func TestRemoteWebUIController(t *testing.T) {
 	var enabled atomic.Bool
+	var paused atomic.Bool
 	enabled.Store(true)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -62,6 +114,29 @@ func TestRemoteWebUIController(t *testing.T) {
 			}
 			enabled.Store(false)
 			_, _ = w.Write([]byte(`{"enabled":false}`))
+		case "/api/control/service/status":
+			w.Header().Set("Content-Type", "application/json")
+			if paused.Load() {
+				_, _ = w.Write([]byte(`{"paused":true,"webui_enabled":false}`))
+			} else {
+				_, _ = w.Write([]byte(`{"paused":false,"webui_enabled":true}`))
+			}
+		case "/api/control/service/pause":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			paused.Store(true)
+			enabled.Store(false)
+			_, _ = w.Write([]byte(`{"paused":true,"webui_enabled":false}`))
+		case "/api/control/service/resume":
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			paused.Store(false)
+			enabled.Store(true)
+			_, _ = w.Write([]byte(`{"paused":false,"webui_enabled":true}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -83,5 +158,20 @@ func TestRemoteWebUIController(t *testing.T) {
 	}
 	if !controller.WebUIRunning() {
 		t.Fatal("WebUIRunning = false after enable")
+	}
+	if controller.ServicePaused() {
+		t.Fatal("ServicePaused = true before pause")
+	}
+	if err := controller.PauseService(); err != nil {
+		t.Fatalf("PauseService: %v", err)
+	}
+	if !controller.ServicePaused() {
+		t.Fatal("ServicePaused = false after pause")
+	}
+	if err := controller.ResumeService(); err != nil {
+		t.Fatalf("ResumeService: %v", err)
+	}
+	if controller.ServicePaused() {
+		t.Fatal("ServicePaused = true after resume")
 	}
 }

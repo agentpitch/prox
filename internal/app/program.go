@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/openai/pitchprox/internal/httpapi"
@@ -16,6 +17,10 @@ type Program struct {
 
 	httpMu sync.Mutex
 	http   *httpapi.Server
+
+	stateMu sync.Mutex
+	ctx     context.Context
+	paused  bool
 }
 
 func NewProgram(configPath string, historyPath string) (*Program, error) {
@@ -35,6 +40,10 @@ func (p *Program) RequestStop() {
 }
 
 func (p *Program) Start(ctx context.Context) error {
+	p.stateMu.Lock()
+	p.ctx = ctx
+	p.paused = false
+	p.stateMu.Unlock()
 	if err := p.runtime.Start(ctx); err != nil {
 		return err
 	}
@@ -46,6 +55,9 @@ func (p *Program) Start(ctx context.Context) error {
 }
 
 func (p *Program) WebUIRunning() bool {
+	if p.ServicePaused() {
+		return false
+	}
 	p.httpMu.Lock()
 	defer p.httpMu.Unlock()
 	return p.http != nil && p.http.WebUIEnabled()
@@ -62,6 +74,9 @@ func (p *Program) EnableWebUI() error {
 	if err != nil {
 		return err
 	}
+	srv.PauseFunc = p.PauseService
+	srv.ResumeFunc = p.ResumeService
+	srv.PausedFunc = p.ServicePaused
 	if err := srv.Listen(); err != nil {
 		_ = srv.Close()
 		return err
@@ -94,7 +109,65 @@ func (p *Program) DisableWebUI() error {
 	return nil
 }
 
+func (p *Program) ServicePaused() bool {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.paused
+}
+
+func (p *Program) PauseService() error {
+	p.stateMu.Lock()
+	if p.paused {
+		p.stateMu.Unlock()
+		return nil
+	}
+	p.paused = true
+	p.stateMu.Unlock()
+
+	if err := p.DisableWebUI(); err != nil {
+		return err
+	}
+	if err := p.runtime.Pause(); err != nil {
+		return err
+	}
+	p.runtime.Monitor().AddLog("info", "service paused")
+	return nil
+}
+
+func (p *Program) ResumeService() error {
+	p.stateMu.Lock()
+	ctx := p.ctx
+	if !p.paused {
+		p.stateMu.Unlock()
+		return p.EnableWebUI()
+	}
+	p.paused = false
+	p.stateMu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := p.runtime.Start(ctx); err != nil {
+		p.stateMu.Lock()
+		p.paused = true
+		p.stateMu.Unlock()
+		return err
+	}
+	if err := p.EnableWebUI(); err != nil {
+		_ = p.runtime.Pause()
+		p.stateMu.Lock()
+		p.paused = true
+		p.stateMu.Unlock()
+		return fmt.Errorf("enable WebUI after resume: %w", err)
+	}
+	p.runtime.Monitor().AddLog("info", "service resumed")
+	return nil
+}
+
 func (p *Program) Stop() error {
+	p.stateMu.Lock()
+	p.paused = true
+	p.stateMu.Unlock()
 	p.httpMu.Lock()
 	srv := p.http
 	p.http = nil

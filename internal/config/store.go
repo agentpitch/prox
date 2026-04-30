@@ -46,7 +46,7 @@ func (s *Store) LoadOrCreate() error {
 		return fmt.Errorf("read config: %w", err)
 	}
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(trimUTF8BOM(data), &cfg); err != nil {
 		return fmt.Errorf("parse config: %w", err)
 	}
 	cfg, err = Canonicalize(cfg)
@@ -91,6 +91,13 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
+}
+
+func trimUTF8BOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		return data[3:]
+	}
+	return data
 }
 
 func cloneConfig(cfg Config) Config {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +30,14 @@ type Runtime struct {
 	divert              *windivert.Engine
 	directObserver      *directObserver
 	interceptionEnabled bool
-	runCancel           context.CancelFunc
+
+	runMu             sync.RWMutex
+	rootCtx           context.Context
+	runCancel         context.CancelFunc
+	running           bool
+	closed            bool
+	diagnosticsCancel context.CancelFunc
+	diagnosticsOnce   sync.Once
 }
 
 func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
@@ -48,6 +56,7 @@ func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
 		return nil, err
 	}
 	bus.SetRetentionWindow(time.Duration(cfg.RetentionMinutes) * time.Minute)
+	bus.SetDroppedLogMaxBytes(cfg.DroppedLogMaxBytes)
 	return &Runtime{
 		store:               st,
 		monitor:             bus,
@@ -102,41 +111,77 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 	r.mu.Unlock()
 
 	r.monitor.SetRetentionWindow(time.Duration(savedCfg.RetentionMinutes) * time.Minute)
+	r.monitor.SetDroppedLogMaxBytes(savedCfg.DroppedLogMaxBytes)
 	r.monitor.AddLog("info", "configuration updated")
-	if old.HTTP.Listen != savedCfg.HTTP.Listen ||
-		old.Transparent.ListenerPort != savedCfg.Transparent.ListenerPort ||
-		old.Transparent.IPv4Listener != savedCfg.Transparent.IPv4Listener ||
-		old.Transparent.IPv6Listener != savedCfg.Transparent.IPv6Listener {
-		r.monitor.AddLog("warn", "listener changes require service restart to take effect")
+	newInterception := !eng.AllEnabledActionsDirect()
+	if old.HTTP.Listen != savedCfg.HTTP.Listen {
+		r.monitor.AddLog("warn", "HTTP listener changes require service restart to take effect")
 	}
-	if oldInterception != (!eng.AllEnabledActionsDirect()) {
-		r.monitor.AddLog("warn", "interception mode changed; restart required to apply optimized fast-path mode")
+	if runtimeRestartRequired(old, savedCfg, oldInterception, newInterception) && r.Running() {
+		r.monitor.AddLog("info", "runtime restart applying routing/listener changes")
+		if err := r.Restart(); err != nil {
+			r.monitor.AddLog("error", "runtime restart failed: %v", err)
+			return err
+		}
 	}
 	return nil
 }
 
+func (r *Runtime) Running() bool {
+	r.runMu.RLock()
+	defer r.runMu.RUnlock()
+	return r.running
+}
+
 func (r *Runtime) Start(ctx context.Context) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	r.runMu.RLock()
+	closed := r.closed
+	r.runMu.RUnlock()
+	if closed {
+		return fmt.Errorf("runtime is closed")
+	}
+	r.diagnosticsOnce.Do(func() {
+		diagCtx, diagCancel := context.WithCancel(ctx)
+		r.runMu.Lock()
+		r.diagnosticsCancel = diagCancel
+		r.runMu.Unlock()
+		startResourceDiagnostics(diagCtx, r)
+	})
+
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	if r.closed {
+		return fmt.Errorf("runtime is closed")
+	}
+	if r.running {
+		return nil
+	}
+	r.rootCtx = ctx
 	ctx, cancel := context.WithCancel(ctx)
 	r.runCancel = cancel
+	r.flows = proxy.NewFlowTable()
+	flows := r.flows
 	defer func() {
 		if err == nil {
 			return
 		}
-		cancel()
-		r.runCancel = nil
-		if r.divert != nil {
-			_ = r.divert.Close()
-			r.divert = nil
-		}
-		if r.proxyServer != nil {
-			_ = r.proxyServer.Close()
-			r.proxyServer = nil
-		}
+		_ = r.stopActiveLocked()
 	}()
 	cfg := r.CurrentConfig()
+	r.mu.RLock()
+	interceptionEnabled := r.interceptionEnabled
+	r.mu.RUnlock()
 	r.directObserver = &directObserver{
 		Monitor:         r.monitor,
-		Flows:           r.flows,
+		Flows:           flows,
 		ActiveInterval:  7 * time.Second,
 		DormantInterval: 5 * time.Second,
 		Decide:          r.directConnectionView,
@@ -144,7 +189,8 @@ func (r *Runtime) Start(ctx context.Context) (err error) {
 	go r.directObserver.Start(ctx)
 	go startIdleMemoryTrimmer(ctx, r.monitor)
 
-	if !r.interceptionEnabled {
+	if !interceptionEnabled {
+		r.running = true
 		r.monitor.AddLog("info", "runtime started in optimized observer-only mode (all enabled rules are direct)")
 		return nil
 	}
@@ -155,7 +201,7 @@ func (r *Runtime) Start(ctx context.Context) (err error) {
 		Port:         cfg.Transparent.ListenerPort,
 		SniffBytes:   cfg.Transparent.SniffBytes,
 		SniffTimeout: time.Duration(cfg.Transparent.SniffTimeout) * time.Millisecond,
-		Flows:        r.flows,
+		Flows:        flows,
 		Route:        r.route,
 		Monitor:      r.monitor,
 	}
@@ -164,13 +210,14 @@ func (r *Runtime) Start(ctx context.Context) (err error) {
 	}
 	r.divert = &windivert.Engine{
 		ListenerPort: cfg.Transparent.ListenerPort,
-		Flows:        r.flows,
+		Flows:        flows,
 		Monitor:      r.monitor,
 		Plan:         r.planFlow,
 	}
 	if err := r.divert.Start(ctx); err != nil {
 		return fmt.Errorf("start WinDivert engine: %w", err)
 	}
+	r.running = true
 	r.monitor.AddLog("info", "runtime started with selective interception fast-path")
 	return nil
 }
@@ -196,20 +243,98 @@ func (r *Runtime) TestProxy(pf config.ProxyProfile, target string) (proxy.ProxyT
 }
 
 func (r *Runtime) Stop() error {
+	r.runMu.Lock()
+	if r.closed {
+		r.runMu.Unlock()
+		return nil
+	}
+	r.closed = true
+	if r.diagnosticsCancel != nil {
+		r.diagnosticsCancel()
+		r.diagnosticsCancel = nil
+	}
+	err := r.stopActiveLocked()
+	r.rootCtx = nil
+	r.runMu.Unlock()
+	if r.monitor != nil {
+		r.monitor.DisableUI()
+		r.monitor.CloseActiveConnections()
+		if closeErr := r.monitor.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+func (r *Runtime) Pause() error {
+	r.runMu.Lock()
+	if r.closed {
+		r.runMu.Unlock()
+		return fmt.Errorf("runtime is closed")
+	}
+	err := r.stopActiveLocked()
+	r.runMu.Unlock()
+	if r.monitor != nil {
+		r.monitor.DisableUI()
+		r.monitor.CloseActiveConnections()
+	}
+	debug.FreeOSMemory()
+	return err
+}
+
+func (r *Runtime) Restart() error {
+	r.runMu.Lock()
+	if r.closed {
+		r.runMu.Unlock()
+		return fmt.Errorf("runtime is closed")
+	}
+	if !r.running {
+		r.runMu.Unlock()
+		return nil
+	}
+	ctx := r.rootCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := r.stopActiveLocked(); err != nil {
+		r.runMu.Unlock()
+		return err
+	}
+	r.runMu.Unlock()
+	return r.Start(ctx)
+}
+
+func (r *Runtime) stopActiveLocked() error {
+	var firstErr error
 	if r.runCancel != nil {
 		r.runCancel()
 		r.runCancel = nil
 	}
 	if r.divert != nil {
-		_ = r.divert.Close()
+		if err := r.divert.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.divert = nil
 	}
 	if r.proxyServer != nil {
-		_ = r.proxyServer.Close()
+		if err := r.proxyServer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.proxyServer = nil
 	}
-	if r.monitor != nil {
-		_ = r.monitor.Close()
-	}
-	return nil
+	r.directObserver = nil
+	r.flows = proxy.NewFlowTable()
+	r.running = false
+	return firstErr
+}
+
+func runtimeRestartRequired(oldCfg, newCfg config.Config, oldInterception, newInterception bool) bool {
+	return oldInterception != newInterception ||
+		oldCfg.Transparent.ListenerPort != newCfg.Transparent.ListenerPort ||
+		oldCfg.Transparent.IPv4Listener != newCfg.Transparent.IPv4Listener ||
+		oldCfg.Transparent.IPv6Listener != newCfg.Transparent.IPv6Listener ||
+		oldCfg.Transparent.SniffBytes != newCfg.Transparent.SniffBytes ||
+		oldCfg.Transparent.SniffTimeout != newCfg.Transparent.SniffTimeout
 }
 
 func (r *Runtime) route(flow proxy.Flow, sniff proxy.SniffResult) (proxy.RouteResult, config.Config, error) {

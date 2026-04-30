@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,13 +25,27 @@ type Store struct {
 	flushMu            sync.Mutex
 	pendingLogs        []LogRecord
 	pendingConnections []ConnectionRecord
+	pendingDropped     []DroppedRecord
 	pendingTraffic     map[int64]TrafficSample
 	pendingRule        map[string]rulePending
 	retention          atomic.Int64
+	droppedMaxBytes    atomic.Int64
+	droppedSeq         atomic.Uint64
+	droppedLimitDirty  atomic.Bool
 	lastPrune          time.Time
 	wake               chan struct{}
 	stop               chan struct{}
 	wg                 sync.WaitGroup
+}
+
+type DiagnosticStats struct {
+	PendingLogs           int   `json:"pending_logs"`
+	PendingConnections    int   `json:"pending_connections"`
+	PendingDropped        int   `json:"pending_dropped"`
+	PendingTrafficBuckets int   `json:"pending_traffic_buckets"`
+	PendingRuleBuckets    int   `json:"pending_rule_buckets"`
+	RetentionSeconds      int64 `json:"retention_seconds"`
+	DroppedMaxBytes       int64 `json:"dropped_max_bytes"`
 }
 
 type rulePending struct {
@@ -70,6 +85,8 @@ const (
 	maxNewConnectionQuery       = 512
 	newConnectionPruneTrigger   = maxNewConnectionQuery * 16
 	maxInitialLogQuery          = 5000
+	defaultDroppedQueryLimit    = 100
+	maxDroppedQueryLimit        = 500
 	segmentLayout               = "2006010215"
 )
 
@@ -86,6 +103,7 @@ func Open(path string, retention time.Duration) (*Store, error) {
 		stop:           make(chan struct{}),
 	}
 	s.SetRetentionWindow(retention)
+	s.SetDroppedLogMaxBytes(config.DefaultDroppedLogMaxBytes)
 	s.wg.Add(1)
 	go s.loop()
 	return s, nil
@@ -105,6 +123,45 @@ func (s *Store) SetRetentionWindow(d time.Duration) {
 	s.wakeFlush()
 }
 
+func (s *Store) SetDroppedLogMaxBytes(n int64) {
+	n = normalizeDroppedLogMaxBytes(n)
+	old := s.droppedMaxBytes.Swap(n)
+	if old != n {
+		s.droppedLimitDirty.Store(true)
+		s.wakeFlush()
+	}
+}
+
+func normalizeDroppedLogMaxBytes(n int64) int64 {
+	if n <= 0 {
+		return config.DefaultDroppedLogMaxBytes
+	}
+	if n < config.MinDroppedLogMaxBytes {
+		return config.MinDroppedLogMaxBytes
+	}
+	if n > config.MaxDroppedLogMaxBytes {
+		return config.MaxDroppedLogMaxBytes
+	}
+	return n
+}
+
+func (s *Store) DiagnosticStats() DiagnosticStats {
+	if s == nil {
+		return DiagnosticStats{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return DiagnosticStats{
+		PendingLogs:           len(s.pendingLogs),
+		PendingConnections:    len(s.pendingConnections),
+		PendingDropped:        len(s.pendingDropped),
+		PendingTrafficBuckets: len(s.pendingTraffic),
+		PendingRuleBuckets:    len(s.pendingRule),
+		RetentionSeconds:      int64(time.Duration(s.retention.Load()) / time.Second),
+		DroppedMaxBytes:       s.droppedMaxBytes.Load(),
+	}
+}
+
 func (s *Store) RecordLog(entry LogRecord) {
 	s.mu.Lock()
 	s.pendingLogs = append(s.pendingLogs, entry)
@@ -121,6 +178,32 @@ func (s *Store) RecordConnection(entry ConnectionRecord) {
 	count := len(s.pendingConnections)
 	s.mu.Unlock()
 	if count >= 64 {
+		s.wakeFlush()
+	}
+}
+
+func (s *Store) RecordDroppedConnection(entry ConnectionRecord) {
+	ts := entry.LastUpdatedAt.UTC()
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = ts
+	}
+	entry.LastUpdatedAt = ts
+	if entry.Count <= 0 {
+		entry.Count = 1
+	}
+	item := DroppedRecord{
+		DropID:     fmt.Sprintf("%016x-%08x", ts.UnixNano(), s.droppedSeq.Add(1)),
+		DroppedAt:  ts,
+		Connection: entry,
+	}
+	s.mu.Lock()
+	s.pendingDropped = append(s.pendingDropped, item)
+	count := len(s.pendingDropped)
+	s.mu.Unlock()
+	if count >= 16 {
 		s.wakeFlush()
 	}
 }
@@ -302,21 +385,125 @@ func (s *Store) NewConnections(options NewConnectionOptions) ([]ConnectionRecord
 	return out, nil
 }
 
+func (s *Store) DroppedConnections(query DroppedQuery) (DroppedResult, error) {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if err := s.flushLocked(); err != nil {
+		return DroppedResult{}, err
+	}
+	if err := s.enforceDroppedLimit(); err != nil {
+		return DroppedResult{}, err
+	}
+	limit := normalizeDroppedQueryLimit(query.Limit)
+	offset := query.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	items, fileBytes, err := s.readDroppedRecords()
+	if err != nil {
+		return DroppedResult{}, err
+	}
+	tokens := droppedSearchTokens(query.Search)
+	filtered := make([]DroppedRecord, 0, len(items))
+	for _, item := range items {
+		if droppedMatchesSearch(item, tokens) {
+			filtered = append(filtered, item)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].DroppedAt.Equal(filtered[j].DroppedAt) {
+			return filtered[i].DropID > filtered[j].DropID
+		}
+		return filtered[i].DroppedAt.After(filtered[j].DroppedAt)
+	})
+	total := len(filtered)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return DroppedResult{
+		Items:     append([]DroppedRecord(nil), filtered[offset:end]...),
+		Total:     total,
+		Offset:    offset,
+		Limit:     limit,
+		MaxBytes:  normalizeDroppedLogMaxBytes(s.droppedMaxBytes.Load()),
+		FileBytes: fileBytes,
+	}, nil
+}
+
+func normalizeDroppedQueryLimit(limit int) int {
+	if limit <= 0 {
+		return defaultDroppedQueryLimit
+	}
+	if limit > maxDroppedQueryLimit {
+		return maxDroppedQueryLimit
+	}
+	return limit
+}
+
+func (s *Store) DeleteDroppedConnections(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if err := s.flushLocked(); err != nil {
+		return err
+	}
+	dropIDs := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			dropIDs[id] = struct{}{}
+		}
+	}
+	if len(dropIDs) == 0 {
+		return nil
+	}
+	items, _, err := s.readDroppedRecords()
+	if err != nil {
+		return err
+	}
+	kept := items[:0]
+	for _, item := range items {
+		if _, ok := dropIDs[item.DropID]; ok {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(kept) == len(items) {
+		return nil
+	}
+	if err := s.rewriteDroppedRecords(kept); err != nil {
+		return err
+	}
+	return s.enforceDroppedLimit()
+}
+
 func (s *Store) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
+	return s.flushLocked()
+}
 
+func (s *Store) flushLocked() error {
 	s.mu.Lock()
 	logs := append([]LogRecord(nil), s.pendingLogs...)
 	conns := append([]ConnectionRecord(nil), s.pendingConnections...)
+	dropped := append([]DroppedRecord(nil), s.pendingDropped...)
 	traffic := s.pendingTraffic
 	rules := s.pendingRule
-	if len(logs) == 0 && len(conns) == 0 && len(traffic) == 0 && len(rules) == 0 && time.Since(s.lastPrune) < pruneInterval {
+	limitDirty := s.droppedLimitDirty.Swap(false)
+	if len(logs) == 0 && len(conns) == 0 && len(dropped) == 0 && len(traffic) == 0 && len(rules) == 0 && !limitDirty && time.Since(s.lastPrune) < pruneInterval {
 		s.mu.Unlock()
 		return nil
 	}
 	s.pendingLogs = nil
 	s.pendingConnections = nil
+	s.pendingDropped = nil
 	s.pendingTraffic = map[int64]TrafficSample{}
 	s.pendingRule = map[string]rulePending{}
 	shouldPrune := time.Since(s.lastPrune) >= pruneInterval
@@ -330,6 +517,17 @@ func (s *Store) Flush() error {
 	}
 	if err := s.appendConnections(conns); err != nil {
 		return err
+	}
+	if err := s.appendDropped(dropped); err != nil {
+		return err
+	}
+	if len(dropped) > 0 || limitDirty {
+		if err := s.enforceDroppedLimit(); err != nil {
+			if limitDirty {
+				s.droppedLimitDirty.Store(true)
+			}
+			return err
+		}
 	}
 	if err := s.appendTraffic(traffic); err != nil {
 		return err
@@ -407,6 +605,151 @@ func (s *Store) appendConnections(items []ConnectionRecord) error {
 		return err
 	}
 	return s.flushSegmentBuffers(buffers)
+}
+
+func (s *Store) appendDropped(items []DroppedRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	path := s.droppedPath()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open dropped log: %w", err)
+	}
+	for _, item := range items {
+		data, err := json.Marshal(item)
+		if err != nil {
+			_ = f.Close()
+			return fmt.Errorf("marshal dropped log: %w", err)
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write dropped log: %w", err)
+		}
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write dropped log newline: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close dropped log: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) enforceDroppedLimit() error {
+	maxBytes := normalizeDroppedLogMaxBytes(s.droppedMaxBytes.Load())
+	path := s.droppedPath()
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat dropped log: %w", err)
+	}
+	if info.Size() <= maxBytes {
+		return nil
+	}
+	items, _, err := s.readDroppedRecords()
+	if err != nil {
+		return err
+	}
+	kept := make([]DroppedRecord, 0, len(items))
+	var size int64
+	for i := len(items) - 1; i >= 0; i-- {
+		lineSize, err := droppedRecordLineSize(items[i])
+		if err != nil {
+			return err
+		}
+		if size+lineSize > maxBytes {
+			continue
+		}
+		size += lineSize
+		kept = append(kept, items[i])
+	}
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	return s.rewriteDroppedRecords(kept)
+}
+
+func droppedRecordLineSize(item DroppedRecord) (int64, error) {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return 0, fmt.Errorf("marshal dropped log: %w", err)
+	}
+	return int64(len(data) + 1), nil
+}
+
+func (s *Store) readDroppedRecords() ([]DroppedRecord, int64, error) {
+	path := s.droppedPath()
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("open dropped log: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat dropped log: %w", err)
+	}
+	items := make([]DroppedRecord, 0, min(int(info.Size()/256)+1, 4096))
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2<<20)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var item DroppedRecord
+		if err := json.Unmarshal(line, &item); err != nil {
+			return nil, info.Size(), fmt.Errorf("parse dropped log: %w", err)
+		}
+		if item.DropID == "" {
+			continue
+		}
+		if item.DroppedAt.IsZero() {
+			item.DroppedAt = item.Connection.LastUpdatedAt
+		}
+		items = append(items, item)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, info.Size(), fmt.Errorf("read dropped log: %w", err)
+	}
+	return items, info.Size(), nil
+}
+
+func (s *Store) rewriteDroppedRecords(items []DroppedRecord) error {
+	path := s.droppedPath()
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("open dropped log tmp: %w", err)
+	}
+	for _, item := range items {
+		data, err := json.Marshal(item)
+		if err != nil {
+			_ = f.Close()
+			return fmt.Errorf("marshal dropped log: %w", err)
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write dropped log tmp: %w", err)
+		}
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write dropped log tmp newline: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close dropped log tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace dropped log: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) appendTraffic(items map[int64]TrafficSample) error {
@@ -938,6 +1281,59 @@ func connectionAggregateKey(item ConnectionRecord) string {
 		item.ProxyID,
 		item.ChainID,
 	)
+}
+
+func (s *Store) droppedPath() string {
+	return filepath.Join(s.root, "dropped.jsonl")
+}
+
+func droppedSearchTokens(raw string) []string {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(raw)))
+	if len(fields) == 0 {
+		return nil
+	}
+	out := fields[:0]
+	for _, field := range fields {
+		if field != "" {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func droppedMatchesSearch(item DroppedRecord, tokens []string) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	text := droppedSearchText(item)
+	for _, token := range tokens {
+		if !strings.Contains(text, token) {
+			return false
+		}
+	}
+	return true
+}
+
+func droppedSearchText(item DroppedRecord) string {
+	c := item.Connection
+	return strings.ToLower(strings.Join([]string{
+		item.DropID,
+		item.DroppedAt.Format(time.RFC3339),
+		fmt.Sprintf("%d", c.PID),
+		filepath.Base(c.ExePath),
+		c.ExePath,
+		c.SourceIP,
+		fmt.Sprintf("%d", c.SourcePort),
+		c.OriginalIP,
+		fmt.Sprintf("%d", c.OriginalPort),
+		c.Hostname,
+		c.RuleID,
+		c.RuleName,
+		string(c.Action),
+		c.ProxyID,
+		c.ChainID,
+		c.State,
+	}, " \x1f "))
 }
 
 func segmentRoot(path string) string {

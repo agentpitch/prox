@@ -2,8 +2,9 @@ package app
 
 import (
 	"context"
-	"runtime/debug"
 	"time"
+
+	"github.com/openai/pitchprox/internal/util"
 )
 
 type memoryTrimMonitor interface {
@@ -24,7 +25,7 @@ func startIdleMemoryTrimmer(ctx context.Context, monitor memoryTrimMonitor) {
 			return
 		case <-ticker.C:
 			if !monitor.UIActive() {
-				debug.FreeOSMemory()
+				util.ReleaseIdleMemory()
 			}
 		}
 	}

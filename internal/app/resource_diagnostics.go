@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/openai/pitchprox/internal/monitor"
+	"github.com/openai/pitchprox/internal/util"
 )
 
 type resourceDiagnosticsConfig struct {
@@ -292,6 +293,9 @@ func runResourceDiagnostics(ctx context.Context, rt *Runtime, f *os.File, writer
 				rt.monitor.AddLog("warn", "resource diagnostics stopped: log write failed: %v", err)
 			}
 			return false
+		}
+		if includeHandleTypes {
+			util.ReleaseIdleMemory()
 		}
 		prev = &sample
 		return true

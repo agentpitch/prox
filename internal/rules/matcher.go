@@ -113,7 +113,7 @@ func (e *Engine) Match(req Request) Decision {
 }
 
 func (e *Engine) Preflight(req Request) PreflightResult {
-	for _, r := range e.rules {
+	for i, r := range e.rules {
 		if !r.Rule.Enabled {
 			continue
 		}
@@ -138,6 +138,14 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 				Definitive: true,
 			}
 		case hostPreflightNeedHostname:
+			if r.Rule.Action == config.ActionDirect {
+				if dec, ok := e.definitiveDirectWithoutHostname(req, i+1); ok {
+					return PreflightResult{
+						Decision:   dec,
+						Definitive: true,
+					}
+				}
+			}
 			return PreflightResult{
 				Decision: Decision{
 					Matched: true,
@@ -154,6 +162,46 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 		}
 	}
 	return PreflightResult{Decision: Decision{Action: config.ActionDirect}, Definitive: true}
+}
+
+func (e *Engine) definitiveDirectWithoutHostname(req Request, start int) (Decision, bool) {
+	for _, r := range e.rules[start:] {
+		if !r.Rule.Enabled {
+			continue
+		}
+		if !r.matchApp(req.AppPath, req.PID) {
+			continue
+		}
+		if !r.matchPort(req.TargetPort) {
+			continue
+		}
+		hostState := r.preflightHost(req.Hostname, req.TargetIP, e.computerName)
+		switch hostState {
+		case hostPreflightMatch:
+			if r.Rule.Action != config.ActionDirect {
+				return Decision{}, false
+			}
+			return decisionFromRule(r), true
+		case hostPreflightNeedHostname:
+			if r.Rule.Action != config.ActionDirect {
+				return Decision{}, false
+			}
+		case hostPreflightNoMatch:
+			continue
+		}
+	}
+	return Decision{Action: config.ActionDirect}, true
+}
+
+func decisionFromRule(r CompiledRule) Decision {
+	return Decision{
+		Matched: true,
+		RuleID:  r.Rule.ID,
+		Rule:    r.Rule.Name,
+		Action:  r.Rule.Action,
+		ProxyID: r.Rule.ProxyID,
+		ChainID: r.Rule.ChainID,
+	}
 }
 
 func (r CompiledRule) matchApp(path string, pid uint32) bool {

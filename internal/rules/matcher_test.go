@@ -248,6 +248,39 @@ func TestPreflightRequiresHostnameWhenEarlierHostRuleMayMatch(t *testing.T) {
 	}
 }
 
+func TestPreflightSkipsHostnameOnlyDirectWhenLaterOutcomeIsDirect(t *testing.T) {
+	cfg := config.Config{Rules: []config.Rule{
+		{ID: "localhost", Name: "Localhost", Enabled: true, Applications: "*", TargetHosts: "localhost;127.0.0.1;::1;%ComputerName%", TargetPorts: "Any", Action: config.ActionDirect},
+		{ID: "sentinel", Name: "Sentinel block", Enabled: true, Applications: "curl.exe", TargetHosts: "blocked.pitchprox.invalid", TargetPorts: "443", Action: config.ActionBlock},
+		{ID: "default", Name: "Default direct", Enabled: true, Applications: "*", TargetHosts: "Any", TargetPorts: "Any", Action: config.ActionDirect},
+	}}
+	eng, err := Compile(cfg, "WORKSTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := eng.Preflight(Request{AppPath: `C:\Apps\codex.exe`, TargetIP: netip.MustParseAddr("104.18.32.47"), TargetPort: 443})
+	if !pre.Definitive || pre.NeedsHostname || pre.Action != config.ActionDirect || pre.RuleID != "default" {
+		t.Fatalf("expected definitive default direct without hostname sniff, got %+v", pre)
+	}
+}
+
+func TestPreflightStillSniffsWhenLaterNonDirectMayMatch(t *testing.T) {
+	cfg := config.Config{Rules: []config.Rule{
+		{ID: "localhost", Name: "Localhost", Enabled: true, Applications: "*", TargetHosts: "localhost;127.0.0.1;::1;%ComputerName%", TargetPorts: "Any", Action: config.ActionDirect},
+		{ID: "curl-direct", Name: "curl example direct", Enabled: true, Applications: "curl.exe", TargetHosts: "example.com", TargetPorts: "443", Action: config.ActionDirect},
+		{ID: "curl-block", Name: "curl blocked host", Enabled: true, Applications: "curl.exe", TargetHosts: "blocked.pitchprox.invalid", TargetPorts: "443", Action: config.ActionBlock},
+		{ID: "default", Name: "Default direct", Enabled: true, Applications: "*", TargetHosts: "Any", TargetPorts: "Any", Action: config.ActionDirect},
+	}}
+	eng, err := Compile(cfg, "WORKSTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := eng.Preflight(Request{AppPath: `C:\Windows\System32\curl.exe`, TargetIP: netip.MustParseAddr("104.20.23.154"), TargetPort: 443})
+	if pre.Definitive || !pre.NeedsHostname || pre.Action != config.ActionDirect || pre.RuleID != "localhost" {
+		t.Fatalf("expected hostname sniff to preserve later block possibility, got %+v", pre)
+	}
+}
+
 func TestAllEnabledActionsDirect(t *testing.T) {
 	cfg := config.Config{Rules: []config.Rule{{ID: "r1", Name: "A", Enabled: true, Applications: "*", TargetHosts: "Any", TargetPorts: "Any", Action: config.ActionDirect}}}
 	eng, err := Compile(cfg, "WORKSTATION")

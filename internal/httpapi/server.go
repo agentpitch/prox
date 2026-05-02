@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/url"
 	"path"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"github.com/openai/pitchprox/internal/history"
 	"github.com/openai/pitchprox/internal/monitor"
 	"github.com/openai/pitchprox/internal/proxy"
+	"github.com/openai/pitchprox/internal/util"
 	embedded "github.com/openai/pitchprox/internal/webui"
 )
 
@@ -308,7 +308,7 @@ func (s *Server) SetWebUIEnabled(enabled bool) {
 	s.webUIMu.Unlock()
 	if !enabled {
 		s.Runtime.Monitor().DisableUI()
-		debug.FreeOSMemory()
+		util.ReleaseIdleMemory()
 	}
 	if changed {
 		state := "disabled"

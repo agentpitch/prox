@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/openai/pitchprox/internal/config"
+	"github.com/openai/pitchprox/internal/win"
 )
 
 func runtimeTestConfig() config.Config {
@@ -186,5 +188,52 @@ func TestRuntimeUpdateConfigRestartsRunningObserverModeForTransparentChange(t *t
 	rt.runMu.RUnlock()
 	if newFlows == nil || newFlows == oldFlows {
 		t.Fatal("runtime restart did not replace flow table")
+	}
+}
+
+func TestRuntimePauseWaitsForRunGoroutines(t *testing.T) {
+	tmp := t.TempDir()
+	rt, err := NewRuntime(filepath.Join(tmp, "config.json"), filepath.Join(tmp, "history"))
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer func() { _ = rt.Stop() }()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	rt.listTCPConnections = func() ([]win.TCPConnection, error) {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return nil, nil
+	}
+	rt.monitor.MarkUIActive()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observer did not enter TCP scan")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- rt.Pause() }()
+	select {
+	case err := <-done:
+		t.Fatalf("Pause returned before observer goroutine exited: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Pause: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pause did not finish after observer scan was released")
 	}
 }

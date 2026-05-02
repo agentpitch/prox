@@ -20,13 +20,16 @@ func PeekAndSniff(conn net.Conn, maxBytes int, timeout time.Duration) (*bufio.Re
 		maxBytes = 4096
 	}
 	br := bufio.NewReaderSize(conn, maxBytes)
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	peek, err := br.Peek(maxBytes)
-	_ = conn.SetReadDeadline(time.Time{})
-	if err != nil && !errors.Is(err, bufio.ErrBufferFull) && !errors.Is(err, io.EOF) && !isTimeout(err) {
+	if timeout > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+	peek, err := peekSniffData(br, maxBytes)
+	if timeout > 0 {
+		_ = conn.SetReadDeadline(time.Time{})
+	}
+	if err != nil {
 		return br, SniffResult{}, err
 	}
-	peek = bytes.TrimSpace(peek)
 	if host := sniffHTTPHost(peek); host != "" {
 		return br, SniffResult{Hostname: host, Protocol: "http"}, nil
 	}
@@ -36,13 +39,61 @@ func PeekAndSniff(conn net.Conn, maxBytes int, timeout time.Duration) (*bufio.Re
 	return br, SniffResult{}, nil
 }
 
+func peekSniffData(br *bufio.Reader, maxBytes int) ([]byte, error) {
+	target := min(maxBytes, 5)
+	for {
+		peek, err := br.Peek(target)
+		if err != nil {
+			if len(peek) > 0 || errors.Is(err, bufio.ErrBufferFull) || errors.Is(err, io.EOF) || isTimeout(err) {
+				return peek, nil
+			}
+			return peek, err
+		}
+		if sniffHTTPHost(peek) != "" {
+			return peek, nil
+		}
+		if need, ok := tlsRecordNeed(peek); ok {
+			next := min(maxBytes, need)
+			if len(peek) >= next || next <= target {
+				return peek, nil
+			}
+			target = next
+			continue
+		}
+		if looksLikeHTTPRequest(peek) {
+			if bytes.Contains(peek, []byte("\r\n\r\n")) || len(peek) >= maxBytes {
+				return peek, nil
+			}
+			target = min(maxBytes, len(peek)+1)
+			continue
+		}
+		if couldBecomeHTTPMethod(peek) && len(peek) < maxHTTPMethodLen && len(peek) < maxBytes {
+			target = min(maxBytes, len(peek)+1)
+			continue
+		}
+		return peek, nil
+	}
+}
+
+var httpMethodPrefixes = [][]byte{
+	[]byte("GET "),
+	[]byte("POST "),
+	[]byte("HEAD "),
+	[]byte("PUT "),
+	[]byte("DELETE "),
+	[]byte("OPTIONS "),
+	[]byte("PATCH "),
+	[]byte("CONNECT "),
+}
+
+const maxHTTPMethodLen = len("OPTIONS ")
+
 func sniffHTTPHost(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
-	methods := [][]byte{[]byte("GET "), []byte("POST "), []byte("HEAD "), []byte("PUT "), []byte("DELETE "), []byte("OPTIONS "), []byte("PATCH "), []byte("CONNECT ")}
 	ok := false
-	for _, m := range methods {
+	for _, m := range httpMethodPrefixes {
 		if bytes.HasPrefix(data, m) {
 			ok = true
 			break
@@ -51,9 +102,14 @@ func sniffHTTPHost(data []byte) string {
 	if !ok {
 		return ""
 	}
-	for _, line := range bytes.Split(data, []byte("\r\n")) {
+	lines := bytes.Split(data, []byte("\r\n"))
+	for i, line := range lines {
+		completeLine := i < len(lines)-1
 		lower := strings.ToLower(string(line))
 		if strings.HasPrefix(lower, "host:") {
+			if !completeLine {
+				return ""
+			}
 			host := strings.TrimSpace(string(line[5:]))
 			if h, _, err := net.SplitHostPort(host); err == nil {
 				host = h
@@ -61,6 +117,9 @@ func sniffHTTPHost(data []byte) string {
 			return strings.ToLower(strings.Trim(host, "[]"))
 		}
 		if strings.HasPrefix(lower, "connect ") {
+			if !completeLine {
+				return ""
+			}
 			parts := strings.SplitN(string(line), " ", 3)
 			if len(parts) >= 2 {
 				host := parts[1]
@@ -72,6 +131,42 @@ func sniffHTTPHost(data []byte) string {
 		}
 	}
 	return ""
+}
+
+func looksLikeHTTPRequest(data []byte) bool {
+	for _, method := range httpMethodPrefixes {
+		if bytes.HasPrefix(data, method) {
+			return true
+		}
+	}
+	return false
+}
+
+func couldBecomeHTTPMethod(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	upper := bytes.ToUpper(data)
+	for _, method := range httpMethodPrefixes {
+		if len(upper) <= len(method) && bytes.HasPrefix(method, upper) {
+			return true
+		}
+	}
+	return false
+}
+
+func tlsRecordNeed(data []byte) (int, bool) {
+	if len(data) == 0 || data[0] != 0x16 {
+		return 0, false
+	}
+	if len(data) < 5 {
+		return 5, true
+	}
+	recLen := int(data[3])<<8 | int(data[4])
+	if recLen <= 0 {
+		return len(data), true
+	}
+	return 5 + recLen, true
 }
 
 func sniffTLSSNI(data []byte) string {

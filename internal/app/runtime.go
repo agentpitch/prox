@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/openai/pitchprox/internal/monitor"
 	"github.com/openai/pitchprox/internal/proxy"
 	"github.com/openai/pitchprox/internal/rules"
+	"github.com/openai/pitchprox/internal/util"
 	"github.com/openai/pitchprox/internal/win"
 	"github.com/openai/pitchprox/internal/windivert"
 )
@@ -31,13 +31,15 @@ type Runtime struct {
 	directObserver      *directObserver
 	interceptionEnabled bool
 
-	runMu             sync.RWMutex
-	rootCtx           context.Context
-	runCancel         context.CancelFunc
-	running           bool
-	closed            bool
-	diagnosticsCancel context.CancelFunc
-	diagnosticsOnce   sync.Once
+	runMu              sync.RWMutex
+	rootCtx            context.Context
+	runCancel          context.CancelFunc
+	runWG              sync.WaitGroup
+	running            bool
+	closed             bool
+	diagnosticsCancel  context.CancelFunc
+	diagnosticsOnce    sync.Once
+	listTCPConnections func() ([]win.TCPConnection, error)
 }
 
 func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
@@ -185,9 +187,17 @@ func (r *Runtime) Start(ctx context.Context) (err error) {
 		ActiveInterval:  7 * time.Second,
 		DormantInterval: 5 * time.Second,
 		Decide:          r.directConnectionView,
+		List:            r.listTCPConnections,
 	}
-	go r.directObserver.Start(ctx)
-	go startIdleMemoryTrimmer(ctx, r.monitor)
+	r.runWG.Add(2)
+	go func(observer *directObserver) {
+		defer r.runWG.Done()
+		observer.Start(ctx)
+	}(r.directObserver)
+	go func() {
+		defer r.runWG.Done()
+		startIdleMemoryTrimmer(ctx, r.monitor)
+	}()
 
 	if !interceptionEnabled {
 		r.running = true
@@ -278,7 +288,7 @@ func (r *Runtime) Pause() error {
 		r.monitor.DisableUI()
 		r.monitor.CloseActiveConnections()
 	}
-	debug.FreeOSMemory()
+	util.ReleaseIdleMemory()
 	return err
 }
 
@@ -322,6 +332,7 @@ func (r *Runtime) stopActiveLocked() error {
 		}
 		r.proxyServer = nil
 	}
+	r.runWG.Wait()
 	r.directObserver = nil
 	r.flows = proxy.NewFlowTable()
 	r.running = false

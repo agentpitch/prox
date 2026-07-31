@@ -208,6 +208,7 @@ Main areas:
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md) - localhost HTTP API used by the WebUI.
 - [docs/RECREATION_SPEC.md](docs/RECREATION_SPEC.md) - text-only specification detailed enough to recreate the program from scratch.
 - [docs/CODE_MAP.md](docs/CODE_MAP.md) - source file map by responsibility.
+- [docs/CODE_AUDIT_2026-07-28.md](docs/CODE_AUDIT_2026-07-28.md) - code audit, long-running resource fixes, decisions, and remaining isolated tests.
 - [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) - preserved CPU investigation that motivated later runtime optimizations.
 - [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) - how to publish the repository to GitHub and use the included CI and release workflow.
 - [CHECKS.md](CHECKS.md) - verification notes for this archive.
@@ -242,9 +243,14 @@ Desktop mode is optimized for a quiet idle state:
 - when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
 - WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
-- otherwise a lightweight SYN classifier decides whether a connection needs interception, and only those flows get dedicated WinDivert packet handling;
+- otherwise a lightweight SYN classifier decides whether a connection needs interception; a shared redirector is opened lazily while at least one selected flow exists and is closed again as soon as the flow table becomes empty;
 - direct-bypass TCP observation now becomes truly dormant when no active UI client is present, instead of continuing periodic full TCP-table scans in the background;
-- owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan.
+- owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan, and cached executable identity is validated with both PID and process creation time;
+- history uses event-driven, batched JSONL writes without SQLite/WAL or an idle polling ticker; incomplete crash tails are truncated and isolated malformed lines are skipped;
+- failed history writes retry at a reduced rate and all emergency in-memory queues are bounded, so a full or unavailable disk cannot make RAM grow indefinitely;
+- large connection maps release their retained capacity after the last connection closes, and the lazy WinDivert cleanup timer sleeps while there are no intercepted flows;
+- forced heap release runs only when there is a meaningful amount of reclaimable memory, avoiding periodic GC work in an already-small idle heap;
+- the WebUI snapshot interval is 15 seconds and the configured HTTP listener is restricted to IPv4/IPv6 loopback addresses.
 
 ## Historical performance note
 

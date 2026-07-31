@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/util"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/util"
 )
 
 type resourceDiagnosticsConfig struct {

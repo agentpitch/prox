@@ -2,25 +2,27 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/proxy"
-	"github.com/openai/pitchprox/internal/rules"
-	"github.com/openai/pitchprox/internal/util"
-	"github.com/openai/pitchprox/internal/win"
-	"github.com/openai/pitchprox/internal/windivert"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/proxy"
+	"github.com/agentpitch/prox/internal/rules"
+	"github.com/agentpitch/prox/internal/util"
+	"github.com/agentpitch/prox/internal/win"
+	"github.com/agentpitch/prox/internal/windivert"
 )
 
 type Runtime struct {
 	store        *config.Store
 	monitor      *monitor.Bus
 	flows        *proxy.FlowTable
+	updateMu     sync.Mutex
 	mu           sync.RWMutex
 	cfg          config.Config
 	engine       *rules.Engine
@@ -87,6 +89,9 @@ func (r *Runtime) TrayView(seconds int) monitor.TrayView {
 }
 
 func (r *Runtime) UpdateConfig(cfg config.Config) error {
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+
 	cfg, err := config.Canonicalize(cfg)
 	if err != nil {
 		return err
@@ -98,35 +103,74 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 
 	r.mu.RLock()
 	old := config.Clone(r.cfg)
+	oldEngine := r.engine
 	oldInterception := r.interceptionEnabled
 	r.mu.RUnlock()
-
-	savedCfg, err := r.store.Save(cfg)
-	if err != nil {
-		return err
-	}
-
-	r.mu.Lock()
-	r.cfg = config.Clone(savedCfg)
-	r.engine = eng
-	r.interceptionEnabled = !eng.AllEnabledActionsDirect()
-	r.mu.Unlock()
-
-	r.monitor.SetRetentionWindow(time.Duration(savedCfg.RetentionMinutes) * time.Minute)
-	r.monitor.SetDroppedLogMaxBytes(savedCfg.DroppedLogMaxBytes)
-	r.monitor.AddLog("info", "configuration updated")
 	newInterception := !eng.AllEnabledActionsDirect()
-	if old.HTTP.Listen != savedCfg.HTTP.Listen {
-		r.monitor.AddLog("warn", "HTTP listener changes require service restart to take effect")
-	}
-	if runtimeRestartRequired(old, savedCfg, oldInterception, newInterception) && r.Running() {
+	restart := runtimeRestartRequired(old, cfg, oldInterception, newInterception) && r.Running()
+
+	if restart {
+		r.applyConfigInMemory(cfg, eng, newInterception)
+		r.applyConfigToMonitor(cfg)
 		r.monitor.AddLog("info", "runtime restart applying routing/listener changes")
 		if err := r.Restart(); err != nil {
-			r.monitor.AddLog("error", "runtime restart failed: %v", err)
+			r.applyConfigInMemory(old, oldEngine, oldInterception)
+			r.applyConfigToMonitor(old)
+			rollbackErr := r.startAfterFailedRestart()
+			r.monitor.AddLog("error", "runtime restart failed, restored previous configuration: %v", err)
+			if rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("restart previous configuration: %w", rollbackErr))
+			}
 			return err
 		}
 	}
+
+	savedCfg, err := r.store.Save(cfg)
+	if err != nil {
+		if restart {
+			r.applyConfigInMemory(old, oldEngine, oldInterception)
+			r.applyConfigToMonitor(old)
+			rollbackErr := r.Restart()
+			if rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("rollback runtime after config save failure: %w", rollbackErr))
+			}
+		}
+		return err
+	}
+	r.applyConfigInMemory(savedCfg, eng, newInterception)
+	r.applyConfigToMonitor(savedCfg)
+	if old.HTTP.Listen != savedCfg.HTTP.Listen {
+		r.monitor.AddLog("warn", "HTTP listener changes require service restart to take effect")
+	}
+	r.monitor.AddLog("info", "configuration updated")
 	return nil
+}
+
+func (r *Runtime) applyConfigInMemory(cfg config.Config, eng *rules.Engine, interception bool) {
+	r.mu.Lock()
+	r.cfg = config.Clone(cfg)
+	r.engine = eng
+	r.interceptionEnabled = interception
+	r.mu.Unlock()
+}
+
+func (r *Runtime) applyConfigToMonitor(cfg config.Config) {
+	r.monitor.SetRetentionWindow(time.Duration(cfg.RetentionMinutes) * time.Minute)
+	r.monitor.SetDroppedLogMaxBytes(cfg.DroppedLogMaxBytes)
+}
+
+func (r *Runtime) startAfterFailedRestart() error {
+	r.runMu.RLock()
+	ctx := r.rootCtx
+	closed := r.closed
+	r.runMu.RUnlock()
+	if closed {
+		return fmt.Errorf("runtime is closed")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return r.Start(ctx)
 }
 
 func (r *Runtime) Running() bool {
@@ -184,7 +228,7 @@ func (r *Runtime) Start(ctx context.Context) (err error) {
 	r.directObserver = &directObserver{
 		Monitor:         r.monitor,
 		Flows:           flows,
-		ActiveInterval:  7 * time.Second,
+		ActiveInterval:  10 * time.Second,
 		DormantInterval: 5 * time.Second,
 		Decide:          r.directConnectionView,
 		List:            r.listTCPConnections,

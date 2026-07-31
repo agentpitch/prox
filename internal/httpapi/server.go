@@ -16,12 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/history"
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/proxy"
-	"github.com/openai/pitchprox/internal/util"
-	embedded "github.com/openai/pitchprox/internal/webui"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/history"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/proxy"
+	"github.com/agentpitch/prox/internal/util"
+	embedded "github.com/agentpitch/prox/internal/webui"
 )
 
 var ErrClosed = net.ErrClosed
@@ -46,6 +46,7 @@ type Server struct {
 	mu        sync.Mutex
 	listener  net.Listener
 	conns     map[net.Conn]struct{}
+	connPeak  int
 	closeCh   chan struct{}
 	closeOnce sync.Once
 	closed    bool
@@ -75,6 +76,12 @@ type uiVisibilityRequest struct {
 type droppedDeleteRequest struct {
 	IDs []string `json:"ids"`
 }
+
+const (
+	maxHTTPConnections = 64
+	maxHTTPHeaders     = 100
+	maxHTTPHeaderBytes = 32 << 10
+)
 
 type droppedConnectionDTO struct {
 	DropID        string            `json:"drop_id"`
@@ -224,7 +231,16 @@ func (s *Server) trackConn(conn net.Conn) bool {
 		_ = conn.Close()
 		return false
 	}
+	if len(s.conns) >= maxHTTPConnections {
+		s.mu.Unlock()
+		writeText(conn, 503, "too many connections")
+		_ = conn.Close()
+		return false
+	}
 	s.conns[conn] = struct{}{}
+	if len(s.conns) > s.connPeak {
+		s.connPeak = len(s.conns)
+	}
 	s.mu.Unlock()
 	return true
 }
@@ -233,6 +249,10 @@ func (s *Server) untrackConn(conn net.Conn) {
 	_ = conn.Close()
 	s.mu.Lock()
 	delete(s.conns, conn)
+	if len(s.conns) == 0 && s.connPeak >= 64 {
+		s.conns = map[net.Conn]struct{}{}
+		s.connPeak = 0
+	}
 	s.mu.Unlock()
 }
 
@@ -656,6 +676,8 @@ func readRequest(br *bufio.Reader) (request, error) {
 		Headers: map[string]string{},
 	}
 	var contentLength int
+	headerBytes := 0
+	headerCount := 0
 	for {
 		line, err := readLine(br)
 		if err != nil {
@@ -663,6 +685,11 @@ func readRequest(br *bufio.Reader) (request, error) {
 		}
 		if line == "" {
 			break
+		}
+		headerCount++
+		headerBytes += len(line)
+		if headerCount > maxHTTPHeaders || headerBytes > maxHTTPHeaderBytes {
+			return request{}, fmt.Errorf("request headers too large")
 		}
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
@@ -691,11 +718,14 @@ func readRequest(br *bufio.Reader) (request, error) {
 }
 
 func readLine(br *bufio.Reader) (string, error) {
-	line, err := br.ReadString('\n')
+	line, err := br.ReadSlice('\n')
 	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", fmt.Errorf("request line too long")
+		}
 		return "", err
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return strings.TrimRight(string(line), "\r\n"), nil
 }
 
 func writeJSON(conn net.Conn, status int, v interface{}) {
@@ -823,11 +853,6 @@ func statusText(code int) string {
 	default:
 		return "Status"
 	}
-}
-
-func mustJSON(v interface{}) []byte {
-	data, _ := json.Marshal(v)
-	return data
 }
 
 func shouldMarkUIActive(path string) bool {

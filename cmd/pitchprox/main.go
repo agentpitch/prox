@@ -7,12 +7,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/openai/pitchprox/internal/app"
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/monitor"
-	svcwrap "github.com/openai/pitchprox/internal/service"
-	"github.com/openai/pitchprox/internal/trayapp"
-	"github.com/openai/pitchprox/internal/util"
+	"github.com/agentpitch/prox/internal/app"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/monitor"
+	svcwrap "github.com/agentpitch/prox/internal/service"
+	"github.com/agentpitch/prox/internal/trayapp"
+	"github.com/agentpitch/prox/internal/util"
 )
 
 const (

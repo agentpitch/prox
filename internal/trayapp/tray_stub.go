@@ -2,7 +2,7 @@
 
 package trayapp
 
-import "github.com/openai/pitchprox/internal/monitor"
+import "github.com/agentpitch/prox/internal/monitor"
 
 type Provider interface {
 	TrayView(seconds int) (monitor.TrayView, error)

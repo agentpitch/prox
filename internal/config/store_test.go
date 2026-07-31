@@ -31,3 +31,29 @@ func TestStoreLoadsUTF8BOMConfig(t *testing.T) {
 		t.Fatalf("listen = %q, want %q", got, cfg.HTTP.Listen)
 	}
 }
+
+func TestCanonicalizeRejectsNonLoopbackHTTPListen(t *testing.T) {
+	for _, listen := range []string{
+		":18080",
+		"0.0.0.0:18080",
+		"[::]:18080",
+		"192.168.1.10:18080",
+	} {
+		cfg := DefaultConfig()
+		cfg.HTTP.Listen = listen
+		if _, err := Canonicalize(cfg); err == nil {
+			t.Fatalf("Canonicalize(%q) succeeded, want loopback validation error", listen)
+		}
+	}
+	for _, listen := range []string{
+		"127.0.0.1:18080",
+		"[::1]:18080",
+		"localhost:18080",
+	} {
+		cfg := DefaultConfig()
+		cfg.HTTP.Listen = listen
+		if _, err := Canonicalize(cfg); err != nil {
+			t.Fatalf("Canonicalize(%q): %v", listen, err)
+		}
+	}
+}

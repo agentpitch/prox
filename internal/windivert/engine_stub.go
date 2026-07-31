@@ -6,9 +6,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/proxy"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/proxy"
 )
 
 type PlanDecision struct {

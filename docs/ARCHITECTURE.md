@@ -15,7 +15,8 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. The program 
 - optionally starts in observer-only mode when all enabled rules are `Direct`;
 - otherwise uses a small WinDivert SYN-classifier handle instead of capturing all outbound TCP packets;
 - resolves the owning PID and executable path for candidate flows;
-- only opens per-flow WinDivert packet handlers for flows that actually need interception;
+- lazily opens one shared redirector while at least one flow actually needs interception;
+- closes that redirector immediately when the last selected flow is retired;
 - redirects only selected traffic to the local transparent listener.
 
 ### Routing plane
@@ -114,10 +115,10 @@ Responsibilities:
 - run a lightweight outbound TCP SYN classifier;
 - consult owner cache only for new candidate flows;
 - fast-path definitive `Direct` flows without opening a relay path;
-- open dedicated per-flow WinDivert handlers only for flows that need interception;
-- rewrite packets toward the local listener only for those intercepted flows;
+- open one shared packet redirector lazily while intercepted flows exist;
+- rewrite only packets matching an entry in the bounded flow table and reinject other captured packets unchanged;
 - exempt loopback and self-traffic;
-- retire per-flow handlers after close or inactivity.
+- retire unopened flows after inactivity and close the shared redirector as soon as the table becomes empty.
 
 ### `internal/win`
 
@@ -186,7 +187,7 @@ Responsibilities:
 3. pitchProx resolves PID/exe from the owner cache.
 4. A preflight rule match runs with the information already known at SYN time: PID, executable path, target IP and port.
 5. If the result is definitively `Direct`, the SYN is allowed through unchanged and the connection bypasses pitchProx data relaying completely.
-6. Otherwise pitchProx opens a dedicated per-flow WinDivert handler and creates a `proxy.Flow` record in `FlowTable`.
+6. Otherwise pitchProx creates a `proxy.Flow` record and lazily opens the shared redirector if it is not already active.
 7. The first SYN is rewritten to the transparent listener.
 8. `proxy.Server` accepts the redirected socket.
 9. It looks up the original destination from `FlowTable`.
@@ -204,6 +205,7 @@ Responsibilities:
     - proxy activity when action is `Proxy` or `Chain`.
 16. Closed/blocked/error connection history is persisted to the file-backed history store.
 17. Open connections remain only in RAM until they close.
+18. When the final intercepted connection closes, the flow table releases high-water capacity and the shared redirector is closed.
 
 ## 5. Quiet mode and performance design
 
@@ -227,6 +229,18 @@ Verbose logging is only captured while the WebUI is open or recently active. Tra
 When the browser tab is hidden or closing, the frontend explicitly marks the UI inactive so the backend can return to the colder quiet-mode behavior sooner.
 Traffic history for the WebUI is bucketed before it leaves the backend, so long retention windows do not require building or shipping giant per-second arrays.
 
+### Long-running resource lifecycle
+
+- history flushes are driven by pending work rather than a permanent ticker;
+- failed writes use a 30-second retry interval and bounded emergency queues, with a diagnostic counter for discarded overflow;
+- startup truncates only an incomplete JSONL tail, while malformed complete lines are skipped without hiding valid neighboring records;
+- dropped-connection pagination, deletion and size trimming stream files instead of loading the full log into RAM;
+- PID-to-executable cache entries use PID plus process creation time, expire after a TTL, and are compacted during on-demand owner refresh;
+- flow, relay and HTTP connection maps replace their backing maps after a high-water burst drains to zero;
+- the flow cleanup timer is armed only while pending flow records exist;
+- forced heap release is conditional and infrequent rather than an unconditional periodic GC;
+- configuration changes that require a routing restart are activated before being committed to disk and roll back to the previous running configuration if activation fails.
+
 ## 6. Retention model
 
 `Config.RetentionMinutes` is the single source of truth for retention.
@@ -239,6 +253,8 @@ It controls:
 - segment pruning horizon.
 
 The default is 7 minutes.
+
+History remains a compact hourly JSONL segment store. SQLite/WAL is intentionally not used: the store has one in-process writer, and WAL would add a database runtime and background/checkpoint work without solving a demonstrated concurrency requirement.
 
 The WebUI `Новые` connection tab reuses the retained connection segments. It reports application/address/port signatures first seen during the last minute, but only when the selected retention window is longer than one minute so there is an earlier baseline inside the same window.
 
@@ -259,5 +275,6 @@ Transient/ephemeral:
 - existing connections created before start are not retroactively adopted;
 - hostname recovery is strongest for HTTP/TLS;
 - no authenticated WebUI;
+- HTTP is intentionally loopback-only;
 - service mode is headless;
 - no UDP/QUIC/HTTP3.

@@ -24,8 +24,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/util"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/util"
 	"golang.org/x/sys/windows"
 )
 

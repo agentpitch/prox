@@ -33,7 +33,7 @@ let ui = {
   serviceBusy: false,
 };
 
-const SNAPSHOT_POLL_MS = 7000;
+const SNAPSHOT_POLL_MS = 15000;
 
 function retentionMinutesFor(source = state) {
   const n = Number(source?.retention_minutes || snapshot?.retention_minutes || 7);

@@ -1,4 +1,4 @@
-module github.com/openai/pitchprox
+module github.com/agentpitch/prox
 
 go 1.25.0
 

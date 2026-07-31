@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 func BenchmarkPreflightLargeRuleSetDefinitiveDirect(b *testing.B) {

@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/monitor"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/monitor"
 )
 
 type RouteResult struct {
@@ -41,6 +41,7 @@ type Server struct {
 
 	activeMu    sync.Mutex
 	activeConns map[net.Conn]struct{}
+	activePeak  int
 }
 
 var relayBufPool = sync.Pool{New: func() any {
@@ -286,6 +287,9 @@ func (s *Server) trackActiveConn(conn net.Conn) {
 		s.activeConns = map[net.Conn]struct{}{}
 	}
 	s.activeConns[conn] = struct{}{}
+	if len(s.activeConns) > s.activePeak {
+		s.activePeak = len(s.activeConns)
+	}
 	s.activeMu.Unlock()
 }
 
@@ -295,6 +299,10 @@ func (s *Server) untrackActiveConn(conn net.Conn) {
 	}
 	s.activeMu.Lock()
 	delete(s.activeConns, conn)
+	if len(s.activeConns) == 0 && s.activePeak >= 64 {
+		s.activeConns = map[net.Conn]struct{}{}
+		s.activePeak = 0
+	}
 	s.activeMu.Unlock()
 }
 
@@ -304,6 +312,8 @@ func (s *Server) closeActiveConns() {
 	for conn := range s.activeConns {
 		conns = append(conns, conn)
 	}
+	s.activeConns = map[net.Conn]struct{}{}
+	s.activePeak = 0
 	s.activeMu.Unlock()
 	for _, conn := range conns {
 		_ = conn.Close()

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/win"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/win"
 )
 
 func runtimeTestConfig() config.Config {
@@ -188,6 +188,52 @@ func TestRuntimeUpdateConfigRestartsRunningObserverModeForTransparentChange(t *t
 	rt.runMu.RUnlock()
 	if newFlows == nil || newFlows == oldFlows {
 		t.Fatal("runtime restart did not replace flow table")
+	}
+}
+
+func TestRuntimeUpdateConfigRollsBackWhenRestartFails(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.json")
+	rt, err := NewRuntime(cfgPath, filepath.Join(tmp, "history"))
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer func() { _ = rt.Stop() }()
+
+	oldCfg := runtimeTestConfig()
+	if err := rt.UpdateConfig(oldCfg); err != nil {
+		t.Fatalf("initial UpdateConfig: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	broken := config.Clone(oldCfg)
+	broken.Transparent.IPv4Listener = "203.0.113.123"
+	broken.Rules[0].Action = config.ActionProxy
+	broken.Rules[0].ProxyID = "p1"
+	if err := rt.UpdateConfig(broken); err == nil {
+		t.Fatal("UpdateConfig succeeded with an unavailable transparent listener address")
+	}
+	if !rt.Running() {
+		t.Fatal("runtime was not restarted with the previous configuration")
+	}
+	got := rt.CurrentConfig()
+	if got.Transparent.IPv4Listener != oldCfg.Transparent.IPv4Listener || got.Rules[0].Action != config.ActionDirect {
+		t.Fatalf("runtime config was not rolled back: %+v", got)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var onDisk config.Config
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if onDisk.Transparent.IPv4Listener != oldCfg.Transparent.IPv4Listener || onDisk.Rules[0].Action != config.ActionDirect {
+		t.Fatalf("on-disk config was not preserved: %+v", onDisk)
 	}
 }
 

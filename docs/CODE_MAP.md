@@ -9,7 +9,8 @@ This file maps concepts to source files.
 ## Runtime orchestration
 
 - `internal/app/program.go` - start/stop orchestration for runtime + lightweight loopback WebUI server.
-- `internal/app/runtime.go` - owns config store, monitor, flow table, rule engine, direct observer, and selective interception startup.
+- `internal/app/runtime.go` - owns config store, monitor, flow table, rule engine, direct observer, selective interception startup, and rollback-safe runtime config activation.
+- `internal/app/memory_trim.go` - low-frequency, threshold-based release of genuinely idle Go heap pages.
 - `internal/app/direct_observer.go` - UI-driven TCP table observer for direct-bypass connections; it goes dormant when the UI is inactive so direct traffic visibility does not keep periodic TCP snapshots warm in the background.
 
 ## Configuration
@@ -26,13 +27,13 @@ This file maps concepts to source files.
 ## History and observability
 
 - `internal/history/model.go` - file-backed history record types.
-- `internal/history/store.go` - segment-backed history store, batching, flushing, pruning, aggregated queries, bucketed traffic snapshots.
+- `internal/history/store.go` - segment-backed history store, event-driven batching, bounded failure queues, crash-tail recovery, streaming dropped-log operations, pruning, aggregated queries, and bucketed traffic snapshots.
 - `internal/monitor/monitor.go` - active in-RAM state, UI activity signaling, SSE publishing, snapshot assembly, bucket sizing, tray view.
 
 ## Transparent routing
 
-- `internal/proxy/flowtable.go` - flow identity cache between interception and listener.
-- `internal/proxy/sniff.go` - HTTP Host / TLS SNI extraction.
+- `internal/proxy/flowtable.go` - bounded-lifecycle flow identity cache between interception and listener.
+- `internal/proxy/sniff.go` - bounded HTTP Host / multi-record TLS SNI extraction.
 - `internal/proxy/upstream.go` - direct, HTTP CONNECT and SOCKS5 dialers.
 - `internal/proxy/test.go` - proxy availability test.
 - `internal/proxy/transparent.go` - listener accept loop, route decision, relay, batched byte accounting.
@@ -48,8 +49,8 @@ This file maps concepts to source files.
 ## Windows integration
 
 - `internal/windivert/divert_windows.go` - WinDivert DLL bindings.
-- `internal/windivert/engine_windows.go` - interception loop, owner-cache use, flow registration.
-- `internal/windivert/packet.go` - packet parsing helpers.
+- `internal/windivert/engine_windows.go` - SYN classifier, lazy shared redirector, checked reinjection, owner-cache use, flow registration and dormant cleanup timer.
+- `internal/windivert/packet.go` - bounded IPv4/IPv6 packet parsing including IPv6 extension-header walking.
 - `internal/win/owner_windows.go` - Windows TCP owner helpers and exe path lookup.
 - `internal/win/owner_cache_windows.go` - on-demand owner cache used by the SYN classifier.
 - `internal/win/tcp_snapshot_windows.go` - direct-observer TCP snapshot reader with persistent PID-to-exe caching.

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/monitor"
-	"github.com/openai/pitchprox/internal/win"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/monitor"
+	"github.com/agentpitch/prox/internal/win"
 )
 
 type fakeDirectObserverMonitor struct {

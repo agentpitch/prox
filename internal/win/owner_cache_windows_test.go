@@ -11,7 +11,7 @@ func TestCompactExeCacheDropsExpiredEntries(t *testing.T) {
 	now := time.Now().UTC()
 	cache := map[uint32]exeCacheEntry{
 		10: {Path: `C:\old.exe`, Expires: now.Add(-time.Second)},
-		20: {Path: `C:\new.exe`, Expires: now.Add(time.Minute)},
+		20: {Path: `C:\new.exe`, Expires: now.Add(time.Minute), ValidatedAt: now},
 	}
 
 	got := compactExeCache(cache, now)

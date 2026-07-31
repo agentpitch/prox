@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 type CompiledRule struct {

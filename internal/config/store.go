@@ -71,15 +71,19 @@ func (s *Store) Save(cfg Config) (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg.UpdatedAt = time.Now().UTC()
-	s.cfg = Clone(cfg)
-	if err := s.saveLocked(); err != nil {
+	if err := s.saveConfigLocked(cfg); err != nil {
 		return Config{}, err
 	}
+	s.cfg = Clone(cfg)
 	return Clone(s.cfg), nil
 }
 
 func (s *Store) saveLocked() error {
-	data, err := json.MarshalIndent(s.cfg, "", "  ")
+	return s.saveConfigLocked(s.cfg)
+}
+
+func (s *Store) saveConfigLocked(cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}

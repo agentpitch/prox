@@ -7,7 +7,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/openai/pitchprox/internal/proxy"
+	"github.com/agentpitch/prox/internal/proxy"
 )
 
 func TestSharedRedirectorRewritesAppAndListenerPackets(t *testing.T) {

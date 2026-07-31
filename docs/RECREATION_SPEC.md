@@ -178,7 +178,9 @@ The required design is:
 - for each new relevant SYN, identify PID/exe and run a preflight rule match using only PID, executable path, target IP and port;
 - if the result is definitively `Direct`, allow the connection through unchanged and do not build a userland relay path;
 - only when the result is non-direct or hostname-dependent, create a flow-table record and redirect the connection into the local transparent listener;
-- open dedicated per-flow packet interception only for those intercepted flows.
+- lazily open one shared redirector while at least one intercepted flow exists;
+- close the shared redirector immediately after the last flow is removed;
+- keep pending-flow cleanup dormant while the flow table is empty.
 
 Must avoid loops for:
 
@@ -194,7 +196,7 @@ Use an on-demand owner cache:
 
 - cache exact local+remote tuples;
 - keep a local-endpoint fallback map;
-- keep a PID→exe cache with TTL;
+- keep a PID→exe cache with TTL and validate identity with the process creation time so a reused PID cannot inherit a stale executable path;
 - refresh the cache on demand when a SYN cannot be resolved from the current maps.
 
 The interception hot path should mostly do cheap map lookups and should not require a hot periodic full-table scan.
@@ -275,6 +277,16 @@ When WebUI is not open:
 - tray must use a lightweight traffic-only view or direct provider;
 - tray polling must **not** mark the UI active;
 - verbose logging must remain off.
+
+Long-running requirements:
+
+- history writes must be event-driven and batched, with no idle database/checkpoint loop;
+- corrupt complete JSONL lines are skipped and an incomplete crash tail is truncated;
+- queries and dropped-log compaction must stream input instead of reading whole files into RAM;
+- pending history queues must have hard bounds and a slow retry path for persistent disk errors;
+- flow and connection maps must release high-water backing storage after they drain;
+- forced heap release must run only when enough memory can actually be returned;
+- the HTTP control plane must listen only on IPv4 or IPv6 loopback.
 
 ## 9. Tray requirements
 

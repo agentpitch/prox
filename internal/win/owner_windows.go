@@ -148,9 +148,12 @@ func loadTCP4Table(tableClass uint32) ([]mibTCPRowOwnerPID, error) {
 	n := *(*uint32)(unsafe.Pointer(&buf[0]))
 	rows := make([]mibTCPRowOwnerPID, 0, n)
 	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
-	base := uintptr(unsafe.Pointer(&buf[4]))
+	if uint64(n)*uint64(rowSize)+4 > uint64(len(buf)) {
+		return nil, fmt.Errorf("truncated IPv4 TCP owner table")
+	}
+	base := unsafe.Pointer(&buf[4])
 	for i := uint32(0); i < n; i++ {
-		row := *(*mibTCPRowOwnerPID)(unsafe.Pointer(base + uintptr(i)*rowSize))
+		row := *(*mibTCPRowOwnerPID)(unsafe.Add(base, uintptr(i)*rowSize))
 		rows = append(rows, row)
 	}
 	return rows, nil
@@ -164,9 +167,12 @@ func loadTCP6Table(tableClass uint32) ([]mibTCP6RowOwnerPID, error) {
 	n := *(*uint32)(unsafe.Pointer(&buf[0]))
 	rows := make([]mibTCP6RowOwnerPID, 0, n)
 	rowSize := unsafe.Sizeof(mibTCP6RowOwnerPID{})
-	base := uintptr(unsafe.Pointer(&buf[4]))
+	if uint64(n)*uint64(rowSize)+4 > uint64(len(buf)) {
+		return nil, fmt.Errorf("truncated IPv6 TCP owner table")
+	}
+	base := unsafe.Pointer(&buf[4])
 	for i := uint32(0); i < n; i++ {
-		row := *(*mibTCP6RowOwnerPID)(unsafe.Pointer(base + uintptr(i)*rowSize))
+		row := *(*mibTCP6RowOwnerPID)(unsafe.Add(base, uintptr(i)*rowSize))
 		rows = append(rows, row)
 	}
 	return rows, nil
@@ -181,12 +187,20 @@ func loadTable(af uint32, tableClass uint32) ([]byte, error) {
 	if size < 4 {
 		size = 4
 	}
-	buf := make([]byte, size)
-	r1, _, _ = procGetExtendedTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, uintptr(af), uintptr(tableClass), 0)
-	if r1 != 0 {
-		return nil, syscallErr("GetExtendedTcpTable", r1)
+	for attempt := 0; attempt < 3; attempt++ {
+		buf := make([]byte, size)
+		r1, _, _ = procGetExtendedTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, uintptr(af), uintptr(tableClass), 0)
+		if r1 == 0 {
+			if size > uint32(len(buf)) {
+				return nil, fmt.Errorf("GetExtendedTcpTable returned invalid size %d", size)
+			}
+			return buf[:size], nil
+		}
+		if windows.Errno(r1) != windows.ERROR_INSUFFICIENT_BUFFER {
+			return nil, syscallErr("GetExtendedTcpTable", r1)
+		}
 	}
-	return buf[:size], nil
+	return nil, fmt.Errorf("GetExtendedTcpTable table kept growing")
 }
 
 func decodePort(v uint32) uint16 {
@@ -196,17 +210,35 @@ func decodePort(v uint32) uint16 {
 }
 
 func ExePath(pid uint32) (string, error) {
+	path, _, err := ProcessInfo(pid)
+	return path, err
+}
+
+func ProcessInfo(pid uint32) (string, int64, error) {
+	path, creation, _, err := RefreshProcessInfo(pid, 0)
+	return path, creation, err
+}
+
+func RefreshProcessInfo(pid uint32, knownCreation int64) (string, int64, bool, error) {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return "", err
+		return "", 0, false, err
 	}
 	defer windows.CloseHandle(h)
+	var creation, exit, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
+		return "", 0, false, err
+	}
+	creationNS := creation.Nanoseconds()
+	if knownCreation != 0 && creationNS == knownCreation {
+		return "", creationNS, false, nil
+	}
 	buf := make([]uint16, 32768)
 	size := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
-		return "", err
+		return "", 0, false, err
 	}
-	return windows.UTF16ToString(buf[:size]), nil
+	return windows.UTF16ToString(buf[:size]), creationNS, true, nil
 }
 
 func syscallErr(name string, code uintptr) error {

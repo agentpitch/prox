@@ -7,7 +7,7 @@ This archive contains the current optimized baseline with segment-backed history
 - tray no longer reads the full `/api/snapshot` feed in desktop mode;
 - tray reads a lightweight traffic view and no longer keeps verbose logging permanently enabled;
 - connection/log/rule/traffic history is persisted into compact hourly files under `pitchProx.history/` instead of living only in RAM;
-- the global all-packets WinDivert path was replaced with a selective SYN classifier plus per-flow interception;
+- the global always-on all-packets WinDivert path was replaced with a selective SYN classifier plus a shared redirector that exists only while intercepted flows are active;
 - all-direct rulesets now run in observer-only mode without starting WinDivert at all;
 - owner lookup is on-demand instead of hot periodic refresh;
 - direct observer now fully sleeps when no active UI client is present and wakes immediately when the UI returns;
@@ -16,6 +16,11 @@ This archive contains the current optimized baseline with segment-backed history
 - relay accounting is batched instead of writing counters on every copied chunk;
 - the embedded WebUI/control plane now uses a lightweight loopback HTTP implementation instead of `net/http`;
 - SQLite and `modernc` were removed from the runtime path.
+- history recovery, retry and pending-memory behavior are bounded for long-running disk-error scenarios;
+- process-path caches validate PID reuse with process creation time;
+- flow/connection maps release high-water capacity after draining;
+- IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
+- runtime config activation rolls back if a required listener/interception restart fails.
 
 ## Checks run in this workspace
 
@@ -61,3 +66,25 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 - proxy activity, connection history, and logs continue to work after long uptime;
 - hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
 - idle memory is materially lower than older builds because the binary no longer links `net/http`/TLS or SQLite.
+
+## Audit verification on 2026-07-28
+
+The long-running resource audit in `docs/CODE_AUDIT_2026-07-28.md` was validated after all code and module-path changes with:
+
+```text
+go test -count=5 ./...
+go vet ./...
+node --check internal/webui/dist/app.js
+go build -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx-review.exe .\cmd\pitchprox
+```
+
+Result:
+
+- all packages passed five consecutive test runs;
+- the Windows handle-churn test passed repeated 1000-connection cycles;
+- `go vet` reported no findings;
+- module metadata now reports `github.com/agentpitch/prox`;
+- `build\pitchProx-review.exe` size: `4,580,864` bytes;
+- SHA-256: `C31B2B51AA056BE7537CAC1189058A1B57CD78369BD139AF1852D7654567B3D3`.
+
+The review binary was deliberately written under a different filename. The already running elevated `pitchProx.exe` process was not stopped, replaced, or used for WinDivert end-to-end testing.

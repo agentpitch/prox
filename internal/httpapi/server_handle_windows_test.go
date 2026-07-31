@@ -37,21 +37,25 @@ func TestServerConnectionChurnDoesNotLeakWindowsHandles(t *testing.T) {
 			DisableKeepAlives: true,
 		},
 	}
-	runHealthRequests(t, client, addr, 25)
+	// Exercise a full churn cycle before taking the baseline. The first large
+	// burst lets the Go runtime create its steady-state network poller and
+	// worker-thread handles; those are process initialization, not server leaks.
+	runHealthRequests(t, client, addr, 1000)
 	waitNoTrackedConnections(t, srv)
+	beforeHeap := currentHeapAlloc()
 	before, err := currentProcessHandleCount()
 	if err != nil {
 		t.Fatalf("handle count before churn: %v", err)
 	}
-	beforeHeap := currentHeapAlloc()
 
 	runHealthRequests(t, client, addr, 1000)
 	waitNoTrackedConnections(t, srv)
+	client.CloseIdleConnections()
+	afterHeap := currentHeapAlloc()
 	after, err := currentProcessHandleCount()
 	if err != nil {
 		t.Fatalf("handle count after churn: %v", err)
 	}
-	afterHeap := currentHeapAlloc()
 	t.Logf("process handles before=%d after=%d delta=%d", before, after, int64(after)-int64(before))
 	t.Logf("heap alloc before=%d after=%d delta=%d", beforeHeap, afterHeap, int64(afterHeap)-int64(beforeHeap))
 

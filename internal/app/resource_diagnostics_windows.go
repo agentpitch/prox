@@ -223,8 +223,13 @@ func resourceSystemHandles() ([]systemHandleTableEntryInfoEx, error) {
 		)
 		if ntStatusOK(status) {
 			count := *(*uintptr)(unsafe.Pointer(&buf[0]))
-			base := uintptr(unsafe.Pointer(&buf[0])) + unsafe.Sizeof(uintptr(0))*2
-			raw := unsafe.Slice((*systemHandleTableEntryInfoEx)(unsafe.Pointer(base)), int(count))
+			headerSize := unsafe.Sizeof(uintptr(0)) * 2
+			entrySize := unsafe.Sizeof(systemHandleTableEntryInfoEx{})
+			if headerSize > uintptr(len(buf)) || count > (uintptr(len(buf))-headerSize)/entrySize {
+				return nil, windows.ERROR_INVALID_DATA
+			}
+			base := unsafe.Add(unsafe.Pointer(&buf[0]), headerSize)
+			raw := unsafe.Slice((*systemHandleTableEntryInfoEx)(base), int(count))
 			out := make([]systemHandleTableEntryInfoEx, 0, 128)
 			pid := uintptr(os.Getpid())
 			for _, h := range raw {

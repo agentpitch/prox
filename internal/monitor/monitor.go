@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
-	"github.com/openai/pitchprox/internal/history"
+	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/history"
 )
 
 type Connection struct {

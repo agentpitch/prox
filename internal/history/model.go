@@ -3,7 +3,7 @@ package history
 import (
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 type ConnectionRecord struct {

@@ -214,8 +214,12 @@ func Validate(cfg Config) error {
 	if cfg.HTTP.Listen == "" {
 		return fmt.Errorf("http.listen is required")
 	}
-	if _, _, err := net.SplitHostPort(cfg.HTTP.Listen); err != nil {
+	host, _, err := net.SplitHostPort(cfg.HTTP.Listen)
+	if err != nil {
 		return fmt.Errorf("http.listen must be host:port: %v", err)
+	}
+	if !isLoopbackHTTPHost(host) {
+		return fmt.Errorf("http.listen must use a loopback host")
 	}
 	if cfg.Transparent.ListenerPort < 1 || cfg.Transparent.ListenerPort > 65535 {
 		return fmt.Errorf("transparent.listener_port must be in 1..65535")
@@ -322,6 +326,15 @@ func Validate(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+func isLoopbackHTTPHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func label(name, id string) string {

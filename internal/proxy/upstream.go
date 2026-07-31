@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 type Dialer interface {

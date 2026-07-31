@@ -28,9 +28,11 @@ type FlowTable struct {
 	mu      sync.RWMutex
 	flows   map[flowKey]Flow
 	deletes int
+	peak    int
+	onEmpty func()
 }
 
-const flowMapCompactDeletes = 256
+const flowMapCompactDeletes = 64
 
 type RedirectDirection uint8
 
@@ -51,6 +53,9 @@ func (t *FlowTable) Register(f Flow) {
 	}
 	f.LastSeen = now
 	t.flows[makeFlowKey(f.ClientIP, f.ClientPort)] = f
+	if len(t.flows) > t.peak {
+		t.peak = len(t.flows)
+	}
 }
 
 func (t *FlowTable) Lookup(clientIP netip.Addr, clientPort uint16) (Flow, bool) {
@@ -101,36 +106,54 @@ func (t *FlowTable) RedirectPacket(srcIP netip.Addr, srcPort uint16, dstIP netip
 
 func (t *FlowTable) Delete(clientIP netip.Addr, clientPort uint16) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.deleteLocked(makeFlowKey(clientIP, clientPort))
+	becameEmpty := t.deleteLocked(makeFlowKey(clientIP, clientPort))
+	onEmpty := t.onEmpty
+	t.mu.Unlock()
+	if becameEmpty && onEmpty != nil {
+		onEmpty()
+	}
 }
 
 func (t *FlowTable) Cleanup(maxAge time.Duration) {
 	cutoff := time.Now().UTC().Add(-maxAge)
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	becameEmpty := false
 	for k, f := range t.flows {
 		if !f.Accepted && f.LastSeen.Before(cutoff) {
-			t.deleteLocked(k)
+			becameEmpty = t.deleteLocked(k) || becameEmpty
 		}
+	}
+	onEmpty := t.onEmpty
+	t.mu.Unlock()
+	if becameEmpty && onEmpty != nil {
+		onEmpty()
 	}
 }
 
-func (t *FlowTable) deleteLocked(k flowKey) {
+func (t *FlowTable) SetOnEmpty(fn func()) {
+	t.mu.Lock()
+	t.onEmpty = fn
+	t.mu.Unlock()
+}
+
+func (t *FlowTable) deleteLocked(k flowKey) bool {
 	if _, ok := t.flows[k]; !ok {
-		return
+		return false
 	}
+	wasNonEmpty := len(t.flows) > 0
 	delete(t.flows, k)
 	t.deletes++
 	t.compactMaybeLocked()
+	return wasNonEmpty && len(t.flows) == 0
 }
 
 func (t *FlowTable) compactMaybeLocked() {
 	if len(t.flows) == 0 {
-		if t.deletes >= flowMapCompactDeletes {
+		if t.peak >= flowMapCompactDeletes {
 			t.flows = map[flowKey]Flow{}
 		}
 		t.deletes = 0
+		t.peak = 0
 		return
 	}
 	if t.deletes < flowMapCompactDeletes {
@@ -142,6 +165,7 @@ func (t *FlowTable) compactMaybeLocked() {
 	}
 	t.flows = next
 	t.deletes = 0
+	t.peak = len(next)
 }
 
 func makeFlowKey(ip netip.Addr, port uint16) flowKey {

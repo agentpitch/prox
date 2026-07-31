@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/openai/pitchprox/internal/httpapi"
+	"github.com/agentpitch/prox/internal/httpapi"
 )
 
 type Program struct {

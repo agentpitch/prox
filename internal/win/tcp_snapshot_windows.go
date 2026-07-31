@@ -107,20 +107,31 @@ func (s *TCPSnapshotter) exePathCached(pid uint32, now time.Time) string {
 	}
 	s.mu.Lock()
 	entry, ok := s.exeByPID[pid]
-	if ok && now.Before(entry.Expires) {
+	if ok && entry.Path != "" && now.Before(entry.Expires) && now.Sub(entry.ValidatedAt) < exeValidationMaxAge {
 		path := entry.Path
 		s.mu.Unlock()
 		return path
 	}
 	s.mu.Unlock()
 
-	path, _ := ExePath(pid)
+	path, creation, changed, err := RefreshProcessInfo(pid, entry.CreationTime)
+	if err != nil {
+		return ""
+	}
+	if !changed {
+		path = entry.Path
+	}
 
 	s.mu.Lock()
 	if s.exeByPID == nil {
 		s.exeByPID = map[uint32]exeCacheEntry{}
 	}
-	s.exeByPID[pid] = exeCacheEntry{Path: path, Expires: now.Add(exeCacheTTL)}
+	s.exeByPID[pid] = exeCacheEntry{
+		Path:         path,
+		CreationTime: creation,
+		ValidatedAt:  now,
+		Expires:      now.Add(exeCacheTTL),
+	}
 	s.mu.Unlock()
 	return path
 }

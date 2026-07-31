@@ -2,11 +2,12 @@ package history
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 func TestStoreSnapshotRoundTrip(t *testing.T) {
@@ -79,6 +80,94 @@ func TestStoreSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreRecoversPartialTailAndSkipsMalformedCompleteLine(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "history")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	store, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	store.RecordLog(LogRecord{Time: now, Level: "info", Message: "valid"})
+	if err := store.Close(); err != nil {
+		t.Fatalf("close initial store: %v", err)
+	}
+
+	path := filepath.Join(root, segmentFileName("logs", now))
+	partial := []byte(`{"time":"unfinished`)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open log segment for corruption: %v", err)
+	}
+	if _, err := f.Write(append([]byte("{malformed}\n"), partial...)); err != nil {
+		_ = f.Close()
+		t.Fatalf("append corrupt records: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close corrupt segment: %v", err)
+	}
+
+	reopened, err := Open(root, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened store: %v", err)
+		}
+	}()
+
+	if got := reopened.DiagnosticStats().RecoveredTailBytes; got != int64(len(partial)) {
+		t.Fatalf("recovered tail bytes = %d, want %d", got, len(partial))
+	}
+	snapshot, err := reopened.Snapshot(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("snapshot recovered store: %v", err)
+	}
+	if len(snapshot.Logs) != 1 || snapshot.Logs[0].Message != "valid" {
+		t.Fatalf("recovered logs = %+v, want the valid record only", snapshot.Logs)
+	}
+	if got := reopened.DiagnosticStats().SkippedLines; got != 1 {
+		t.Fatalf("skipped malformed lines = %d, want 1", got)
+	}
+}
+
+func TestPendingHistoryIsBoundedWhenWriterCannotDrain(t *testing.T) {
+	store := &Store{
+		pendingTraffic: map[int64]TrafficSample{},
+		pendingRule:    map[string]rulePending{},
+	}
+	base := time.Now().UTC().Truncate(time.Second)
+
+	for i := 0; i < maxPendingLogs+10; i++ {
+		store.RecordLog(LogRecord{Time: base, Message: fmt.Sprintf("log-%d", i)})
+	}
+	for i := 0; i < maxPendingConnections+10; i++ {
+		store.RecordConnection(ConnectionRecord{ID: fmt.Sprintf("conn-%d", i)})
+	}
+	for i := 0; i < maxPendingDropped+10; i++ {
+		store.RecordDroppedConnection(ConnectionRecord{ID: fmt.Sprintf("drop-%d", i), LastUpdatedAt: base})
+	}
+	for i := 0; i < maxPendingTrafficBuckets+10; i++ {
+		store.AddTraffic(base.Add(time.Duration(i)*time.Second), 1, 1)
+	}
+	for i := 0; i < maxPendingRuleBuckets+10; i++ {
+		store.AddRuleActivity(base, fmt.Sprintf("rule-%d", i), "", config.ActionDirect, 1, 0, 0)
+	}
+
+	stats := store.DiagnosticStats()
+	if stats.PendingLogs != maxPendingLogs ||
+		stats.PendingConnections != maxPendingConnections ||
+		stats.PendingDropped != maxPendingDropped ||
+		stats.PendingTrafficBuckets != maxPendingTrafficBuckets ||
+		stats.PendingRuleBuckets != maxPendingRuleBuckets {
+		t.Fatalf("pending queues exceeded limits: %+v", stats)
+	}
+	if stats.DiscardedPending != 50 {
+		t.Fatalf("discarded pending records = %d, want 50", stats.DiscardedPending)
+	}
+}
+
 func TestStoreSnapshotWithoutLogs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pitchProx.history")
 	store, err := Open(root, 10*time.Minute)
@@ -140,7 +229,8 @@ func TestStoreSnapshotBucketsTraffic(t *testing.T) {
 		}
 	}()
 
-	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	baseUnix := time.Now().UTC().Add(-2 * time.Minute).Unix()
+	base := time.Unix((baseUnix/3)*3, 0).UTC()
 	store.AddTraffic(base.Add(0*time.Second), 10, 100)
 	store.AddTraffic(base.Add(1*time.Second), 20, 200)
 	store.AddTraffic(base.Add(2*time.Second), 30, 300)

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openai/pitchprox/internal/monitor"
+	"github.com/agentpitch/prox/internal/monitor"
 )
 
 func TestEncodeICOUsesUncompressedDIB(t *testing.T) {

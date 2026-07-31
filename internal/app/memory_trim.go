@@ -2,16 +2,21 @@ package app
 
 import (
 	"context"
+	"runtime"
 	"time"
 
-	"github.com/openai/pitchprox/internal/util"
+	"github.com/agentpitch/prox/internal/util"
 )
 
 type memoryTrimMonitor interface {
 	UIActive() bool
 }
 
-const idleMemoryTrimInterval = 2 * time.Minute
+const (
+	idleMemoryTrimInterval   = 5 * time.Minute
+	idleHeapReleaseThreshold = 4 << 20
+	idleHeapAllocThreshold   = 16 << 20
+)
 
 func startIdleMemoryTrimmer(ctx context.Context, monitor memoryTrimMonitor) {
 	if monitor == nil {
@@ -24,9 +29,19 @@ func startIdleMemoryTrimmer(ctx context.Context, monitor memoryTrimMonitor) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !monitor.UIActive() {
+			if !monitor.UIActive() && idleMemoryReleaseWorthwhile() {
 				util.ReleaseIdleMemory()
 			}
 		}
 	}
+}
+
+func idleMemoryReleaseWorthwhile() bool {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	unreleasedIdle := uint64(0)
+	if stats.HeapIdle > stats.HeapReleased {
+		unreleasedIdle = stats.HeapIdle - stats.HeapReleased
+	}
+	return unreleasedIdle >= idleHeapReleaseThreshold || stats.HeapAlloc >= idleHeapAllocThreshold
 }

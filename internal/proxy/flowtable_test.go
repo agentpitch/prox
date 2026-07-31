@@ -118,6 +118,37 @@ func TestFlowTableChurnReturnsToEmptyAndCompacts(t *testing.T) {
 	}
 }
 
+func TestFlowTableHighWaterChurnReleasesAndSignalsOnce(t *testing.T) {
+	table := NewFlowTable()
+	clientIP := netip.MustParseAddr("127.0.0.1")
+	originalIP := netip.MustParseAddr("1.1.1.1")
+	emptySignals := 0
+	table.SetOnEmpty(func() { emptySignals++ })
+
+	const count = 512
+	for i := 0; i < count; i++ {
+		table.Register(Flow{
+			ClientIP:     clientIP,
+			ClientPort:   uint16(20000 + i),
+			OriginalIP:   originalIP,
+			OriginalPort: 443,
+		})
+	}
+	for i := 0; i < count; i++ {
+		table.Delete(clientIP, uint16(20000+i))
+	}
+
+	if got := table.Len(); got != 0 {
+		t.Fatalf("flow table len = %d, want 0", got)
+	}
+	if emptySignals != 1 {
+		t.Fatalf("empty signals = %d, want 1", emptySignals)
+	}
+	if table.peak != 0 || table.deletes != 0 {
+		t.Fatalf("high-water bookkeeping was not reset: peak=%d deletes=%d", table.peak, table.deletes)
+	}
+}
+
 func BenchmarkFlowTableRedirectPacketUntracked(b *testing.B) {
 	table := benchmarkFlowTable(1024)
 	src := netip.MustParseAddr("203.0.113.10")

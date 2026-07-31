@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openai/pitchprox/internal/config"
+	"github.com/agentpitch/prox/internal/config"
 )
 
 func TestSnapshotTrafficBucketSeconds(t *testing.T) {

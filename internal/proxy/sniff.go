@@ -30,10 +30,10 @@ func PeekAndSniff(conn net.Conn, maxBytes int, timeout time.Duration) (*bufio.Re
 	if err != nil {
 		return br, SniffResult{}, err
 	}
-	if host := sniffHTTPHost(peek); host != "" {
+	if host := normalizeSniffedHostname(sniffHTTPHost(peek)); host != "" {
 		return br, SniffResult{Hostname: host, Protocol: "http"}, nil
 	}
-	if host := sniffTLSSNI(peek); host != "" {
+	if host := normalizeSniffedHostname(sniffTLSSNI(peek)); host != "" {
 		return br, SniffResult{Hostname: host, Protocol: "tls"}, nil
 	}
 	return br, SniffResult{}, nil
@@ -159,25 +159,51 @@ func tlsRecordNeed(data []byte) (int, bool) {
 	if len(data) == 0 || data[0] != 0x16 {
 		return 0, false
 	}
-	if len(data) < 5 {
-		return 5, true
+	offset := 0
+	payloadBytes := 0
+	handshakeNeed := -1
+	var handshakeHeader [4]byte
+	headerBytes := 0
+	for records := 0; records < 8; records++ {
+		if len(data) < offset+5 {
+			return offset + 5, true
+		}
+		if data[offset] != 0x16 {
+			return len(data), true
+		}
+		recLen := int(data[offset+3])<<8 | int(data[offset+4])
+		if recLen <= 0 {
+			return offset + 5, true
+		}
+		end := offset + 5 + recLen
+		if len(data) < end {
+			return end, true
+		}
+		payload := data[offset+5 : end]
+		if headerBytes < len(handshakeHeader) {
+			n := copy(handshakeHeader[headerBytes:], payload)
+			headerBytes += n
+			if headerBytes == len(handshakeHeader) {
+				if handshakeHeader[0] != 0x01 {
+					return end, true
+				}
+				handshakeNeed = 4 + int(handshakeHeader[1])<<16 + int(handshakeHeader[2])<<8 + int(handshakeHeader[3])
+			}
+		}
+		payloadBytes += len(payload)
+		if handshakeNeed >= 0 && payloadBytes >= handshakeNeed {
+			return end, true
+		}
+		offset = end
 	}
-	recLen := int(data[3])<<8 | int(data[4])
-	if recLen <= 0 {
-		return len(data), true
-	}
-	return 5 + recLen, true
+	return offset, true
 }
 
 func sniffTLSSNI(data []byte) string {
-	if len(data) < 5 || data[0] != 0x16 {
+	payload, ok := tlsClientHelloPayload(data)
+	if !ok {
 		return ""
 	}
-	recLen := int(data[3])<<8 | int(data[4])
-	if len(data) < 5+recLen || recLen < 42 {
-		return ""
-	}
-	payload := data[5 : 5+recLen]
 	if payload[0] != 0x01 || len(payload) < 4 {
 		return ""
 	}
@@ -235,7 +261,7 @@ func sniffTLSSNI(data []byte) string {
 					return ""
 				}
 				if nameType == 0 {
-					return strings.ToLower(string(p2[:nameLen]))
+					return string(p2[:nameLen])
 				}
 				p2 = p2[nameLen:]
 			}
@@ -244,6 +270,69 @@ func sniffTLSSNI(data []byte) string {
 		exts = exts[l:]
 	}
 	return ""
+}
+
+func tlsClientHelloPayload(data []byte) ([]byte, bool) {
+	if len(data) < 5 || data[0] != 0x16 {
+		return nil, false
+	}
+	var joined []byte
+	offset := 0
+	for records := 0; records < 8; records++ {
+		if len(data) < offset+5 || data[offset] != 0x16 {
+			return nil, false
+		}
+		recLen := int(data[offset+3])<<8 | int(data[offset+4])
+		end := offset + 5 + recLen
+		if recLen <= 0 || len(data) < end {
+			return nil, false
+		}
+		payload := data[offset+5 : end]
+		if joined == nil && len(payload) >= 4 {
+			need := 4 + int(payload[1])<<16 + int(payload[2])<<8 + int(payload[3])
+			if payload[0] == 0x01 && len(payload) >= need {
+				return payload[:need], true
+			}
+		}
+		joined = append(joined, payload...)
+		if len(joined) >= 4 {
+			need := 4 + int(joined[1])<<16 + int(joined[2])<<8 + int(joined[3])
+			if joined[0] != 0x01 {
+				return nil, false
+			}
+			if len(joined) >= need {
+				return joined[:need], true
+			}
+		}
+		offset = end
+	}
+	return nil, false
+}
+
+func normalizeSniffedHostname(host string) string {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return strings.ToLower(host)
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return ""
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-' || c == '_' {
+				continue
+			}
+			return ""
+		}
+	}
+	return strings.ToLower(host)
 }
 
 func isTimeout(err error) bool {

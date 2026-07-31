@@ -5,6 +5,8 @@ package win
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"time"
@@ -35,8 +37,10 @@ type tcp6LocalKey struct {
 }
 
 type exeCacheEntry struct {
-	Path    string
-	Expires time.Time
+	Path         string
+	CreationTime int64
+	ValidatedAt  time.Time
+	Expires      time.Time
 }
 
 type OwnerCache struct {
@@ -51,7 +55,10 @@ type OwnerCache struct {
 	exeByPID    map[uint32]exeCacheEntry
 }
 
-const exeCacheTTL = 5 * time.Minute
+const (
+	exeCacheTTL         = 5 * time.Minute
+	exeValidationMaxAge = 2 * time.Second
+)
 
 func NewOwnerCache(interval time.Duration) *OwnerCache {
 	if interval < 50*time.Millisecond {
@@ -120,12 +127,24 @@ func (c *OwnerCache) Lookup(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, 
 	if pid == 0 {
 		return 0, "", false
 	}
-	if entry.Path != "" && time.Now().UTC().Before(entry.Expires) {
+	now := time.Now().UTC()
+	if entry.Path != "" && now.Before(entry.Expires) && now.Sub(entry.ValidatedAt) < exeValidationMaxAge {
 		return pid, entry.Path, true
 	}
-	path, _ := ExePath(pid)
+	path, creation, changed, err := RefreshProcessInfo(pid, entry.CreationTime)
+	if err != nil {
+		return pid, "", true
+	}
+	if !changed {
+		path = entry.Path
+	}
 	c.mu.Lock()
-	c.exeByPID[pid] = exeCacheEntry{Path: path, Expires: time.Now().UTC().Add(exeCacheTTL)}
+	c.exeByPID[pid] = exeCacheEntry{
+		Path:         path,
+		CreationTime: creation,
+		ValidatedAt:  now,
+		Expires:      now.Add(exeCacheTTL),
+	}
 	c.mu.Unlock()
 	return pid, path, true
 }
@@ -133,12 +152,17 @@ func (c *OwnerCache) Lookup(srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, 
 func (c *OwnerCache) ForceRefresh() error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
-	v4Exact := map[tcp4ExactKey]uint32{}
-	v4Local := map[tcp4LocalKey]uint32{}
-	v6Exact := map[tcp6ExactKey]uint32{}
-	v6Local := map[tcp6LocalKey]uint32{}
-
+	var (
+		v4Exact map[tcp4ExactKey]uint32
+		v4Local map[tcp4LocalKey]uint32
+		v6Exact map[tcp6ExactKey]uint32
+		v6Local map[tcp6LocalKey]uint32
+		v4Err   error
+		v6Err   error
+	)
 	if rows, err := loadTCP4Table(tcpTableOwnerPIDAll); err == nil {
+		v4Exact = map[tcp4ExactKey]uint32{}
+		v4Local = map[tcp4LocalKey]uint32{}
 		for _, row := range rows {
 			lp := decodePort(row.LocalPort)
 			if lp == 0 || row.OwningPID == 0 {
@@ -153,8 +177,12 @@ func (c *OwnerCache) ForceRefresh() error {
 				v4Exact[tcp4ExactKey{LocalAddr: row.LocalAddr, LocalPort: lp, RemoteAddr: row.RemoteAddr, RemotePort: rp}] = row.OwningPID
 			}
 		}
+	} else {
+		v4Err = err
 	}
 	if rows, err := loadTCP6Table(tcpTableOwnerPIDAll); err == nil {
+		v6Exact = map[tcp6ExactKey]uint32{}
+		v6Local = map[tcp6LocalKey]uint32{}
 		for _, row := range rows {
 			lp := decodePort(row.LocalPort)
 			if lp == 0 || row.OwningPID == 0 {
@@ -169,16 +197,34 @@ func (c *OwnerCache) ForceRefresh() error {
 				v6Exact[tcp6ExactKey{LocalAddr: row.LocalAddr, LocalPort: lp, RemoteAddr: row.RemoteAddr, RemotePort: rp}] = row.OwningPID
 			}
 		}
+	} else {
+		v6Err = err
+	}
+	if v4Err != nil && v6Err != nil {
+		return errors.Join(
+			fmt.Errorf("refresh IPv4 TCP owners: %w", v4Err),
+			fmt.Errorf("refresh IPv6 TCP owners: %w", v6Err),
+		)
 	}
 	c.mu.Lock()
-	c.v4Exact = v4Exact
-	c.v4Local = v4Local
-	c.v6Exact = v6Exact
-	c.v6Local = v6Local
+	if v4Err == nil {
+		c.v4Exact = v4Exact
+		c.v4Local = v4Local
+	}
+	if v6Err == nil {
+		c.v6Exact = v6Exact
+		c.v6Local = v6Local
+	}
 	now := time.Now().UTC()
 	c.exeByPID = compactExeCache(c.exeByPID, now)
 	c.lastRefresh = now
 	c.mu.Unlock()
+	if v4Err != nil {
+		return fmt.Errorf("refresh IPv4 TCP owners: %w", v4Err)
+	}
+	if v6Err != nil {
+		return fmt.Errorf("refresh IPv6 TCP owners: %w", v6Err)
+	}
 	return nil
 }
 

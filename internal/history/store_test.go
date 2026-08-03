@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +78,271 @@ func TestStoreSnapshotRoundTrip(t *testing.T) {
 	}
 	if snap.RuleStats[0].Connections != 1 {
 		t.Fatalf("rule connections = %d, want 1", snap.RuleStats[0].Connections)
+	}
+}
+
+func TestRuleActivityTimelineIsBoundedAndUsesStableRuleID(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC()
+	store.AddRuleActivity(now.Add(-40*time.Second), "rule-1", "Old name", config.ActionProxy, 1, 100, 200)
+	store.AddRuleActivity(now.Add(-10*time.Second), "rule-1", "New name", config.ActionDirect, 2, 300, 400)
+	store.AddRuleActivity(now.Add(-10*time.Second), "other", "Other", config.ActionProxy, 9, 900, 900)
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	timeline, err := store.RuleActivityTimeline([]string{"rule-1", "rule-1"}, 5*time.Minute, 40)
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	if timeline.Points != 40 || timeline.BucketSeconds < 1 {
+		t.Fatalf("unexpected timeline bounds: %+v", timeline)
+	}
+	if len(timeline.Series) != 1 {
+		t.Fatalf("series count = %d, want 1", len(timeline.Series))
+	}
+	series := timeline.Series[0]
+	if series.Connections != 3 || series.UpBytes != 400 || series.DownBytes != 600 {
+		t.Fatalf("series totals = %+v", series)
+	}
+	if series.RuleName != "New name" || series.Action != config.ActionDirect {
+		t.Fatalf("series metadata = %+v, want newest name/action", series)
+	}
+	if len(series.Buckets) != 40 {
+		t.Fatalf("bucket count = %d, want 40", len(series.Buckets))
+	}
+	var connections int64
+	for _, bucket := range series.Buckets {
+		connections += bucket.Connections
+	}
+	if connections != 3 {
+		t.Fatalf("bucket connections = %d, want 3", connections)
+	}
+}
+
+func TestRuleActivityTimelinePendingMetadataWinsSameWriteBucket(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ts := time.Now().UTC().Truncate(ruleActivityWriteBucket)
+	store.AddRuleActivity(ts, "rule", "Flushed name", config.ActionProxy, 1, 10, 20)
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	store.AddRuleActivity(ts, "rule", "Pending name", config.ActionDirect, 2, 30, 40)
+
+	timeline, err := store.RuleActivityTimeline([]string{"rule"}, time.Minute, 40)
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	series := timeline.Series[0]
+	if series.Connections != 3 || series.UpBytes != 40 || series.DownBytes != 60 {
+		t.Fatalf("series totals = %+v", series)
+	}
+	if series.RuleName != "Pending name" || series.Action != config.ActionDirect {
+		t.Fatalf("series metadata = %+v, want pending name/action", series)
+	}
+}
+
+func TestRuleActivityAggregateKeepsLatestRealEventTime(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	older := time.Date(2026, 8, 3, 12, 0, 16, 900_000_000, time.UTC)
+	newer := older.Add(11 * time.Second)
+	store.AddRuleActivity(older, "rule", "Older", config.ActionProxy, 1, 0, 0)
+	store.AddRuleActivity(newer, "rule", "Newer", config.ActionDirect, 1, 0, 0)
+	// An out-of-order event may contribute counters but must not move the
+	// representative timestamp or metadata backwards.
+	store.AddRuleActivity(older.Add(time.Second), "rule", "Late old event", config.ActionBlock, 1, 0, 0)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.pendingRule) != 1 {
+		t.Fatalf("pending rule buckets = %d, want 1", len(store.pendingRule))
+	}
+	for _, item := range store.pendingRule {
+		if item.Ts != newer.Truncate(time.Second).Unix() {
+			t.Fatalf("aggregate timestamp = %d, want latest real event %d", item.Ts, newer.Truncate(time.Second).Unix())
+		}
+		if item.Item.RuleName != "Newer" || item.Item.Action != config.ActionDirect || item.Item.Connections != 3 {
+			t.Fatalf("aggregate = %+v, want latest metadata and all counters", item.Item)
+		}
+	}
+}
+
+func TestRuleActivityReverseScanFinishesBoundaryWriteBucket(t *testing.T) {
+	cutoff := time.Date(2026, 8, 3, 12, 0, 10, 0, time.UTC)
+	if ruleActivityBucketBeforeCutoff(time.Date(2026, 8, 3, 12, 0, 1, 0, time.UTC), cutoff) {
+		t.Fatal("scan would stop inside the cutoff's partial write bucket")
+	}
+	if !ruleActivityBucketBeforeCutoff(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC).Add(-time.Second), cutoff) {
+		t.Fatal("scan would continue into a write bucket entirely before cutoff")
+	}
+}
+
+func TestRuleActivityTimelineIncludesPendingAndPreservesOpaqueRuleIDs(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC()
+	longID := strings.Repeat("long-id-", 40)
+	ids := []string{"Foo", "foo", "foo,bar", longID}
+	for i, id := range ids {
+		store.AddRuleActivity(now, id, id, config.ActionDirect, int64(i+1), 0, 0)
+	}
+
+	// Deliberately do not Flush: the endpoint must merge a stable copy of the
+	// bounded pending map rather than force an extra disk write.
+	timeline, err := store.RuleActivityTimeline(ids, time.Minute, 40)
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	if len(timeline.Series) != len(ids) {
+		t.Fatalf("series count = %d, want %d", len(timeline.Series), len(ids))
+	}
+	for i, series := range timeline.Series {
+		if series.RuleID != ids[i] || series.Connections != int64(i+1) {
+			t.Fatalf("series %d = %+v, want id=%q connections=%d", i, series, ids[i], i+1)
+		}
+	}
+	if timeline.WindowMinutes != 1 || timeline.BucketSeconds != 1.5 {
+		t.Fatalf("timeline window = %d minutes, bucket=%v seconds", timeline.WindowMinutes, timeline.BucketSeconds)
+	}
+}
+
+func TestRuleActivityTimelineDoesNotExpandRequestedWindow(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC()
+	store.AddRuleActivity(now.Add(-70*time.Second), "rule", "Old", config.ActionDirect, 100, 0, 0)
+	store.AddRuleActivity(now.Add(-5*time.Second), "rule", "Recent", config.ActionDirect, 1, 0, 0)
+	timeline, err := store.RuleActivityTimeline([]string{"rule"}, time.Minute, 40)
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	if got := timeline.Series[0].Connections; got != 1 {
+		t.Fatalf("connections in exact one-minute window = %d, want 1", got)
+	}
+}
+
+func TestRuleStatsAggregateRenameAndActionByExactStableID(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC()
+	store.AddRuleActivity(now.Add(-30*time.Second), "Stable", "Old name", config.ActionProxy, 1, 10, 20)
+	store.AddRuleActivity(now, "Stable", "New name", config.ActionDirect, 2, 30, 40)
+	store.AddRuleActivity(now, "stable", "Different exact ID", config.ActionBlock, 4, 50, 60)
+	snapshot, err := store.Snapshot(10 * time.Minute)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot.RuleStats) != 2 {
+		t.Fatalf("rule stats count = %d, want 2: %+v", len(snapshot.RuleStats), snapshot.RuleStats)
+	}
+	var stable RuleActivity
+	for _, item := range snapshot.RuleStats {
+		if item.RuleID == "Stable" {
+			stable = item
+		}
+	}
+	if stable.Connections != 3 || stable.UpBytes != 40 || stable.DownBytes != 60 {
+		t.Fatalf("stable aggregate = %+v", stable)
+	}
+	if stable.RuleName != "New name" || stable.Action != config.ActionDirect {
+		t.Fatalf("stable latest metadata = %+v", stable)
+	}
+}
+
+func TestRuleActivityTimelineAllowsConcurrentAppendAndFlush(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < 100; i++ {
+			store.AddRuleActivity(time.Now().UTC(), "rule", "Rule", config.ActionDirect, 1, 0, 0)
+			if i%10 == 0 {
+				if err := store.Flush(); err != nil {
+					done <- err
+					return
+				}
+			}
+		}
+		done <- store.Flush()
+	}()
+	for i := 0; i < 25; i++ {
+		if _, err := store.RuleActivityTimeline([]string{"rule"}, time.Minute, 40); err != nil {
+			t.Fatalf("timeline during append: %v", err)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	timeline, err := store.RuleActivityTimeline([]string{"rule"}, time.Minute, 40)
+	if err != nil {
+		t.Fatalf("final timeline: %v", err)
+	}
+	if got := timeline.Series[0].Connections; got != 100 {
+		t.Fatalf("final connections = %d, want 100", got)
+	}
+}
+
+func BenchmarkRuleActivityTimelineLargeSegment(b *testing.B) {
+	store, err := Open(filepath.Join(b.TempDir(), "pitchProx.history"), time.Hour)
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+
+	base := time.Now().UTC().Add(-15 * time.Minute)
+	ids := make([]string, 50)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("rule-%d", i)
+	}
+	for bucket := 0; bucket < 60; bucket++ {
+		for rule := 0; rule < 74; rule++ {
+			store.AddRuleActivity(base.Add(time.Duration(bucket)*15*time.Second), fmt.Sprintf("rule-%d", rule), "Rule", config.ActionProxy, 1, 128, 256)
+		}
+		if bucket == 29 {
+			if err := store.Flush(); err != nil {
+				b.Fatalf("flush first half: %v", err)
+			}
+		}
+	}
+	if err := store.Flush(); err != nil {
+		b.Fatalf("flush: %v", err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.RuleActivityTimeline(ids, 15*time.Minute, 40); err != nil {
+			b.Fatalf("timeline: %v", err)
+		}
 	}
 }
 

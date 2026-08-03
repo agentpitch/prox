@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var ErrConfigConflict = errors.New("configuration changed since it was loaded")
+
 type Store struct {
 	path string
 	mu   sync.RWMutex
@@ -70,7 +72,11 @@ func (s *Store) Save(cfg Config) (Config, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cfg.UpdatedAt = time.Now().UTC()
+	updatedAt := time.Now().UTC()
+	if !updatedAt.After(s.cfg.UpdatedAt) {
+		updatedAt = s.cfg.UpdatedAt.Add(time.Nanosecond)
+	}
+	cfg.UpdatedAt = updatedAt
 	if err := s.saveConfigLocked(cfg); err != nil {
 		return Config{}, err
 	}

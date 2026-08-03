@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 )
 
 type fakeRuntime struct {
+	mu  sync.RWMutex
 	cfg config.Config
 	mon *monitor.Bus
 }
@@ -28,6 +32,7 @@ func newFakeRuntime(t *testing.T, addr string) *fakeRuntime {
 	t.Cleanup(func() { _ = mon.Close() })
 	return &fakeRuntime{
 		cfg: config.Config{
+			UpdatedAt:   time.Now().UTC(),
 			HTTP:        config.HTTPConfig{Listen: addr},
 			Transparent: config.TransparentConfig{ListenerPort: 26001, SniffBytes: 4096, SniffTimeout: 1500},
 			Rules: []config.Rule{{
@@ -44,9 +49,27 @@ func newFakeRuntime(t *testing.T, addr string) *fakeRuntime {
 	}
 }
 
-func (r *fakeRuntime) CurrentConfig() config.Config { return config.Clone(r.cfg) }
+func (r *fakeRuntime) CurrentConfig() config.Config {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return config.Clone(r.cfg)
+}
 
 func (r *fakeRuntime) UpdateConfig(cfg config.Config) error {
+	return r.UpdateConfigIfCurrent(cfg, time.Time{})
+}
+
+func (r *fakeRuntime) UpdateConfigIfCurrent(cfg config.Config, expectedUpdatedAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !expectedUpdatedAt.IsZero() && !expectedUpdatedAt.Equal(r.cfg.UpdatedAt) {
+		return config.ErrConfigConflict
+	}
+	updatedAt := time.Now().UTC()
+	if !updatedAt.After(r.cfg.UpdatedAt) {
+		updatedAt = r.cfg.UpdatedAt.Add(time.Nanosecond)
+	}
+	cfg.UpdatedAt = updatedAt
 	r.cfg = config.Clone(cfg)
 	return nil
 }
@@ -99,6 +122,204 @@ func TestServerConnectionChurnReleasesTrackedConnections(t *testing.T) {
 		}
 	}
 	waitNoTrackedConnections(t, srv)
+}
+
+func TestConfigPUTUsesUpdatedAtAsOptimisticToken(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	runtime := newFakeRuntime(t, addr)
+	srv, err := New(addr, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	put := func(candidate config.Config) (int, string, config.Config) {
+		t.Helper()
+		body, err := json.Marshal(candidate)
+		if err != nil {
+			t.Fatalf("marshal config: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPut, "http://"+addr+"/api/config", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("new PUT config request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("PUT config: %v", err)
+		}
+		defer resp.Body.Close()
+		var saved config.Config
+		if resp.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(resp.Body).Decode(&saved); err != nil {
+				t.Fatalf("decode saved config: %v", err)
+			}
+		}
+		return resp.StatusCode, resp.Status, saved
+	}
+
+	initial := runtime.CurrentConfig()
+	first := config.Clone(initial)
+	first.RetentionMinutes = 8
+	status, _, saved := put(first)
+	if status != http.StatusOK {
+		t.Fatalf("matching PUT status = %d, want 200", status)
+	}
+	if saved.RetentionMinutes != 8 || !saved.UpdatedAt.After(initial.UpdatedAt) {
+		t.Fatalf("matching PUT response = %+v", saved)
+	}
+
+	stale := config.Clone(initial)
+	stale.RetentionMinutes = 9
+	status, statusText, _ := put(stale)
+	if status != http.StatusConflict || statusText != "409 Conflict" {
+		t.Fatalf("stale PUT status = %q, want 409 Conflict", statusText)
+	}
+	if got := runtime.CurrentConfig(); got.RetentionMinutes != 8 || !got.UpdatedAt.Equal(saved.UpdatedAt) {
+		t.Fatalf("stale PUT changed config: saved=%+v current=%+v", saved, got)
+	}
+
+	legacy := config.Clone(stale)
+	legacy.UpdatedAt = time.Time{}
+	legacy.RetentionMinutes = 10
+	status, _, legacySaved := put(legacy)
+	if status != http.StatusOK {
+		t.Fatalf("legacy zero-timestamp PUT status = %d, want 200", status)
+	}
+	if legacySaved.RetentionMinutes != 10 || !legacySaved.UpdatedAt.After(saved.UpdatedAt) {
+		t.Fatalf("legacy PUT response = %+v", legacySaved)
+	}
+}
+
+func TestShouldMarkUIActiveOnlyForLiveEndpoints(t *testing.T) {
+	tests := map[string]bool{
+		"/api/snapshot":       true,
+		"/api/events":         true,
+		"/api/config":         false,
+		"/api/proxy-test":     false,
+		"/api/dropped":        false,
+		"/api/rules/activity": false,
+		"/api/health":         false,
+		"/":                   false,
+	}
+	for path, want := range tests {
+		if got := shouldMarkUIActive(path); got != want {
+			t.Errorf("shouldMarkUIActive(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestDisableWebUICannotLeaveLateEventSubscriber(t *testing.T) {
+	runtime := newFakeRuntime(t, freeHTTPAddr(t))
+	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := 0; i < 200; i++ {
+		srv.SetWebUIEnabled(true)
+		start := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			close(start)
+			_, _, _ = srv.subscribeEventsIfEnabled()
+			close(done)
+		}()
+		<-start
+		srv.SetWebUIEnabled(false)
+		<-done
+		if subscribers := runtime.mon.DiagnosticStats().Subscribers; subscribers != 0 {
+			t.Fatalf("iteration %d left %d event subscribers after disable", i, subscribers)
+		}
+	}
+}
+
+func TestRuleActivityEndpointReturnsOnlyRequestedBoundedSeries(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	runtime := newFakeRuntime(t, addr)
+	runtime.mon.AddRuleConnection("default", "Default", config.ActionDirect)
+	runtime.mon.AddRuleTraffic("default", "Default", config.ActionProxy, 120, 340)
+
+	srv, err := New(addr, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/api/rules/activity?id=default&points=40&window_minutes=5")
+	if err != nil {
+		t.Fatalf("GET activity: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET activity status = %d, want 200", resp.StatusCode)
+	}
+	var timeline monitor.RuleActivityTimeline
+	if err := json.NewDecoder(resp.Body).Decode(&timeline); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if timeline.Points != 40 || len(timeline.Series) != 1 || len(timeline.Series[0].Buckets) != 40 {
+		t.Fatalf("unexpected timeline: %+v", timeline)
+	}
+	if timeline.Series[0].RuleID != "default" || timeline.Series[0].Connections != 1 {
+		t.Fatalf("unexpected series: %+v", timeline.Series[0])
+	}
+
+	longID := strings.Repeat("opaque-", 45)
+	opaqueIDs := []string{"Foo", "foo", "foo,bar", longID}
+	for _, id := range opaqueIDs {
+		runtime.mon.AddRuleConnection(id, id, config.ActionDirect)
+	}
+	query := url.Values{"points": {"40"}, "window_minutes": {"5"}}
+	for _, id := range opaqueIDs {
+		query.Add("id", id)
+	}
+	resp, err = client.Get("http://" + addr + "/api/rules/activity?" + query.Encode())
+	if err != nil {
+		t.Fatalf("GET opaque activity: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET opaque activity status = %d, want 200", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&timeline); err != nil {
+		t.Fatalf("decode opaque timeline: %v", err)
+	}
+	if len(timeline.Series) != len(opaqueIDs) {
+		t.Fatalf("opaque series count = %d, want %d", len(timeline.Series), len(opaqueIDs))
+	}
+	for i, series := range timeline.Series {
+		if series.RuleID != opaqueIDs[i] || series.Connections != 1 {
+			t.Fatalf("opaque series %d = %+v, want id %q", i, series, opaqueIDs[i])
+		}
+	}
+
+	resp, err = client.Get("http://" + addr + "/api/rules/activity?id=default&points=61")
+	if err != nil {
+		t.Fatalf("GET invalid activity: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("GET invalid activity status = %d, want 400", resp.StatusCode)
+	}
 }
 
 func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {

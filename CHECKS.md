@@ -22,7 +22,51 @@ This archive contains the current optimized baseline with segment-backed history
 - IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
 - runtime config activation rolls back if a required listener/interception restart fails.
 
-## Checks run in this workspace
+## v0.43 release-candidate gate
+
+A publishable v0.43 candidate is prepared only from a committed clean working
+tree with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.1
+```
+
+The script fails immediately on an uncommitted tree unless `-AllowDirty` is
+explicitly supplied for a disposable test build. `-SkipChecks` is rejected
+unless `-AllowDirty` is also present. A publishable candidate always requires
+and executes:
+
+```text
+Node.js v22.17.0
+node --check internal/webui/dist/rules-ui.js
+node --check internal/webui/dist/app.js
+node --test internal/webui/rules_ui_test.js
+go1.26.5 windows/amd64, GOAMD64=v1, CGO_ENABLED=0
+GOWORK=off, GOENV=off, default GOEXPERIMENT/GOFIPS140, exact repository go.mod
+go mod download + verify with GOFLAGS=-mod=readonly
+go test -mod=readonly -count=1 ./...
+go vet -mod=readonly ./...
+git diff --check and git show --check HEAD
+physical working-tree EOLs match .gitattributes
+go build -mod=readonly -trimpath -buildvcs=true with the Windows GUI subsystem
+```
+
+Release packaging additionally:
+
+- locally reuses and verifies the exact root WinDivert 2.2.2 x64 DLL/driver plus the tracked upstream LICENSE, without temporary archive extraction;
+- in CI, explicitly downloads and verifies the official archive before verifying its x64 DLL, driver, and LICENSE;
+- includes WinDivert, Go, and `golang.org/x/sys` licenses plus `THIRD_PARTY_NOTICES.md`;
+- statically verifies the exact injected version in the binary, and requires `go version -m` to report the intended target, commit, and `vcs.modified=false` for a clean candidate;
+- writes `pitchProx-build-manifest.json` with source, toolchain, target, dependency, license, and executable hashes;
+- emits a ZIP with ordinally sorted entries and the source-commit timestamp, followed by an LF-encoded SHA-256 file verified again by the release job;
+- refuses candidate cleanup when the output path or any existing child is a junction/symlink, and rejects mismatched tracked-text EOLs so embedded WebUI bytes stay stable.
+
+The manifest and `pitchProx-windows-amd64.sha256` next to each candidate are the
+authoritative record for that particular artifact. The release pipeline does
+not start the executable, load WinDivert, stop the already running application,
+or overwrite `build\pitchProx.exe`.
+
+## Earlier checks run in this workspace
 
 These checks were executed successfully:
 

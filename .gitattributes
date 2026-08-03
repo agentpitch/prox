@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.ico binary
+*.png binary
+*.syso binary
+*.dll binary
+*.exe binary
+*.sys binary
+*.zip binary
+
+# Preserve the verified upstream license byte-for-byte, including its EOF.
+licenses/WinDivert-LICENSE.txt binary

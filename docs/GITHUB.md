@@ -1,53 +1,97 @@
-# GitHub setup
+# GitHub CI and releases
 
-This repository includes a single GitHub Actions workflow for Windows CI and tag-based releases.
+The repository uses `.github/workflows/ci.yml` for Windows validation,
+packaging, and tag-based GitHub Releases.
 
-## Files
+## Single release path
 
-- `.github/workflows/ci.yml` - build, package, and release on GitHub Actions
-- `build.cmd` - local Windows build helper
+Both local candidates and GitHub Actions execute
+`tools/package-release.ps1`. The local default reuses the verified
+`WinDivert.dll` and `WinDivert64.sys` already in the repository root; CI passes
+the explicit `-DownloadWinDivertArchive` switch because ignored runtime
+binaries are not present in a fresh checkout. The workflow does not maintain a
+second copy of the build/package commands or hashes.
 
-## What the workflow does
+The release path fixes:
 
-1. checks out the repository;
-2. sets up Go from `go.mod`;
-3. downloads Go modules;
-4. runs `go test ./...`;
-5. builds `build/pitchProx.exe` with the Windows GUI subsystem;
-6. downloads `WinDivert.dll` and `WinDivert64.sys` from the official WinDivert 2.2.2 release;
-7. packages `pitchProx.exe`, the WinDivert runtime files, `README.md`, `CHECKS.md`, and `docs/` into `pitchProx-windows-amd64.zip`;
-8. generates `pitchProx-windows-amd64.sha256`;
-9. uploads the packaged release files as a workflow artifact.
+- Go `1.26.5`;
+- Node.js `22.17.0` for WebUI checks;
+- `windows/amd64`, `GOAMD64=v1`, and `CGO_ENABLED=0`;
+- read-only Go module mode, `GOWORK=off`, `GOENV=off`, default experiment/FIPS modes, and `-trimpath`;
+- the official WinDivert 2.2.2 archive, DLL, driver, and license SHA-256 values.
 
-When the ref is a tag starting with `v`, the workflow also:
+Every native command is checked before the next command runs. A clean candidate
+must run the full gate and retain a clean Git tree. It verifies module-cache
+content, the exact repository `go.mod`, and both working-tree and committed
+whitespace. The script statically checks
+the exact injected version; executable metadata must report the intended commit
+with `vcs.modified=false`.
 
-13. creates a versioned GitHub Release automatically;
-14. attaches the executable, zip archive, and checksum file to that release;
-15. lets GitHub generate release notes from merged changes.
+## Workflow output
+
+The Windows job runs WebUI syntax/unit checks, Go tests, `go vet`, builds the GUI
+subsystem executable, verifies WinDivert, and creates:
+
+- `pitchProx.exe` — standalone update executable;
+- `pitchProx-windows-amd64.zip` — complete package with WinDivert and licenses;
+- `pitchProx-windows-amd64.sha256` — hashes for the executable, ZIP, and manifest;
+- `pitchProx-build-manifest.json` — commit/toolchain/target/input metadata;
+- `RELEASE_NOTES.md` — release body source.
+
+The ZIP uses ordinally sorted entries and the source commit timestamp. This removes common
+ordering/time variance, while the project defines reproducibility primarily as
+pinned source, toolchain, target, modules, and third-party inputs rather than a
+formal cross-Windows byte-for-byte guarantee.
+
+`.gitattributes` fixes tracked source/document text to LF (with CRLF only for
+batch wrappers), so `go:embed` inputs do not vary with `core.autocrlf`. Candidate
+cleanup rejects reparse points in the output parent chain and candidate tree.
+Third-party actions in the workflow are pinned to full commit SHAs.
 
 ## Triggers
 
-- `push` on any branch
-- `pull_request`
-- `workflow_dispatch`
-- `push` of a tag matching `v*`
+- a push to any branch;
+- a pull request;
+- manual `workflow_dispatch`;
+- a tag matching `v*`.
 
-## Release usage
+Branch builds use `dev-<short-commit>` as their embedded version. Tag builds use
+the exact tag. The packaging script rejects malformed version tags even though
+the workflow trigger itself uses the broader `v*` pattern. For a tag such as
+`v0.43` or `v0.43-rc.1`, the script requires
+`docs/RELEASE_NOTES_v0.43.md`; future major/minor tags therefore cannot
+silently publish v0.43 notes. Development artifacts receive a neutral generated
+note instead.
 
-Push to `main` and GitHub will run the Windows build and upload the packaged artifacts to that workflow run.
+## Publishing
 
-Create and push an annotated tag such as:
+After reviewing a clean candidate and merging the approved commit to `main`,
+create and push only the intended annotated tag:
 
 ```powershell
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.43 -m "v0.43"
+git push origin v0.43
 ```
 
-That tag starts the same workflow and publishes the versioned release automatically.
+Do not use `git push --tags` as a release command: unrelated local tags would
+also trigger releases. A tag immediately starts the publication workflow, so it
+must not be created or pushed before approval.
 
-## Notes
+The release job downloads the Windows artifact, verifies its SHA-256 file on
+Linux, then publishes the executable, ZIP, checksum, and manifest. The curated
+v0.43 notes are prepended to GitHub-generated change notes. Tags containing a
+hyphen, such as `v0.43-rc.1`, are marked as prereleases.
 
-- The build job runs on `windows-latest` because pitchProx is Windows-only.
-- The release job uses the built-in `GITHUB_TOKEN`; no extra secret is required for standard releases in the same repository.
-- WinDivert is pinned to the official `v2.2.2` release: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
-- Runtime integration with WinDivert is **not** exercised in GitHub-hosted CI. The workflow is a build-and-basic-test pipeline, not a full driver/runtime integration test.
+## Runtime scope
+
+GitHub-hosted CI does not execute the built application or load the WinDivert
+driver. Elevated networking, tray, and Windows Service behavior require a
+separate controlled test window or VM.
+
+Release executables are currently unsigned. SmartScreen may warn about
+`pitchProx.exe`; the WinDivert runtime inside the ZIP is the official upstream
+2.2.2 build verified by hash and accompanied by its license.
+
+The repository currently has no first-party `LICENSE`. Dependency license files
+do not grant rights to pitchProx itself; the owner must choose a project license
+before publication if open-source redistribution is intended.

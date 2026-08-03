@@ -1,215 +1,223 @@
-# UI reference
+# WebUI reference
 
-This document describes the intended WebUI and tray behavior.
+This document describes the intended WebUI behavior from v0.43 onward.
 
-## 1. Global layout
+## 1. Application shell
 
-The page is split into two columns:
+The WebUI uses a persistent application shell:
 
-- **left column**: configuration cards
-- **right column**: observability cards
+- fixed left sidebar;
+- sticky page header;
+- one mounted page per primary domain;
+- hash routes (`#/rules`, `#/monitor`, `#/proxies`, `#/chains`, `#/dropped`, `#/logs`);
+- settings remain a modal because they affect the whole runtime.
 
-The right column is visually larger because runtime investigation requires more horizontal space.
+The available navigation entries reflect real pitchProx domains. The UI does not present Applications, Hosts, Ports, DNS profiles, users, notifications, or reports as independent entities while the backend has no corresponding model.
 
-The top bar is compact and scrolls with the page. It is not sticky.
+The sidebar can collapse on desktop and becomes an overlay on narrow screens. The system card reports the real service state and build version returned by `/api/health`.
 
-## 2. Left column order
+## 2. Rules page
 
-1. **Rules**
-2. **Proxies**
-3. **Chains**
+Rules are shown in routing order in a dense table. The saved order is semantic: the first matching enabled rule wins.
 
-A separate settings dialog is opened from the gear button near the `pitchProx` title.
+Columns:
 
-## 3. Settings dialog
+- page selection;
+- enabled toggle;
+- global routing order;
+- name and comment;
+- Applications;
+- Target hosts;
+- Ports;
+- route/action;
+- bounded recent activity;
+- row actions.
 
-The settings dialog contains:
+Applications, Target hosts, and Ports remain raw strings in the configuration. Chips and abbreviated cell values are derived previews only. The WebUI must never convert those fields to arrays as the source of truth.
 
-- Web UI listen address
-- transparent listener port
-- IPv4 listener
-- IPv6 listener
-- sniff bytes
-- sniff timeout
-- retention window in minutes
+The full multi-value syntax remains supported:
 
-The retention window controls:
+- semicolon, comma, CR/LF separators;
+- quoted values containing separators;
+- multiple applications, hosts, ports, and ranges inside one rule;
+- wildcards, PID, full application paths, CIDR, IP ranges, and port ranges.
 
-- active connection history window
-- proxy activity chart window
-- rule stats aggregation window
+Cells show the first values plus `+N`; their tooltip contains the full parsed list. Saving an otherwise unchanged rule preserves the raw text, apart from backend outer trimming.
 
-Settings are autosaved through `PUT /api/config`.
+### Search and filters
 
-## 4. Rules card
+Rule search is local and case-insensitive. Whitespace-separated terms use AND semantics; quoted search phrases are supported.
 
-### Rule list item
+The search index contains:
 
-A rule list item shows:
+- name and stable ID;
+- comment (`notes`);
+- every application, host, and port value;
+- action;
+- proxy/chain ID and display name.
 
-- compact enable checkbox
-- compact move-up / move-down buttons under the checkbox
-- rule name
-- action badge
-- disabled badge when disabled
-- summary chips derived from applications / hosts / ports / proxy / chain
-- rule metrics for the retention window:
-  - connection count
-  - incoming bytes
-  - outgoing bytes
+The index is rebuilt from the current config and never appended indefinitely.
 
-Clicking the rule body opens the edit dialog.
+Filters cover enabled, disabled, Proxy, Chain, Direct, and Block rules. Changing search, filter, or page size returns to page 1.
 
-Clicking any rule metric focuses observability on that rule.
+### Pagination and selection
 
-### Rule edit dialog
+Page sizes are 25 and 50. Only the current page is mounted in the DOM.
 
-Contains:
+Every derived row retains:
 
-- name
-- id
-- action
-- proxy selector
-- chain selector
-- enabled checkbox
-- notes
-- applications textarea
-- target hosts textarea
-- target ports input
-- duplicate button
-- delete button
+- stable rule ID;
+- original global index.
 
-Action-dependent behavior:
+All mutations resolve the ID again against the latest in-memory config. Page indexes and filtered row indexes are never used as mutation identities.
 
-- `Direct` and `Block`: proxy and chain fields are disabled and cleared on save.
-- `Proxy`: proxy field enabled, chain disabled.
-- `Chain`: chain field enabled, proxy disabled.
+Selection is stored in a bounded `Set` of rule IDs. The header checkbox selects the current page. After a complete page is selected, the selection banner can explicitly extend selection to every filtered result.
 
-## 5. Proxies card
+### Reordering
 
-Each proxy row shows:
+Move buttons display and modify the global routing order. Reordering is disabled while search or a non-default filter is active, because hidden rules would make the resulting priority ambiguous.
 
-- name
-- status chips
-- compact inline test target input
-- `Проверить` button
-- `Изменить` button
-- `Удалить` button
+### Bulk operations
 
-The test status line:
+Bulk enable, disable, and delete produce one cloned config and one `PUT /api/config`, regardless of the number of selected rules. This bounds validation, disk writes, rule compilation, and any required runtime transition to one operation.
 
-- is empty before any test;
-- shows centered `Проверка…` while running;
-- shows the result after completion.
+Only one config save may be in flight from a WebUI tab. Controls are disabled during the save and the previous state remains visible if the backend rejects the candidate.
 
-No overlapping controls are allowed.
+## 3. Rule editor
 
-## 6. Chains card
+The editor contains:
 
-Each chain row shows:
+- name;
+- enabled state;
+- multiline comment/purpose saved in the existing `notes` field;
+- Applications textarea;
+- Target hosts textarea;
+- Target ports textarea;
+- action and proxy/chain selectors;
+- stable ID under an advanced disclosure;
+- duplicate and delete actions for existing rules.
 
-- name
-- enabled state
-- proxy ID sequence summary
-- edit/delete actions
+The three matching fields remain textareas so users can keep one rule with multiple apps, hosts, ports, and ranges.
 
-The edit dialog must explain that proxy IDs are separated by `;`, comma or newline and that order matters.
+Client-side analysis reports:
 
-## 7. Proxy activity card
+- unclosed quotes;
+- redundant `Any`/`*` mixed with narrower values;
+- duplicate rule ID;
+- up to three possible criteria overlaps.
 
-Shows proxied traffic only.
+Similarity is advisory. It compares normalized values and does not claim full glob/CIDR/range subsumption.
 
-### Chart semantics
+Closing a dirty editor requires confirmation. Save is single-flight. An existing rule is located by its original stable ID at save time rather than by a stale array index.
 
-- X axis: time inside the retention window
-- Y axis: bytes per second
-- two series:
-  - incoming proxied bytes
-  - outgoing proxied bytes
+## 4. Rules import and export
 
-Summary numbers are shown in one compact line.
+Import and export are client-side rules-only operations. They never export proxy profiles, usernames, or passwords.
 
-## 8. Active connections card
+Format:
 
-This area is optimized for rule investigation, not raw system traffic.
+```json
+{
+  "format": "pitchprox.rules",
+  "version": 1,
+  "exported_at": "2026-08-03T12:00:00Z",
+  "rules": []
+}
+```
 
-### Default view
+Import accepts the versioned envelope, a full config containing `rules`, or a bare rules array. The preview reports invalid records, ID conflicts, exact criteria matches, and unresolved proxy/chain references.
 
-The `Все` tab shows only connections that matched an explicit rule other than `Default`.
+ID conflict strategies:
 
-### Tabs
+- skip;
+- replace in place;
+- copy with a unique imported ID.
 
-- `Все`
-- `Proxy / Chain`
-- `Direct`
-- `Block`
-- `Ещё`
-- `Новые`
+New rules keep their relative order and are inserted before an existing rule with ID `default`. Rules referencing a missing or disabled route can be imported disabled. The final result is applied with one config PUT.
 
-`Ещё` means connections without an explicit non-default rule match.
+## 5. Rule activity
 
-`Новые` shows application/address/port signatures that first appeared during the last minute. The backend compares that last minute against the currently selected retained history window, for example 7 minutes. If the selected window is not longer than one minute, the tab remains empty because there is no earlier baseline to compare with.
+`GET /api/rules/activity` supplies real bounded time series for the visible page only.
 
-### Additional filters
+Frontend limits:
 
-- free-text search input above the table filters rows by PID, process name/path, host, port, rule, action, state, proxy ID, and chain ID
-- click on `Rule` cell to focus by rule
-- click on `Action` cell to focus by action/process investigation
+- at most the visible 50 rule IDs;
+- 40 requested points;
+- at most a 15-minute window, further limited by configured retention;
+- one request at a time;
+- sequential polling every 60 seconds;
+- no polling while the page or browser tab is hidden;
+- request cancellation when leaving Rules.
 
-Rule focus and action tab filter are mutually exclusive. Selecting one clears the other. Search stays active as an additional local narrowing filter for the table.
+Backend limits:
 
-### Table behavior
+- at most 50 unique IDs;
+- 2–60 points;
+- 1–60 minutes;
+- memory `O(ids × points)`;
+- no persistent cache, goroutine, or timer;
+- streaming scan of the existing bounded hourly JSONL rule segments.
 
-- rows are grouped by PID/process/host/port/rule/action;
-- duplicate rows collapse into one row with a repetition counter;
-- updates arrive by snapshot polling, not every single packet;
-- history remains visible for the retention window.
+Direct traffic bytes are not always observable. The table therefore treats byte totals as recorded relay traffic and presents connection rate separately.
 
-### Copy behavior
+## 6. Other pages
 
-The following fields should be copyable:
+### Monitoring
 
-- PID
-- process path
-- host
-- port
+Shows the proxied traffic chart and active-connections investigation table. It uses the existing snapshot and focus behavior.
 
-Hover over process shows the full executable path as tooltip.
+### Proxies and Chains
 
-## 9. Log card
+Keep the existing editors and proxy test behavior inside dedicated pages.
 
-The log is intended for investigation, not for raw packet spam.
+### Dropped
 
-Behavior:
+Uses a dedicated page with server-side search, paging, bounded file-size metadata, and selective deletion.
 
-- live updates come from SSE `/api/events`;
-- newest lines appear first;
-- the log stores up to 100 latest entries per process plus a generic global tail;
-- clicking process/rule/action related filters changes the visible log subset;
-- the log can be reset back to unfiltered state.
+### Journal
 
-## 10. Tray icon
+Shows the existing live log. Journal uses one SSE connection plus a bounded
+history backfill when that connection opens or reconnects; it does not run the
+Monitoring snapshot timer. Monitoring uses sequential snapshots without log
+payloads and does not open SSE.
 
-### Desktop mode only
+## 7. Resource lifecycle
 
-The tray exists only in desktop mode.
+The routed UI must remain quiet when configuration pages are open:
 
-### Visual behavior
+- one EventSource and one sequential snapshot timer at most;
+- live monitoring only on Monitoring or Journal;
+- one sequential rule-activity timer only on Rules;
+- page-specific timers and requests are cancelled on route changes and tab hiding;
+- the shared shell remains mounted, while hidden pages release timers, requests, retained data, and heavy DOM content;
+- rules use one delegated table listener rather than handlers per row;
+- rule selection and activity maps are replaced/pruned, not appended indefinitely;
+- export Blob URLs are revoked;
+- import file inputs are cleared immediately after reading;
+- no application-icon cache is introduced.
 
-The tray icon is a miniature filled graph:
+## 8. Responsive behavior
 
-- one color for incoming proxied traffic;
-- another color for outgoing proxied traffic;
-- if one series is higher, that series is rendered in the background.
+- Desktop: full sidebar and all selected table columns.
+- Medium width: horizontal table scrolling and optional hidden columns.
+- Mobile: sidebar overlay and each rule row becomes a compact grid card while preserving every action.
 
-### Interaction
+Users can hide Applications, Hosts, Ports, or Activity columns. Column choices, density, page size, and sidebar state are stored locally; rule search and filters are session-scoped.
 
-- double click: open WebUI in the default browser
-- right click: context menu
-  - `Управление`
-  - `Disable WebUI` / `Отключить WebUI` when WebUI is currently running
-  - `Выйти`
+## 9. Keyboard and accessibility
 
-`Disable WebUI` / `Отключить WebUI` disables static WebUI pages, configuration API, snapshots, and SSE streams while keeping the lightweight health/tray/control endpoints available. This lets both desktop tray and standalone `tray --url` mode re-enable WebUI on double click.
+- `/` opens Rules and focuses search when the user is not typing.
+- `Ctrl+N` / `Cmd+N` opens a new rule.
+- `Escape` clears rule search.
+- Rule names can open the editor with Enter or Space.
+- Selection and enabled state use native checkboxes.
+- Dialogs require an explicit accessible title and preserve native Escape behavior with dirty-state confirmation.
 
-`Выйти` stops the whole desktop runtime, not only the tray icon.
+## 10. Tray behavior
+
+Tray behavior is unchanged:
+
+- double click opens WebUI;
+- the context menu controls WebUI and process shutdown;
+- the tray reads the lightweight traffic view;
+- disabling WebUI keeps health/tray/control endpoints available.

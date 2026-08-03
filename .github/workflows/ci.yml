@@ -10,11 +10,6 @@ on:
 permissions:
   contents: read
 
-env:
-  WINDIVERT_VERSION: 2.2.2
-  WINDIVERT_RELEASE_URL: https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
-  WINDIVERT_RELEASE_PAGE: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,96 +19,53 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - name: Setup pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: go.mod
+          go-version: "1.26.5"
+          architecture: x64
           cache: true
           cache-dependency-path: |
             go.mod
             go.sum
 
-      - name: Show Go version
-        shell: pwsh
-        run: go version
+      - name: Setup pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.17.0"
 
-      - name: Download Go modules
-        shell: pwsh
-        run: go mod download
-
-      - name: Test
-        shell: pwsh
-        run: go test -mod=mod ./...
-
-      - name: Download WinDivert runtime
+      - name: Resolve artifact version
+        id: release-version
         shell: pwsh
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $archivePath = Join-Path $env:RUNNER_TEMP "WinDivert-$env:WINDIVERT_VERSION-A.zip"
-          $extractPath = Join-Path $env:RUNNER_TEMP "WinDivert-$env:WINDIVERT_VERSION-A"
-
-          Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
-          Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-
-          Invoke-WebRequest -Uri $env:WINDIVERT_RELEASE_URL -OutFile $archivePath
-          Expand-Archive -Path $archivePath -DestinationPath $extractPath -Force
-
-          $dll = Get-ChildItem $extractPath -Recurse -Filter WinDivert.dll |
-            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
-            Select-Object -First 1
-          $sys = Get-ChildItem $extractPath -Recurse -Filter WinDivert64.sys |
-            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
-            Select-Object -First 1
-
-          if ($null -eq $dll -or $null -eq $sys) {
-            throw "Failed to locate x64 WinDivert runtime files in $env:WINDIVERT_RELEASE_URL"
+          $version = if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $env:GITHUB_REF_NAME
+          } else {
+            "dev-$($env:GITHUB_SHA.Substring(0, 7))"
           }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          Copy-Item $dll.FullName (Join-Path $env:RUNNER_TEMP "WinDivert.dll")
-          Copy-Item $sys.FullName (Join-Path $env:RUNNER_TEMP "WinDivert64.sys")
-
-      - name: Build and package
-        shell: pwsh
+      - name: Test, build, verify, and package
+        shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path build, package, release | Out-Null
-          go build -mod=mod -trimpath -ldflags "-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
-
-          Copy-Item "build\pitchProx.exe" "release\pitchProx.exe"
-          Copy-Item "build\pitchProx.exe" "package\pitchProx.exe"
-          Copy-Item (Join-Path $env:RUNNER_TEMP "WinDivert.dll") "package\WinDivert.dll"
-          Copy-Item (Join-Path $env:RUNNER_TEMP "WinDivert64.sys") "package\WinDivert64.sys"
-
-          foreach ($file in @("README.md", "CHECKS.md")) {
-            if (Test-Path $file) {
-              Copy-Item $file package\
-            }
+          & .\tools\package-release.ps1 -Version "${{ steps.release-version.outputs.version }}" -DownloadWinDivertArchive
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
-
-          if (Test-Path docs) {
-            Copy-Item docs package\docs -Recurse
-          }
-
-          Compress-Archive -Path package\* -DestinationPath release\pitchProx-windows-amd64.zip -Force
-
-          $hashes = @(
-            Get-FileHash -Algorithm SHA256 release\pitchProx.exe
-            Get-FileHash -Algorithm SHA256 release\pitchProx-windows-amd64.zip
-          ) | ForEach-Object {
-            "{0} *{1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf)
-          }
-          Set-Content -Path release\pitchProx-windows-amd64.sha256 -Value $hashes
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pitchProx-windows-amd64
           if-no-files-found: error
           path: |
-            release/pitchProx.exe
-            release/pitchProx-windows-amd64.zip
-            release/pitchProx-windows-amd64.sha256
+            build/candidates/${{ steps.release-version.outputs.version }}/pitchProx.exe
+            build/candidates/${{ steps.release-version.outputs.version }}/pitchProx-windows-amd64.zip
+            build/candidates/${{ steps.release-version.outputs.version }}/pitchProx-windows-amd64.sha256
+            build/candidates/${{ steps.release-version.outputs.version }}/pitchProx-build-manifest.json
+            build/candidates/${{ steps.release-version.outputs.version }}/RELEASE_NOTES.md
 
   release-tag:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -123,18 +75,25 @@ jobs:
       contents: write
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pitchProx-windows-amd64
           path: release-assets
 
+      - name: Verify packaged artifacts
+        shell: bash
+        working-directory: release-assets
+        run: sha256sum --check pitchProx-windows-amd64.sha256
+
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          body_path: release-assets/RELEASE_NOTES.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
           files: |
-            release-assets/**/pitchProx.exe
-            release-assets/**/pitchProx-windows-amd64.zip
-            release-assets/**/pitchProx-windows-amd64.sha256
+            release-assets/pitchProx.exe
+            release-assets/pitchProx-windows-amd64.zip
+            release-assets/pitchProx-windows-amd64.sha256
+            release-assets/pitchProx-build-manifest.json

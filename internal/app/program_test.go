@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,7 +29,7 @@ func TestProgramCanDisableAndReenableWebUI(t *testing.T) {
 	if err := prog.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = prog.Stop() }()
+	cleanupBeforeTempDir(t, tmp, prog.Stop)
 
 	waitHTTPHealth(t, cfg.HTTP.Listen)
 	if !prog.WebUIRunning() {
@@ -76,7 +77,7 @@ func TestProgramPauseAndResumeThroughHTTPControl(t *testing.T) {
 	if err := prog.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer func() { _ = prog.Stop() }()
+	cleanupBeforeTempDir(t, tmp, prog.Stop)
 
 	baseURL := "http://" + cfg.HTTP.Listen
 	waitHTTPHealth(t, cfg.HTTP.Listen)
@@ -115,6 +116,178 @@ func TestProgramPauseAndResumeThroughHTTPControl(t *testing.T) {
 	waitHTTPHealth(t, cfg.HTTP.Listen)
 	if status := httpStatus(t, baseURL+"/"); status != http.StatusOK {
 		t.Fatalf("GET / status after resume = %d, want %d", status, http.StatusOK)
+	}
+}
+
+func TestProgramSerializesPauseThenResume(t *testing.T) {
+	tmp := t.TempDir()
+	prog, err := NewProgram(filepath.Join(tmp, "config.json"), filepath.Join(tmp, "history"))
+	if err != nil {
+		t.Fatalf("NewProgram: %v", err)
+	}
+
+	cfg := runtimeTestConfig()
+	cfg.HTTP.Listen = freeTCPAddr(t)
+	if err := prog.Runtime().UpdateConfig(cfg); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := prog.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cleanupBeforeTempDir(t, tmp, prog.Stop)
+
+	prog.runtime.transitionMu.Lock()
+	transitionLocked := true
+	defer func() {
+		if transitionLocked {
+			prog.runtime.transitionMu.Unlock()
+		}
+	}()
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- prog.PauseService() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !prog.ServicePaused() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !prog.ServicePaused() {
+		t.Fatal("PauseService did not enter the lifecycle transition")
+	}
+
+	resumeCalled := make(chan struct{})
+	resumeDone := make(chan error, 1)
+	go func() {
+		close(resumeCalled)
+		resumeDone <- prog.ResumeService()
+	}()
+	<-resumeCalled
+	select {
+	case err := <-resumeDone:
+		t.Fatalf("ResumeService bypassed the in-flight pause: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !prog.ServicePaused() {
+		t.Fatal("ResumeService changed paused state before PauseService completed")
+	}
+
+	prog.runtime.transitionMu.Unlock()
+	transitionLocked = false
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatalf("PauseService: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PauseService did not finish after the runtime transition was released")
+	}
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("ResumeService: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ResumeService did not follow the completed pause")
+	}
+	if prog.ServicePaused() || !prog.Runtime().Running() || !prog.WebUIRunning() {
+		t.Fatal("pause followed by resume did not leave the program fully running")
+	}
+}
+
+func TestProgramStopDoesNotDeadlockWithControlHandler(t *testing.T) {
+	tmp := t.TempDir()
+	prog, err := NewProgram(filepath.Join(tmp, "config.json"), filepath.Join(tmp, "history"))
+	if err != nil {
+		t.Fatalf("NewProgram: %v", err)
+	}
+
+	cfg := runtimeTestConfig()
+	cfg.HTTP.Listen = freeTCPAddr(t)
+	if err := prog.Runtime().UpdateConfig(cfg); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := prog.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cleanupBeforeTempDir(t, tmp, prog.Stop)
+	waitHTTPHealth(t, cfg.HTTP.Listen)
+
+	prog.httpMu.Lock()
+	srv := prog.http
+	prog.httpMu.Unlock()
+	if srv == nil {
+		t.Fatal("HTTP server is not running")
+	}
+	handlerEntered := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseHandler) }) })
+	srv.PauseFunc = func() error {
+		close(handlerEntered)
+		<-releaseHandler
+		return prog.PauseService()
+	}
+
+	requestDone := make(chan error, 1)
+	go func() {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Post("http://"+cfg.HTTP.Listen+"/api/control/service/pause", "application/json", strings.NewReader(`{}`))
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+	select {
+	case <-handlerEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control handler did not enter PauseFunc")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- prog.Stop() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		prog.lifecycleMu.Lock()
+		stopping := prog.stopping
+		prog.lifecycleMu.Unlock()
+		if stopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Stop did not publish stopping state")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	secondStopDone := make(chan error, 1)
+	go func() { secondStopDone <- prog.Stop() }()
+	select {
+	case err := <-secondStopDone:
+		t.Fatalf("concurrent Stop returned before the active shutdown completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseHandler) })
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop deadlocked waiting for a control handler")
+	}
+	select {
+	case err := <-secondStopDone:
+		if err != nil {
+			t.Fatalf("concurrent Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent Stop did not observe shutdown completion")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control request did not return after Stop")
 	}
 }
 

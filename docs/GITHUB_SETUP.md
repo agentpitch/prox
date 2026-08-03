@@ -1,59 +1,71 @@
-# GitHub repository and CI setup
+# GitHub repository and release setup
 
-This repository is prepared for GitHub Actions and automatic GitHub Releases.
+See [GITHUB.md](GITHUB.md) for the exact CI inputs, artifact contents, and tag
+publication behavior.
 
-## Included workflow
+## Initial repository setup
 
-- `.github/workflows/ci.yml`
+1. Push the complete source history to the intended GitHub repository.
+2. Enable GitHub Actions if the repository settings require it.
+3. Push a normal branch commit or run `workflow_dispatch`.
+4. Confirm that the `windows-build` job succeeds and download its artifact.
+5. Verify `pitchProx-windows-amd64.sha256` and inspect
+   `pitchProx-build-manifest.json` before enabling a release tag workflow.
+6. Decide and add a first-party `LICENSE` if open-source redistribution is intended; dependency licenses do not cover pitchProx itself.
+7. Protect `main` so the Windows CI job is required before merge.
 
-It builds `pitchProx.exe` on `windows-latest`, using the Go version declared in
-`go.mod`, downloads the WinDivert runtime from the official `v2.2.2` release,
-packages a Windows zip and checksum file, uploads them as workflow artifacts,
-and publishes a versioned GitHub Release automatically when you push a tag
-that matches `v*`.
+The workflow requires only the built-in `GITHUB_TOKEN`. The tag publication job
+elevates its permission to `contents: write`; normal builds remain read-only.
 
-Triggers:
+## Local candidate before a tag
 
-- `push`
-- `pull_request`
-- `workflow_dispatch`
-- tag push `v*`
-
-## Recommended first-time setup
-
-1. Create a new empty repository on GitHub, for example `pitchprox`.
-2. Push this project into that repository.
-3. Open the **Actions** tab once to allow workflows if GitHub prompts you.
-4. Push a commit or run the workflow manually with **Run workflow** to confirm the Windows build passes.
-5. Push to `main` to confirm the Windows build passes and the packaged artifacts upload successfully.
-6. Download the generated artifact from the workflow run if you want to inspect the packaged output.
-7. Create and push a version tag to publish a versioned release automatically:
+From a committed clean working tree on Windows:
 
 ```powershell
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.1
 ```
 
-8. Open the **Releases** page and verify that GitHub published the new tagged release with the generated assets.
+Review the files under `build\candidates\v0.43-rc.1\`. This path is separate
+from `build\pitchProx.exe`, so packaging does not overwrite or stop an already
+running main application. The local script verifies and reuses the existing
+root `WinDivert.dll` and `WinDivert64.sys`; it neither downloads a duplicate nor
+loads the driver. CI explicitly downloads the pinned official archive because
+those ignored runtime binaries are absent from a clean checkout.
 
-## What the release contains
+`-AllowDirty` is a diagnostic convenience only, and `-SkipChecks` is accepted
+only together with it. Artifacts made with either switch are not release
+approvals.
 
-- `pitchProx.exe`
-- `pitchProx-windows-amd64.zip`
-- `pitchProx-windows-amd64.sha256`
+## Publish an approved version
 
-Version tags `v*` publish the same assets as normal GitHub Releases.
+Push exactly one intended tag:
 
-## Optional follow-ups
+```powershell
+git tag -a v0.43 -m "v0.43"
+git push origin v0.43
+```
 
-- Add branch protection so `main` requires the Windows build to pass.
-- If you need a reproducible corporate environment, move the build to a self-hosted Windows runner.
-- If you want manual release notes instead of generated ones, edit `.github/workflows/ci.yml`.
+Never substitute `git push --tags` unless every local tag has been deliberately
+audited. Every pushed `v*` tag starts an automatic GitHub Release.
+Before tagging a new major/minor line, add its matching curated notes file (for
+example, `docs/RELEASE_NOTES_v0.44.md`); packaging intentionally fails rather
+than reusing notes from another release line.
 
-## Notes about WinDivert
+The release contains:
 
-The workflow downloads `WinDivert.dll` and `WinDivert64.sys` automatically from:
+- `pitchProx.exe`;
+- `pitchProx-windows-amd64.zip`;
+- `pitchProx-windows-amd64.sha256`;
+- `pitchProx-build-manifest.json`.
 
-- https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+The ZIP is the complete new-install package. It contains the verified official
+WinDivert 2.2.2 x64 runtime, upstream WinDivert license, Go and
+`golang.org/x/sys` licenses, `THIRD_PARTY_NOTICES.md`, README, checks, and docs.
 
-This keeps the packaged GitHub Release self-contained even if those files are not committed to the repository.
+## Signing and runtime tests
+
+The pitchProx executable is currently unsigned and may trigger SmartScreen. CI
+does not start the executable, install a service, display the tray, or load the
+WinDivert driver. Perform those checks separately on a VM or during an approved
+test window where the production instance is not competing for the same driver,
+ports, or configuration.

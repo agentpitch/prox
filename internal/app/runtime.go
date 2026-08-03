@@ -19,10 +19,12 @@ import (
 )
 
 type Runtime struct {
-	store        *config.Store
-	monitor      *monitor.Bus
-	flows        *proxy.FlowTable
-	updateMu     sync.Mutex
+	store   *config.Store
+	monitor *monitor.Bus
+	flows   *proxy.FlowTable
+	// transitionMu serializes config activation with every runtime lifecycle
+	// transition. It must be acquired before runMu and never while mu is held.
+	transitionMu sync.Mutex
 	mu           sync.RWMutex
 	cfg          config.Config
 	engine       *rules.Engine
@@ -89,8 +91,29 @@ func (r *Runtime) TrayView(seconds int) monitor.TrayView {
 }
 
 func (r *Runtime) UpdateConfig(cfg config.Config) error {
-	r.updateMu.Lock()
-	defer r.updateMu.Unlock()
+	return r.UpdateConfigIfCurrent(cfg, time.Time{})
+}
+
+func (r *Runtime) UpdateConfigIfCurrent(cfg config.Config, expectedUpdatedAt time.Time) error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	return r.updateConfigIfCurrentTransitionLocked(cfg, expectedUpdatedAt)
+}
+
+func (r *Runtime) updateConfigIfCurrentTransitionLocked(cfg config.Config, expectedUpdatedAt time.Time) error {
+	r.mu.RLock()
+	old := config.Clone(r.cfg)
+	oldEngine := r.engine
+	oldInterception := r.interceptionEnabled
+	r.mu.RUnlock()
+	if !expectedUpdatedAt.IsZero() && !expectedUpdatedAt.Equal(old.UpdatedAt) {
+		return fmt.Errorf(
+			"%w: expected updated_at %s, current %s",
+			config.ErrConfigConflict,
+			expectedUpdatedAt.UTC().Format(time.RFC3339Nano),
+			old.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		)
+	}
 
 	cfg, err := config.Canonicalize(cfg)
 	if err != nil {
@@ -101,11 +124,6 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 		return err
 	}
 
-	r.mu.RLock()
-	old := config.Clone(r.cfg)
-	oldEngine := r.engine
-	oldInterception := r.interceptionEnabled
-	r.mu.RUnlock()
 	newInterception := !eng.AllEnabledActionsDirect()
 	restart := runtimeRestartRequired(old, cfg, oldInterception, newInterception) && r.Running()
 
@@ -113,10 +131,10 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 		r.applyConfigInMemory(cfg, eng, newInterception)
 		r.applyConfigToMonitor(cfg)
 		r.monitor.AddLog("info", "runtime restart applying routing/listener changes")
-		if err := r.Restart(); err != nil {
+		if err := r.restartTransitionLocked(); err != nil {
 			r.applyConfigInMemory(old, oldEngine, oldInterception)
 			r.applyConfigToMonitor(old)
-			rollbackErr := r.startAfterFailedRestart()
+			rollbackErr := r.startAfterFailedRestartTransitionLocked()
 			r.monitor.AddLog("error", "runtime restart failed, restored previous configuration: %v", err)
 			if rollbackErr != nil {
 				return errors.Join(err, fmt.Errorf("restart previous configuration: %w", rollbackErr))
@@ -130,7 +148,7 @@ func (r *Runtime) UpdateConfig(cfg config.Config) error {
 		if restart {
 			r.applyConfigInMemory(old, oldEngine, oldInterception)
 			r.applyConfigToMonitor(old)
-			rollbackErr := r.Restart()
+			rollbackErr := r.restartTransitionLocked()
 			if rollbackErr != nil {
 				return errors.Join(err, fmt.Errorf("rollback runtime after config save failure: %w", rollbackErr))
 			}
@@ -159,7 +177,7 @@ func (r *Runtime) applyConfigToMonitor(cfg config.Config) {
 	r.monitor.SetDroppedLogMaxBytes(cfg.DroppedLogMaxBytes)
 }
 
-func (r *Runtime) startAfterFailedRestart() error {
+func (r *Runtime) startAfterFailedRestartTransitionLocked() error {
 	r.runMu.RLock()
 	ctx := r.rootCtx
 	closed := r.closed
@@ -170,7 +188,7 @@ func (r *Runtime) startAfterFailedRestart() error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return r.Start(ctx)
+	return r.startTransitionLocked(ctx)
 }
 
 func (r *Runtime) Running() bool {
@@ -180,6 +198,12 @@ func (r *Runtime) Running() bool {
 }
 
 func (r *Runtime) Start(ctx context.Context) (err error) {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	return r.startTransitionLocked(ctx)
+}
+
+func (r *Runtime) startTransitionLocked(ctx context.Context) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -297,6 +321,12 @@ func (r *Runtime) TestProxy(pf config.ProxyProfile, target string) (proxy.ProxyT
 }
 
 func (r *Runtime) Stop() error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	return r.stopTransitionLocked()
+}
+
+func (r *Runtime) stopTransitionLocked() error {
 	r.runMu.Lock()
 	if r.closed {
 		r.runMu.Unlock()
@@ -321,6 +351,12 @@ func (r *Runtime) Stop() error {
 }
 
 func (r *Runtime) Pause() error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	return r.pauseTransitionLocked()
+}
+
+func (r *Runtime) pauseTransitionLocked() error {
 	r.runMu.Lock()
 	if r.closed {
 		r.runMu.Unlock()
@@ -337,6 +373,12 @@ func (r *Runtime) Pause() error {
 }
 
 func (r *Runtime) Restart() error {
+	r.transitionMu.Lock()
+	defer r.transitionMu.Unlock()
+	return r.restartTransitionLocked()
+}
+
+func (r *Runtime) restartTransitionLocked() error {
 	r.runMu.Lock()
 	if r.closed {
 		r.runMu.Unlock()
@@ -355,7 +397,7 @@ func (r *Runtime) Restart() error {
 		return err
 	}
 	r.runMu.Unlock()
-	return r.Start(ctx)
+	return r.startTransitionLocked(ctx)
 }
 
 func (r *Runtime) stopActiveLocked() error {

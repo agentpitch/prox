@@ -109,6 +109,7 @@ const (
 	defaultDroppedQueryLimit    = 100
 	maxDroppedQueryLimit        = 500
 	segmentLayout               = "2006010215"
+	ruleActivityWriteBucket     = 15 * time.Second
 )
 
 func Open(path string, retention time.Duration) (*Store, error) {
@@ -303,8 +304,9 @@ func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action co
 	if conns == 0 && upBytes == 0 && downBytes == 0 {
 		return
 	}
-	bucket := ts.UTC().Truncate(time.Second)
-	key := fmt.Sprintf("%d\x1f%s\x1f%s\x1f%s", bucket.Unix(), strings.ToLower(strings.TrimSpace(ruleID)), strings.ToLower(strings.TrimSpace(ruleName)), strings.ToLower(strings.TrimSpace(string(action))))
+	eventTime := ts.UTC().Truncate(time.Second)
+	bucket := eventTime.Truncate(ruleActivityWriteBucket)
+	key := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityIdentity(ruleID, ruleName, action))
 	s.mu.Lock()
 	wasEmpty := s.pendingEmptyLocked()
 	item, exists := s.pendingRule[key]
@@ -313,9 +315,13 @@ func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action co
 		s.mu.Unlock()
 		return
 	}
-	item.Ts = bucket.Unix()
-	if item.Item.RuleID == "" {
-		item.Item.RuleID = ruleID
+	// Keep the latest real event time as the aggregate timestamp. Using the
+	// bucket start would drop valid events from the first partial bucket of an
+	// exact query window. Counts remain deliberately quantized to 15 seconds,
+	// so at most the older part of one boundary aggregate can be included.
+	if !exists || eventTime.Unix() >= item.Ts {
+		item.Ts = eventTime.Unix()
+		item.Item.RuleID = strings.TrimSpace(ruleID)
 		item.Item.RuleName = ruleName
 		item.Item.Action = action
 	}
@@ -327,6 +333,13 @@ func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action co
 	if wasEmpty {
 		s.wakeFlush()
 	}
+}
+
+func ruleActivityIdentity(ruleID, ruleName string, action config.RuleAction) string {
+	if id := strings.TrimSpace(ruleID); id != "" {
+		return "id\x1f" + id
+	}
+	return "legacy\x1f" + strings.TrimSpace(ruleName) + "\x1f" + strings.TrimSpace(string(action))
 }
 
 func (s *Store) Snapshot(retention time.Duration) (SnapshotData, error) {
@@ -991,17 +1004,30 @@ func (s *Store) rewriteDroppedFiltered(keep func(DroppedRecord) bool) error {
 }
 
 func scanLinesReverse(path string, fn func([]byte)) (int64, error) {
+	return scanLinesReverseUntil(path, 0, func(line []byte) bool {
+		if fn != nil {
+			fn(line)
+		}
+		return true
+	})
+}
+
+// scanLinesReverseUntil reads complete JSONL records from newest to oldest.
+// maxBytes pins the visible file length so callers can read a stable snapshot
+// while the append-only writer continues past that boundary. A zero value uses
+// the current full file size. Returning false from fn stops the scan early.
+func scanLinesReverseUntil(path string, maxBytes int64, fn func([]byte) bool) (int64, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("open dropped log: %w", err)
+		return 0, fmt.Errorf("open segment: %w", err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return 0, fmt.Errorf("stat dropped log: %w", err)
+		return 0, fmt.Errorf("stat segment: %w", err)
 	}
 	const (
 		chunkSize    = 64 * 1024
@@ -1010,12 +1036,17 @@ func scanLinesReverse(path string, fn func([]byte)) (int64, error) {
 	buf := make([]byte, chunkSize)
 	var carry []byte
 	droppingOversized := false
-	pos := info.Size()
-	process := func(line []byte) {
+	visibleSize := info.Size()
+	if maxBytes > 0 && maxBytes < visibleSize {
+		visibleSize = maxBytes
+	}
+	pos := visibleSize
+	process := func(line []byte) bool {
 		line = bytes.TrimSpace(line)
 		if len(line) > 0 && fn != nil {
-			fn(line)
+			return fn(line)
 		}
+		return true
 	}
 	for pos > 0 {
 		start := pos - int64(len(buf))
@@ -1024,7 +1055,7 @@ func scanLinesReverse(path string, fn func([]byte)) (int64, error) {
 		}
 		n, readErr := f.ReadAt(buf[:pos-start], start)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return info.Size(), fmt.Errorf("read dropped log backwards: %w", readErr)
+			return visibleSize, fmt.Errorf("read segment backwards: %w", readErr)
 		}
 		chunk := buf[:n]
 		if droppingOversized {
@@ -1045,7 +1076,9 @@ func scanLinesReverse(path string, fn func([]byte)) (int64, error) {
 			if idx < 0 {
 				break
 			}
-			process(data[idx+1 : end])
+			if !process(data[idx+1 : end]) {
+				return visibleSize, nil
+			}
 			end = idx
 		}
 		carry = append(carry[:0], data[:end]...)
@@ -1056,9 +1089,9 @@ func scanLinesReverse(path string, fn func([]byte)) (int64, error) {
 		pos = start
 	}
 	if !droppingOversized {
-		process(carry)
+		_ = process(carry)
 	}
-	return info.Size(), nil
+	return visibleSize, nil
 }
 
 func nextLineOffset(path string, offset int64) (int64, error) {
@@ -1155,7 +1188,13 @@ func (s *Store) appendRules(items map[string]rulePending) error {
 	for key := range items {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := items[keys[i]], items[keys[j]]
+		if left.Ts == right.Ts {
+			return keys[i] < keys[j]
+		}
+		return left.Ts < right.Ts
+	})
 	buffers, err := marshalBySegment("rules", len(keys), func(write func(time.Time, any) error) error {
 		for _, key := range keys {
 			item := items[key]
@@ -1598,13 +1637,11 @@ func (s *Store) queryRuleStats(cutoff time.Time) ([]RuleActivity, error) {
 			if item.Connections == 0 && item.UpBytes == 0 && item.DownBytes == 0 {
 				return
 			}
-			key := fmt.Sprintf("%s\x1f%s\x1f%s", strings.ToLower(strings.TrimSpace(item.RuleID)), strings.ToLower(strings.TrimSpace(item.RuleName)), strings.ToLower(strings.TrimSpace(string(item.Action))))
+			key := ruleActivityIdentity(item.RuleID, item.RuleName, item.Action)
 			current := agg[key]
-			if current.RuleID == "" && current.RuleName == "" {
-				current.RuleID = item.RuleID
-				current.RuleName = item.RuleName
-				current.Action = item.Action
-			}
+			current.RuleID = strings.TrimSpace(item.RuleID)
+			current.RuleName = item.RuleName
+			current.Action = item.Action
 			current.Connections += item.Connections
 			current.UpBytes += item.UpBytes
 			current.DownBytes += item.DownBytes
@@ -1629,6 +1666,184 @@ func (s *Store) queryRuleStats(cutoff time.Time) ([]RuleActivity, error) {
 		return strings.ToLower(out[i].RuleName) < strings.ToLower(out[j].RuleName)
 	})
 	return out, nil
+}
+
+func (s *Store) RuleActivityTimeline(ruleIDs []string, window time.Duration, points int) (RuleActivityTimeline, error) {
+	if window < time.Minute {
+		window = time.Minute
+	}
+	if window > time.Hour {
+		window = time.Hour
+	}
+	if points < 2 {
+		points = 2
+	}
+	if points > 60 {
+		points = 60
+	}
+
+	orderedIDs := make([]string, 0, min(len(ruleIDs), 50))
+	indexByID := make(map[string]int, min(len(ruleIDs), 50))
+	for _, rawID := range ruleIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, exists := indexByID[id]; exists {
+			continue
+		}
+		if len(orderedIDs) >= 50 {
+			break
+		}
+		indexByID[id] = len(orderedIDs)
+		orderedIDs = append(orderedIDs, id)
+	}
+
+	generatedAt := time.Now().UTC().Truncate(time.Second)
+	cutoff := generatedAt.Add(-window)
+	bucketWidth := window / time.Duration(points)
+	out := RuleActivityTimeline{
+		GeneratedAt:   generatedAt,
+		WindowMinutes: int(window / time.Minute),
+		BucketSeconds: float64(bucketWidth) / float64(time.Second),
+		Points:        points,
+		Series:        make([]RuleActivitySeries, len(orderedIDs)),
+	}
+	for i, id := range orderedIDs {
+		out.Series[i] = RuleActivitySeries{
+			RuleID:  id,
+			Buckets: make([]RuleActivityBucket, points),
+		}
+		for bucket := range out.Series[i].Buckets {
+			out.Series[i].Buckets[bucket].Time = cutoff.Add(time.Duration(bucket) * bucketWidth)
+		}
+	}
+	if len(orderedIDs) == 0 {
+		return out, nil
+	}
+
+	files, pending, err := s.snapshotRuleTimelineSources(cutoff)
+	if err != nil {
+		return RuleActivityTimeline{}, err
+	}
+	metadataAt := make([]time.Time, len(out.Series))
+	add := func(item timedRuleActivity) {
+		itemTime := item.Time.UTC()
+		if itemTime.Before(cutoff) || itemTime.After(generatedAt) {
+			return
+		}
+		seriesIndex, ok := indexByID[strings.TrimSpace(item.RuleID)]
+		if !ok {
+			return
+		}
+		bucketIndex := int(itemTime.Sub(cutoff) / bucketWidth)
+		if bucketIndex < 0 {
+			return
+		}
+		if bucketIndex >= points {
+			bucketIndex = points - 1
+		}
+		series := &out.Series[seriesIndex]
+		if itemTime.After(metadataAt[seriesIndex]) {
+			metadataAt[seriesIndex] = itemTime
+			series.RuleName = item.RuleName
+			series.Action = item.Action
+		}
+		series.Connections += item.Connections
+		series.UpBytes += item.UpBytes
+		series.DownBytes += item.DownBytes
+		bucket := &series.Buckets[bucketIndex]
+		bucket.Connections += item.Connections
+		bucket.UpBytes += item.UpBytes
+		bucket.DownBytes += item.DownBytes
+	}
+
+	// Pending entries are the newest source. Process them first so their
+	// metadata wins when a flush split the same 15-second bucket across an
+	// on-disk record and the current pending aggregate. Counters from every
+	// source are still summed below.
+	for _, item := range pending {
+		add(item)
+	}
+	stopOlderFiles := false
+	for i := len(files) - 1; i >= 0 && !stopOlderFiles; i-- {
+		file := files[i]
+		_, err := scanLinesReverseUntil(file.path, file.size, func(line []byte) bool {
+			var item timedRuleActivity
+			if err := json.Unmarshal(line, &item); err != nil {
+				s.noteSkippedLine()
+				return true
+			}
+			itemTime := item.Time.UTC()
+			if itemTime.Before(cutoff) {
+				// Records inside one write bucket can have different latest event
+				// timestamps and identity tie-break ordering. Finish the boundary
+				// bucket before stopping the reverse scan.
+				if ruleActivityBucketBeforeCutoff(itemTime, cutoff) {
+					stopOlderFiles = true
+					return false
+				}
+				return true
+			}
+			if itemTime.After(generatedAt) {
+				return true
+			}
+			if _, ok := indexByID[strings.TrimSpace(item.RuleID)]; !ok {
+				return true
+			}
+			add(item)
+			return true
+		})
+		if err != nil {
+			return RuleActivityTimeline{}, fmt.Errorf("query rule activity timeline: %w", err)
+		}
+	}
+	return out, nil
+}
+
+func ruleActivityBucketBeforeCutoff(itemTime, cutoff time.Time) bool {
+	bucketEnd := itemTime.UTC().Truncate(ruleActivityWriteBucket).Add(ruleActivityWriteBucket)
+	return !bucketEnd.After(cutoff.UTC())
+}
+
+type ruleSegmentSnapshot struct {
+	path string
+	size int64
+}
+
+// snapshotRuleTimelineSources captures an append-consistent view without
+// holding flushMu while JSON is decoded. Records appended after the captured
+// file sizes are excluded and the not-yet-flushed map is merged separately.
+func (s *Store) snapshotRuleTimelineSources(cutoff time.Time) ([]ruleSegmentSnapshot, []timedRuleActivity, error) {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	paths, err := s.segmentFiles("rules", cutoff)
+	if err != nil {
+		return nil, nil, err
+	}
+	files := make([]ruleSegmentSnapshot, 0, len(paths))
+	for _, path := range paths {
+		info, statErr := os.Stat(path)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return nil, nil, fmt.Errorf("stat rule activity segment: %w", statErr)
+		}
+		files = append(files, ruleSegmentSnapshot{path: path, size: info.Size()})
+	}
+
+	s.mu.Lock()
+	pending := make([]timedRuleActivity, 0, len(s.pendingRule))
+	for _, item := range s.pendingRule {
+		pending = append(pending, timedRuleActivity{
+			Time:         time.Unix(item.Ts, 0).UTC(),
+			RuleActivity: item.Item,
+		})
+	}
+	s.mu.Unlock()
+	return files, pending, nil
 }
 
 func (s *Store) segmentFiles(prefix string, cutoff time.Time) ([]string, error) {

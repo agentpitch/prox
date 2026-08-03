@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agentpitch/prox/internal/buildinfo"
 	"github.com/agentpitch/prox/internal/config"
 	"github.com/agentpitch/prox/internal/history"
 	"github.com/agentpitch/prox/internal/monitor"
@@ -28,7 +29,7 @@ var ErrClosed = net.ErrClosed
 
 type Runtime interface {
 	CurrentConfig() config.Config
-	UpdateConfig(config.Config) error
+	UpdateConfigIfCurrent(config.Config, time.Time) error
 	Monitor() *monitor.Bus
 	TestProxy(config.ProxyProfile, string) (proxy.ProxyTestResult, error)
 }
@@ -278,6 +279,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleConfig(conn, req)
 	case "/api/snapshot":
 		s.handleSnapshot(conn, req)
+	case "/api/rules/activity":
+		s.handleRuleActivity(conn, req)
 	case "/api/dropped":
 		s.handleDropped(conn, req)
 	case "/api/tray":
@@ -312,7 +315,10 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) handleHealth(conn net.Conn) {
-	writeJSON(conn, 200, map[string]bool{"ok": true})
+	writeJSON(conn, 200, map[string]interface{}{
+		"ok":      true,
+		"version": buildinfo.CurrentVersion(),
+	})
 }
 
 func (s *Server) WebUIEnabled() bool {
@@ -429,7 +435,12 @@ func (s *Server) handleConfig(conn net.Conn, req request) {
 			writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
 			return
 		}
-		if err := s.Runtime.UpdateConfig(cfg); err != nil {
+		expectedUpdatedAt := cfg.UpdatedAt
+		if err := s.Runtime.UpdateConfigIfCurrent(cfg, expectedUpdatedAt); err != nil {
+			if errors.Is(err, config.ErrConfigConflict) {
+				writeText(conn, 409, err.Error())
+				return
+			}
 			writeText(conn, 400, err.Error())
 			return
 		}
@@ -445,6 +456,50 @@ func (s *Server) handleSnapshot(conn net.Conn, req request) {
 		includeLogs = false
 	}
 	writeJSON(conn, 200, s.Runtime.Monitor().SnapshotWithOptions(monitor.SnapshotOptions{IncludeLogs: includeLogs}))
+}
+
+func (s *Server) handleRuleActivity(conn net.Conn, req request) {
+	if req.Method != "GET" {
+		writeEmpty(conn, 405)
+		return
+	}
+	rawIDs := req.Query["id"]
+	ids := make([]string, 0, min(len(rawIDs), 50))
+	seen := make(map[string]struct{}, min(len(rawIDs), 50))
+	for _, rawID := range rawIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		if len(ids) >= 50 {
+			writeText(conn, 400, "at most 50 rule ids are allowed")
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	points, err := parseNonNegativeInt(req.Query.Get("points"), 40)
+	if err != nil || points < 2 || points > 60 {
+		writeText(conn, 400, "points must be in 2..60")
+		return
+	}
+	windowMinutes, err := parseNonNegativeInt(req.Query.Get("window_minutes"), 15)
+	if err != nil || windowMinutes < 1 || windowMinutes > 60 {
+		writeText(conn, 400, "window_minutes must be in 1..60")
+		return
+	}
+	if retention := s.Runtime.CurrentConfig().RetentionMinutes; retention > 0 && windowMinutes > retention {
+		windowMinutes = retention
+	}
+	data, err := s.Runtime.Monitor().RuleActivityTimeline(ids, time.Duration(windowMinutes)*time.Minute, points)
+	if err != nil {
+		writeText(conn, 500, err.Error())
+		return
+	}
+	writeJSON(conn, 200, data)
 }
 
 func (s *Server) handleDropped(conn net.Conn, req request) {
@@ -603,6 +658,13 @@ func (s *Server) handleUIVisibility(conn net.Conn, req request) {
 }
 
 func (s *Server) handleEvents(conn net.Conn) {
+	ch, cancel, ok := s.subscribeEventsIfEnabled()
+	if !ok {
+		writeText(conn, 503, "WebUI disabled")
+		return
+	}
+	defer cancel()
+
 	bw := bufio.NewWriter(conn)
 	if err := writeHeaders(bw, 200, map[string]string{
 		"Content-Type":  "text/event-stream",
@@ -611,8 +673,6 @@ func (s *Server) handleEvents(conn net.Conn) {
 	}, -1); err != nil {
 		return
 	}
-	_, ch, cancel := s.Runtime.Monitor().Subscribe()
-	defer cancel()
 
 	_ = conn.SetReadDeadline(time.Time{})
 	ticker := time.NewTicker(25 * time.Second)
@@ -638,6 +698,19 @@ func (s *Server) handleEvents(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// subscribeEventsIfEnabled serializes the enabled check and subscription with
+// SetWebUIEnabled. A concurrent disable either observes and closes this new
+// subscriber through DisableUI, or wins first and prevents its creation.
+func (s *Server) subscribeEventsIfEnabled() (<-chan []byte, func(), bool) {
+	s.webUIMu.RLock()
+	defer s.webUIMu.RUnlock()
+	if !s.webUIEnabled {
+		return nil, nil, false
+	}
+	_, ch, cancel := s.Runtime.Monitor().Subscribe()
+	return ch, cancel, true
 }
 
 func (s *Server) handleStatic(conn net.Conn, reqPath string) {
@@ -848,6 +921,8 @@ func statusText(code int) string {
 		return "Not Found"
 	case 405:
 		return "Method Not Allowed"
+	case 409:
+		return "Conflict"
 	case 500:
 		return "Internal Server Error"
 	default:
@@ -856,15 +931,7 @@ func statusText(code int) string {
 }
 
 func shouldMarkUIActive(path string) bool {
-	if !strings.HasPrefix(path, "/api/") {
-		return false
-	}
-	switch path {
-	case "/api/health", "/api/tray", "/api/control/stop", "/api/ui/visibility", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable", "/api/control/service/status", "/api/control/service/pause", "/api/control/service/resume":
-		return false
-	default:
-		return true
-	}
+	return path == "/api/snapshot" || path == "/api/events"
 }
 
 func isWebUIControlPath(path string) bool {

@@ -79,7 +79,6 @@ func buildWindowsArgs(args []string) string {
 	return strings.Join(parts, " ")
 }
 
-
 func quoteWindowsArg(arg string) string {
 	return syscall.EscapeArg(arg)
 }

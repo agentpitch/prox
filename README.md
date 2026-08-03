@@ -69,41 +69,61 @@ In service mode the process is headless. The service does not display a tray ico
 Requirements:
 
 - Windows 10/11 x64
-- Go 1.25+
-- WinDivert 2.2.2+
+- Go with toolchain switching support; release builds force the exact `go1.26.5` toolchain
+- Node.js `22.17.0` for release-candidate WebUI checks
+- the exact official WinDivert `2.2.2` x64 runtime
 
 Get the runtime files from the official WinDivert 2.2.2 release page:
 
 - https://github.com/basil00/WinDivert/releases/tag/v2.2.2
 
-Place these files next to the built executable:
+For a normal local build, place these files in the repository root. Their
+official SHA-256 digests are verified before they are copied next to the built
+executable:
 
 - `WinDivert.dll`
 - `WinDivert64.sys`
 
-Build:
-
-Without PowerShell scripts (recommended if execution policy blocks `build.ps1`):
+Build through the command wrapper. It invokes `build.ps1` with the Windows
+PowerShell execution-policy bypass and forwards all arguments:
 
 ```cmd
 build.cmd
 ```
 
-Or manually from PowerShell:
+Or invoke the same script directly:
 
 ```powershell
-go mod tidy
-New-Item -ItemType Directory -Force -Path build | Out-Null
-go build -mod=mod -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+.\build.ps1 -Version dev
 ```
 
-The `cmd/pitchprox/pitchprox_windows_amd64.syso` resource file is already checked into the repo, so the `pp` icon is embedded by a normal `go build` on Windows.
+Both entry points force `windows/amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`,
+`-mod=readonly`, `-trimpath`, Go `1.26.5`, and `GOWORK=off`. Release builds also
+ignore per-user Go environment files and reject unexpected experiment/FIPS
+modes. Go may download the pinned toolchain on the first build. A missing
+WinDivert runtime produces a development-build warning; an existing runtime in
+either the source or output directory is accepted only when its exact hash
+matches.
 
-If you want to use the optional PowerShell wrapper instead, first allow the script under your local PowerShell execution policy and then run:
+To prepare a reviewable release candidate, first commit all intended source
+changes, then run:
 
 ```powershell
-.\build.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.1
 ```
+
+The candidate is written to `build\candidates\v0.43-rc.1\`; it does not replace
+`build\pitchProx.exe` or interact with a running pitchProx process. The release
+script runs all Go and WebUI checks, verifies the existing root
+`WinDivert.dll`/`WinDivert64.sys` and the tracked upstream license by exact
+hash, includes third-party licenses, and writes a build manifest plus SHA-256
+file. It refuses recursive cleanup through junctions/symlinks and does not
+download or temporarily unpack duplicate runtime files.
+`-AllowDirty` is only for disposable test builds; `-SkipChecks` is accepted
+only together with it. A publishable candidate must report a clean tree,
+completed checks, the injected version, and `vcs.modified=false`.
+
+The `cmd/pitchprox/pitchprox_windows_amd64.syso` resource file is already checked into the repo, so the `pp` icon is embedded by a normal Go build on Windows.
 
 ## First run
 
@@ -118,6 +138,16 @@ Default WebUI address:
 ```text
 http://127.0.0.1:18080
 ```
+
+The WebUI opens on the Rules page and provides:
+
+- sidebar navigation for Monitoring, Rules, Proxies, Chains, Dropped connections, and the event log;
+- local rule search across names, comments, every application/host/port value, actions, proxies, and chains;
+- filters, pagination, compact mode, configurable columns, and atomic bulk operations;
+- versioned rules-only import/export that never includes proxy credentials;
+- demand-only bounded per-rule activity charts.
+
+One rule may still contain multiple Applications, Target hosts, and Target ports. These values remain raw strings in the config and keep the syntax documented below.
 
 ## Config file
 
@@ -211,7 +241,9 @@ Main areas:
 - [docs/CODE_AUDIT_2026-07-28.md](docs/CODE_AUDIT_2026-07-28.md) - code audit, long-running resource fixes, decisions, and remaining isolated tests.
 - [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) - preserved CPU investigation that motivated later runtime optimizations.
 - [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) - how to publish the repository to GitHub and use the included CI and release workflow.
+- [docs/RELEASE_NOTES_v0.43.md](docs/RELEASE_NOTES_v0.43.md) - release notes used for the v0.43 GitHub Release body.
 - [CHECKS.md](CHECKS.md) - verification notes for this archive.
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - bundled dependency notices and license locations.
 
 ## GitHub Actions CI
 
@@ -221,17 +253,30 @@ This archive includes a ready-to-commit workflow at:
 .github/workflows/ci.yml
 ```
 
-It builds `pitchProx.exe` on a GitHub-hosted Windows runner, packages a Windows zip plus SHA-256 checksums, and uploads them as workflow artifacts.
+It invokes the same release script as a local candidate: pinned Go and Node.js
+versions, WebUI checks, Go tests and `go vet`, exact Windows amd64/CGO-disabled
+build settings, verified WinDivert inputs, licenses, deterministic ZIP entry
+ordering/timestamps, a build manifest, and SHA-256 checksums.
 
-During GitHub Actions packaging, the workflow automatically downloads `WinDivert.dll` and `WinDivert64.sys` from the official WinDivert 2.2.2 release and includes them in the packaged zip.
+The CI invocation explicitly downloads the official WinDivert 2.2.2 archive
+and accepts it only when the pinned archive, DLL, driver, and license SHA-256
+values all match. Local candidates instead reuse the already present verified
+root runtime. The complete tracked WinDivert license and third-party notices
+are included in either ZIP, and the manifest records which runtime source was
+used.
 
-A push to `main` runs the Windows build and uploads packaged workflow artifacts.
+A push to any branch, a pull request, or a manual workflow run executes the
+Windows build and uploads packaged workflow artifacts.
 
-If you push a tag named `v*` such as `v0.1.0`, the same workflow also creates a versioned GitHub Release automatically and attaches:
+If you push an approved tag such as `v0.43`, the same workflow also creates a
+versioned GitHub Release automatically. A matching
+`docs/RELEASE_NOTES_v<major>.<minor>.md` file is required, so future tags cannot
+silently reuse notes from v0.43. The release attaches:
 
 - `pitchProx.exe`
 - `pitchProx-windows-amd64.zip`
 - `pitchProx-windows-amd64.sha256`
+- `pitchProx-build-manifest.json`
 
 ## Performance model
 
@@ -272,14 +317,39 @@ The main release build is produced as a **GUI subsystem** executable. This avoid
 Use:
 
 ```powershell
-.\build.ps1
+.\build.ps1 -Version dev
 ```
 
 If you build manually and want the same behavior, use:
 
 ```powershell
-go build -mod=mod -trimpath -ldflags="-H=windowsgui -s -w" -o build\pitchProx.exe .\cmd\pitchprox
+$env:GOTOOLCHAIN = 'go1.26.5'
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+$env:GOAMD64 = 'v1'
+$env:CGO_ENABLED = '0'
+$env:GOWORK = 'off'
+$env:GOENV = 'off'
+$env:GOEXPERIMENT = ''
+$env:GOFIPS140 = 'off'
+go build -mod=readonly -trimpath -buildvcs=true -ldflags="-H=windowsgui -s -w -X github.com/agentpitch/prox/internal/buildinfo.Version=dev" -o build\pitchProx.exe .\cmd\pitchprox
 ```
+
+The release script additionally produces a ZIP with ordinally sorted entries and a fixed
+source-commit timestamp. Reproducibility here means pinned source, toolchain,
+target, dependencies, and packaging inputs; it is not a formal promise that
+independent Windows/.NET environments will always emit byte-identical files.
+
+Tracked text uses repository-defined line endings so embedded WebUI bytes do
+not depend on a contributor's Git `core.autocrlf` setting.
+
+pitchProx itself currently has no declared open-source license. The bundled
+license files cover third-party components only; choose and add a project
+license before publishing if redistribution rights are intended.
+
+Release executables are currently unsigned. Windows may show a SmartScreen
+warning even though the bundled WinDivert 2.2.2 driver/runtime files are the
+official upstream binaries verified by SHA-256.
 
 The file icon is embedded from `assets/pp_icon_256.png` through the generated resource object `cmd/pitchprox/pitchprox_windows_amd64.syso`. To regenerate it, run:
 

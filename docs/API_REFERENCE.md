@@ -9,8 +9,11 @@ The API is intended for localhost use only.
 Response:
 
 ```json
-{"ok": true}
+{"ok": true, "version": "v0.43-rc.1"}
 ```
+
+`version` is injected at build time. Unversioned developer builds report
+`"dev"`.
 
 ## `GET /api/config`
 
@@ -24,10 +27,13 @@ Behavior:
 
 - config is normalized;
 - config is validated;
+- a non-zero `updated_at` from the submitted document is used as an optimistic concurrency token;
+- stale updates return HTTP `409 Conflict` instead of overwriting a newer config;
+- a zero or omitted token remains an unconditional update for legacy API clients;
 - `updated_at` is rewritten server-side;
 - the JSON file is written atomically.
 
-Important: changing listen addresses or transparent listener addresses/ports does not hot-rebind existing listeners. The backend logs a restart warning.
+Transparent-listener and routing changes are applied by a transactional runtime restart; if activation fails, the previous runtime/configuration is restored. Changing the HTTP listen address still requires a service/process restart.
 
 ## `GET /api/snapshot`
 
@@ -57,6 +63,57 @@ Notes:
 - `new_connections` contains application/address/port signatures first seen during `new_recent_minutes`; the comparison baseline is the currently configured retained history window reported as `new_baseline_minutes`. If the retained window is not longer than the recent window, the result is empty.
 
 This is heavier than tray data and is intended for the WebUI, not for the tray.
+
+## `GET /api/rules/activity`
+
+Returns bounded activity timelines for the requested stable rule IDs. This is
+used for the visible Rules-page sparklines and does not create an in-memory
+history cache.
+
+Query parameters:
+
+- repeated `id=<rule-id>` values; at most 50 unique non-empty IDs;
+- `points`, default 40, range 2–60;
+- `window_minutes`, default 15, range 1–60 and clamped to configured retention.
+
+Example:
+
+```text
+/api/rules/activity?id=default&id=browser&points=40&window_minutes=15
+```
+
+Response shape:
+
+```json
+{
+  "generated_at": "2026-08-03T12:00:00Z",
+  "window_minutes": 15,
+  "bucket_seconds": 22.5,
+  "points": 40,
+  "series": [
+    {
+      "rule_id": "browser",
+      "rule_name": "Browser",
+      "action": "proxy",
+      "connections": 12,
+      "up_bytes": 1024,
+      "down_bytes": 4096,
+      "buckets": [
+        {"time": "2026-08-03T11:45:00Z", "connections": 1, "up_bytes": 64, "down_bytes": 128}
+      ]
+    }
+  ]
+}
+```
+
+Rule activity totals are aggregated for up to 15 seconds and stored with the
+latest real event time in that aggregate. The endpoint performs a bounded
+reverse scan of retained history. When the lower window boundary cuts through
+one stored aggregate, the result may include an older portion of that boundary
+aggregate; values are not proportionally split. IDs are opaque and matched
+exactly after outer whitespace is trimmed.
+Direct-connection byte counts may be unavailable because direct traffic does
+not necessarily traverse the relay.
 
 ## `GET /api/tray`
 
@@ -144,13 +201,9 @@ Service mode:
 
 ## UI activity semantics
 
-The backend treats most `/api/*` calls as evidence of active UI and temporarily enables verbose log capture.
-
-Exceptions that do **not** mark the UI active:
-
-- `/api/health`
-- `/api/tray`
-- `/api/control/stop`
-- `/api/ui/visibility`
-
-This prevents tray polling or hidden-tab bookkeeping from accidentally keeping expensive verbose logging enabled all the time.
+Only `/api/snapshot` and `/api/events` automatically count as evidence of an
+actively viewed UI. An explicit `/api/ui/visibility` request with
+`active=true` also marks it active; `active=false` starts the cooldown. Other
+API calls do not extend the active period. This prevents tray polling, rule
+sparklines, health checks, or control requests from accidentally keeping
+verbose log capture enabled.

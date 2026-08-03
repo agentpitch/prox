@@ -69,6 +69,31 @@ type RuleActivity struct {
 	DownBytes   int64             `json:"down_bytes"`
 }
 
+type RuleActivityBucket struct {
+	Time        time.Time `json:"time"`
+	Connections int64     `json:"connections"`
+	UpBytes     int64     `json:"up_bytes"`
+	DownBytes   int64     `json:"down_bytes"`
+}
+
+type RuleActivitySeries struct {
+	RuleID      string               `json:"rule_id"`
+	RuleName    string               `json:"rule_name,omitempty"`
+	Action      config.RuleAction    `json:"action,omitempty"`
+	Connections int64                `json:"connections"`
+	UpBytes     int64                `json:"up_bytes"`
+	DownBytes   int64                `json:"down_bytes"`
+	Buckets     []RuleActivityBucket `json:"buckets"`
+}
+
+type RuleActivityTimeline struct {
+	GeneratedAt   time.Time            `json:"generated_at"`
+	WindowMinutes int                  `json:"window_minutes"`
+	BucketSeconds float64              `json:"bucket_seconds"`
+	Points        int                  `json:"points"`
+	Series        []RuleActivitySeries `json:"series"`
+}
+
 type Snapshot struct {
 	Connections          []Connection    `json:"connections"`
 	NewConnections       []Connection    `json:"new_connections"`
@@ -201,6 +226,43 @@ func (b *Bus) DeleteDroppedConnections(ids []string) error {
 		return nil
 	}
 	return b.history.DeleteDroppedConnections(ids)
+}
+
+func (b *Bus) RuleActivityTimeline(ruleIDs []string, window time.Duration, points int) (RuleActivityTimeline, error) {
+	if b == nil || b.history == nil {
+		return RuleActivityTimeline{
+			GeneratedAt:   time.Now().UTC(),
+			WindowMinutes: max(1, int(window/time.Minute)),
+			Points:        points,
+			Series:        []RuleActivitySeries{},
+		}, nil
+	}
+	data, err := b.history.RuleActivityTimeline(ruleIDs, window, points)
+	if err != nil {
+		return RuleActivityTimeline{}, err
+	}
+	out := RuleActivityTimeline{
+		GeneratedAt:   data.GeneratedAt,
+		WindowMinutes: data.WindowMinutes,
+		BucketSeconds: data.BucketSeconds,
+		Points:        data.Points,
+		Series:        make([]RuleActivitySeries, len(data.Series)),
+	}
+	for i, series := range data.Series {
+		out.Series[i] = RuleActivitySeries{
+			RuleID:      series.RuleID,
+			RuleName:    series.RuleName,
+			Action:      series.Action,
+			Connections: series.Connections,
+			UpBytes:     series.UpBytes,
+			DownBytes:   series.DownBytes,
+			Buckets:     make([]RuleActivityBucket, len(series.Buckets)),
+		}
+		for j, bucket := range series.Buckets {
+			out.Series[i].Buckets[j] = RuleActivityBucket(bucket)
+		}
+	}
+	return out, nil
 }
 
 func (b *Bus) MarkUIActive() {

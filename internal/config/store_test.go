@@ -32,6 +32,26 @@ func TestStoreLoadsUTF8BOMConfig(t *testing.T) {
 	}
 }
 
+func TestStoreSaveAlwaysAdvancesUpdatedAt(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	initial := store.Get()
+	first, err := store.Save(initial)
+	if err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	second, err := store.Save(first)
+	if err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if !first.UpdatedAt.After(initial.UpdatedAt) || !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Fatalf("updated_at did not advance monotonically: initial=%v first=%v second=%v", initial.UpdatedAt, first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
 func TestCanonicalizeRejectsNonLoopbackHTTPListen(t *testing.T) {
 	for _, listen := range []string{
 		":18080",

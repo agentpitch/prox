@@ -83,6 +83,31 @@ type RuleActivity struct {
 	DownBytes   int64
 }
 
+type RuleActivityBucket struct {
+	Time        time.Time
+	Connections int64
+	UpBytes     int64
+	DownBytes   int64
+}
+
+type RuleActivitySeries struct {
+	RuleID      string
+	RuleName    string
+	Action      config.RuleAction
+	Connections int64
+	UpBytes     int64
+	DownBytes   int64
+	Buckets     []RuleActivityBucket
+}
+
+type RuleActivityTimeline struct {
+	GeneratedAt   time.Time
+	WindowMinutes int
+	BucketSeconds float64
+	Points        int
+	Series        []RuleActivitySeries
+}
+
 type SnapshotData struct {
 	Connections   []ConnectionRecord
 	Logs          []LogRecord

@@ -15,6 +15,13 @@ type Program struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 
+	// lifecycleMu serializes whole user-visible state transitions. Stop releases
+	// it before waiting for HTTP handlers, after publishing stopping=true.
+	lifecycleMu sync.Mutex
+	stopping    bool
+	stopped     bool
+	stopDone    chan struct{}
+
 	httpMu sync.Mutex
 	http   *httpapi.Server
 
@@ -28,7 +35,7 @@ func NewProgram(configPath string, historyPath string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Program{runtime: rt, stopCh: make(chan struct{})}, nil
+	return &Program{runtime: rt, stopCh: make(chan struct{}), stopDone: make(chan struct{})}, nil
 }
 
 func (p *Program) Runtime() *Runtime { return p.runtime }
@@ -40,6 +47,11 @@ func (p *Program) RequestStop() {
 }
 
 func (p *Program) Start(ctx context.Context) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping || p.stopped {
+		return fmt.Errorf("program is stopping")
+	}
 	p.stateMu.Lock()
 	p.ctx = ctx
 	p.paused = false
@@ -47,7 +59,7 @@ func (p *Program) Start(ctx context.Context) error {
 	if err := p.runtime.Start(ctx); err != nil {
 		return err
 	}
-	if err := p.EnableWebUI(); err != nil {
+	if err := p.enableWebUILocked(); err != nil {
 		_ = p.runtime.Stop()
 		return err
 	}
@@ -64,6 +76,15 @@ func (p *Program) WebUIRunning() bool {
 }
 
 func (p *Program) EnableWebUI() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping || p.stopped {
+		return fmt.Errorf("program is stopping")
+	}
+	return p.enableWebUILocked()
+}
+
+func (p *Program) enableWebUILocked() error {
 	p.httpMu.Lock()
 	defer p.httpMu.Unlock()
 	if p.http != nil {
@@ -99,6 +120,12 @@ func (p *Program) EnableWebUI() error {
 }
 
 func (p *Program) DisableWebUI() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	return p.disableWebUILocked()
+}
+
+func (p *Program) disableWebUILocked() error {
 	p.httpMu.Lock()
 	srv := p.http
 	p.httpMu.Unlock()
@@ -116,6 +143,11 @@ func (p *Program) ServicePaused() bool {
 }
 
 func (p *Program) PauseService() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping || p.stopped {
+		return nil
+	}
 	p.stateMu.Lock()
 	if p.paused {
 		p.stateMu.Unlock()
@@ -124,7 +156,7 @@ func (p *Program) PauseService() error {
 	p.paused = true
 	p.stateMu.Unlock()
 
-	if err := p.DisableWebUI(); err != nil {
+	if err := p.disableWebUILocked(); err != nil {
 		return err
 	}
 	if err := p.runtime.Pause(); err != nil {
@@ -135,11 +167,16 @@ func (p *Program) PauseService() error {
 }
 
 func (p *Program) ResumeService() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping || p.stopped {
+		return fmt.Errorf("program is stopping")
+	}
 	p.stateMu.Lock()
 	ctx := p.ctx
 	if !p.paused {
 		p.stateMu.Unlock()
-		return p.EnableWebUI()
+		return p.enableWebUILocked()
 	}
 	p.paused = false
 	p.stateMu.Unlock()
@@ -153,7 +190,7 @@ func (p *Program) ResumeService() error {
 		p.stateMu.Unlock()
 		return err
 	}
-	if err := p.EnableWebUI(); err != nil {
+	if err := p.enableWebUILocked(); err != nil {
 		_ = p.runtime.Pause()
 		p.stateMu.Lock()
 		p.paused = true
@@ -165,6 +202,18 @@ func (p *Program) ResumeService() error {
 }
 
 func (p *Program) Stop() error {
+	p.lifecycleMu.Lock()
+	if p.stopped {
+		p.lifecycleMu.Unlock()
+		return nil
+	}
+	if p.stopping {
+		done := p.stopDone
+		p.lifecycleMu.Unlock()
+		<-done
+		return nil
+	}
+	p.stopping = true
 	p.stateMu.Lock()
 	p.paused = true
 	p.stateMu.Unlock()
@@ -172,6 +221,10 @@ func (p *Program) Stop() error {
 	srv := p.http
 	p.http = nil
 	p.httpMu.Unlock()
+	// Do not hold lifecycleMu while Close waits for HTTP handlers: a handler
+	// may already be waiting to enter PauseService or ResumeService. Once
+	// stopping is visible, those handlers return without starting new work.
+	p.lifecycleMu.Unlock()
 	if srv != nil {
 		_ = srv.Close()
 	}
@@ -179,5 +232,9 @@ func (p *Program) Stop() error {
 		_ = p.runtime.Stop()
 	}
 	p.wg.Wait()
+	p.lifecycleMu.Lock()
+	p.stopped = true
+	close(p.stopDone)
+	p.lifecycleMu.Unlock()
 	return nil
 }

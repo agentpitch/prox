@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.2
 ```
 
-The candidate is written to `build\candidates\v0.43-rc.1\`; it does not replace
+The candidate is written to `build\candidates\v0.43-rc.2\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, verifies the existing root
 `WinDivert.dll`/`WinDivert64.sys` and the tracked upstream license by exact
@@ -123,7 +123,7 @@ download or temporarily unpack duplicate runtime files.
 only together with it. A publishable candidate must report a clean tree,
 completed checks, the injected version, and `vcs.modified=false`.
 
-The `cmd/pitchprox/pitchprox_windows_amd64.syso` resource file is already checked into the repo, so the `pp` icon is embedded by a normal Go build on Windows.
+The `cmd/pitchprox/pitchprox_windows_amd64.syso` resource file is already checked into the repo, so the pitchProx route icon is embedded by a normal Go build on Windows.
 
 ## First run
 
@@ -143,9 +143,12 @@ The WebUI opens on the Rules page and provides:
 
 - sidebar navigation for Monitoring, Rules, Proxies, Chains, Dropped connections, and the event log;
 - local rule search across names, comments, every application/host/port value, actions, proxies, and chains;
-- filters, pagination, compact mode, configurable columns, and atomic bulk operations;
+- filters, pagination, one consistently compact table, configurable columns, and atomic bulk operations;
 - versioned rules-only import/export that never includes proxy credentials;
-- demand-only bounded per-rule activity charts.
+- demand-only bounded per-rule activity charts;
+- lazy Application + Host + Port condition coverage without expanding a rule
+  into a potentially huge Cartesian product; details are coalesced into bounded
+  15-second aggregates so snapshot frequency does not amplify disk writes.
 
 One rule may still contain multiple Applications, Target hosts, and Target ports. These values remain raw strings in the config and keep the syntax documented below.
 
@@ -286,14 +289,15 @@ Desktop mode is optimized for a quiet idle state:
 - verbose `info/debug` logging is captured only while the WebUI is open or recently active;
 - connection/log/rule/traffic history is stored in compact hourly file segments instead of remaining in RAM;
 - when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
+- after one hour without a marked browser request, only WebUI is automatically paused; one lazy deadline timer is used, proxy routing continues unchanged, and **Управление** in the tray enables the interface again;
 - WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception; a shared redirector is opened lazily while at least one selected flow exists and is closed again as soon as the flow table becomes empty;
-- direct-bypass TCP observation now becomes truly dormant when no active UI client is present, instead of continuing periodic full TCP-table scans in the background;
+- direct-bypass TCP observation now becomes truly dormant when no active UI client is present, instead of continuing periodic full TCP-table scans in the background; its WebUI-only PID/path snapshot cache is released on dormancy;
 - owner-PID resolution is refreshed on demand instead of by a hot periodic full-table scan, and cached executable identity is validated with both PID and process creation time;
 - history uses event-driven, batched JSONL writes without SQLite/WAL or an idle polling ticker; incomplete crash tails are truncated and isolated malformed lines are skipped;
 - failed history writes retry at a reduced rate and all emergency in-memory queues are bounded, so a full or unavailable disk cannot make RAM grow indefinitely;
-- large connection maps release their retained capacity after the last connection closes, and the lazy WinDivert cleanup timer sleeps while there are no intercepted flows;
+- large connection maps geometrically release retained high-water capacity as bursts drain, even when one connection stays open, and the lazy WinDivert cleanup timer sleeps while there are no intercepted flows;
 - forced heap release runs only when there is a meaningful amount of reclaimable memory, avoiding periodic GC work in an already-small idle heap;
 - the WebUI snapshot interval is 15 seconds and the configured HTTP listener is restricted to IPv4/IPv6 loopback addresses.
 
@@ -351,7 +355,7 @@ Release executables are currently unsigned. Windows may show a SmartScreen
 warning even though the bundled WinDivert 2.2.2 driver/runtime files are the
 official upstream binaries verified by SHA-256.
 
-The file icon is embedded from `assets/pp_icon_256.png` through the generated resource object `cmd/pitchprox/pitchprox_windows_amd64.syso`. To regenerate it, run:
+The Windows executable/tray icon and the WebUI favicon are generated together from `assets/pp_icon_256.png`; the Windows resource object is `cmd/pitchprox/pitchprox_windows_amd64.syso`. With Pillow available, regenerate all derived icon files with:
 
 ```powershell
 python .\tools\make_icon_syso.py

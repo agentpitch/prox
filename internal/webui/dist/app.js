@@ -48,7 +48,6 @@ let ui = {
     page: 1,
     pageSize: storedRulePageSize(),
     selected: new Set(),
-    compact: readStorage(localStorage, 'pitchprox_rule_compact', '1') !== '0',
     columns: storedRuleColumns(),
     activity: new Map(),
     activityTimer: null,
@@ -82,23 +81,41 @@ let ui = {
   events: null,
   eventsWanted: false,
   eventsRetryTimer: null,
+  eventsRetryAttempt: 0,
   logsInitialized: false,
   logRenderFrame: null,
   editorSave: null,
   editorSession: 0,
   editorSavingSession: 0,
   editorAnalysisTimer: null,
+  editorConditionRequest: null,
+  editorConditionGeneration: 0,
   saving: false,
   statusMessage: '',
   statusTone: 'muted',
   statusTimer: null,
   servicePaused: false,
   serviceBusy: false,
+  webUIPaused: false,
+  webUIAutoPaused: false,
+  webUIDisabledReason: '',
+  webUIIdleDeadlineAt: '',
+  webUIIdleTimeoutSeconds: 3600,
+  webUIIdleTimer: null,
+  webUIStatusRequest: null,
+  webUIStatusGeneration: 0,
+  webUIStatusFailures: 0,
   refreshing: false,
   editorDirty: false,
   initialized: false,
   configLoadGeneration: 0,
   configSaveGeneration: 0,
+  configLoadRequest: null,
+  configReloadOnResume: false,
+  visibilityRequest: null,
+  pendingRouteListener: null,
+  pendingRouteFrame: null,
+  toastTimers: new Map(),
   resizeFrame: null,
 };
 
@@ -253,13 +270,26 @@ function setRoute(nextRoute, options = {}) {
     else renderDroppedDialog();
   }
   ui.routeReady = true;
+  scheduleWebUIIdleCheck();
 }
 
 function runAfterRoute(route, callback) {
+  cancelPendingRouteTask();
   let completed = false;
+  const cleanup = () => {
+    if (ui.pendingRouteListener) {
+      window.removeEventListener('hashchange', ui.pendingRouteListener);
+      ui.pendingRouteListener = null;
+    }
+    if (ui.pendingRouteFrame != null) {
+      cancelAnimationFrame(ui.pendingRouteFrame);
+      ui.pendingRouteFrame = null;
+    }
+  };
   const finish = () => {
     if (completed || ui.route !== route) return;
     completed = true;
+    cleanup();
     callback();
   };
   if (ui.route === route && routeFromHash() === route) {
@@ -267,15 +297,53 @@ function runAfterRoute(route, callback) {
     return;
   }
   const onHashChange = () => {
-    window.removeEventListener('hashchange', onHashChange);
-    if (routeFromHash() === route) requestAnimationFrame(finish);
+    if (routeFromHash() !== route) {
+      cleanup();
+      return;
+    }
+    if (ui.pendingRouteListener === onHashChange) {
+      window.removeEventListener('hashchange', onHashChange);
+      ui.pendingRouteListener = null;
+    }
+    ui.pendingRouteFrame = requestAnimationFrame(() => {
+      ui.pendingRouteFrame = null;
+      finish();
+    });
   };
+  ui.pendingRouteListener = onHashChange;
   window.addEventListener('hashchange', onHashChange);
   setRoute(route);
   if (ui.route === route) {
     window.removeEventListener('hashchange', onHashChange);
-    requestAnimationFrame(finish);
+    ui.pendingRouteListener = null;
+    ui.pendingRouteFrame = requestAnimationFrame(() => {
+      ui.pendingRouteFrame = null;
+      finish();
+    });
   }
+}
+
+function cancelPendingRouteTask() {
+  if (ui.pendingRouteListener) {
+    window.removeEventListener('hashchange', ui.pendingRouteListener);
+    ui.pendingRouteListener = null;
+  }
+  if (ui.pendingRouteFrame != null) {
+    cancelAnimationFrame(ui.pendingRouteFrame);
+    ui.pendingRouteFrame = null;
+  }
+}
+
+function removeToast(toast) {
+  const timer = ui.toastTimers.get(toast);
+  if (timer != null) clearTimeout(timer);
+  ui.toastTimers.delete(toast);
+  toast.remove();
+}
+
+function clearToasts() {
+  for (const toast of Array.from(ui.toastTimers.keys())) removeToast(toast);
+  $('toastRegion')?.replaceChildren();
 }
 
 function showToast(message, tone = 'muted', ms = 3800) {
@@ -284,8 +352,10 @@ function showToast(message, tone = 'muted', ms = 3800) {
   const toast = document.createElement('div');
   toast.className = `toast${tone === 'error' ? ' error' : (tone === 'warn' ? ' warn' : '')}`;
   toast.textContent = message;
+  while (region.children.length >= 4) removeToast(region.firstElementChild);
   region.appendChild(toast);
-  setTimeout(() => toast.remove(), ms);
+  const timer = setTimeout(() => removeToast(toast), ms);
+  ui.toastTimers.set(toast, timer);
 }
 
 async function loadHealth() {
@@ -297,21 +367,162 @@ async function loadHealth() {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const headers = new Headers(opts.headers || {});
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  headers.set('X-PitchProx-WebUI', '1');
+  const res = await fetch(path, { ...opts, headers });
   if (!res.ok) {
     const error = new Error(await res.text());
     error.status = res.status;
+    if (res.status === 503 && !String(path).startsWith('/api/control/webui/')) void loadWebUIStatus();
     throw error;
   }
   if (res.status === 204) return null;
   return res.json();
 }
 
+function clearWebUIIdleTimer() {
+  if (ui.webUIIdleTimer != null) {
+    clearTimeout(ui.webUIIdleTimer);
+    ui.webUIIdleTimer = null;
+  }
+}
+
+function cancelWebUIStatusRequest() {
+  ui.webUIStatusGeneration += 1;
+  if (ui.webUIStatusRequest) {
+    ui.webUIStatusRequest.abort();
+    ui.webUIStatusRequest = null;
+  }
+  renderWebUIStatus();
+}
+
+function stopWebUIBackgroundWork() {
+  leaveLiveMode(false, false);
+  stopRuleActivityPolling();
+  suspendDroppedLoading();
+  releaseCurrentViewForSuspension();
+}
+
+function renderWebUIStatus() {
+  const banner = $('webUIIdleBanner');
+  document.body.classList.toggle('webui-paused', !!ui.webUIPaused);
+  if (!banner) return;
+  banner.hidden = !ui.webUIPaused;
+  const title = $('webUIIdleTitle');
+  const text = $('webUIIdleText');
+  const check = $('webUIStatusCheckBtn');
+  if (title) title.textContent = ui.webUIAutoPaused ? 'WebUI автоматически приостановлен' : 'WebUI приостановлен';
+  if (text) {
+    const timeoutMinutes = Math.max(1, Math.round(Number(ui.webUIIdleTimeoutSeconds || 3600) / 60));
+    text.textContent = ui.webUIAutoPaused
+      ? `После ${timeoutMinutes} минут без обращений WebUI освободил ресурсы. Проксирование и правила продолжают работать. Возобновите WebUI через меню pitchProx в области уведомлений.`
+      : 'Проксирование продолжает работать. Возобновите WebUI через меню pitchProx в области уведомлений.';
+  }
+  if (check) check.disabled = !!ui.webUIStatusRequest;
+}
+
+function scheduleWebUIIdleCheck(afterStatusCheck = false) {
+  clearWebUIIdleTimer();
+  if (ui.webUIPaused || document.hidden) return;
+  const delay = rulesUI.nextWebUIIdleDelay(
+    ui.webUIIdleDeadlineAt,
+    Date.now(),
+    ui.webUIStatusFailures,
+    afterStatusCheck,
+  );
+  if (delay == null) return;
+  ui.webUIIdleTimer = setTimeout(async () => {
+    ui.webUIIdleTimer = null;
+    await loadWebUIStatus();
+    if (!ui.webUIPaused) scheduleWebUIIdleCheck(true);
+  }, delay);
+}
+
+function applyWebUIStatus(data) {
+  if (!data || typeof data !== 'object') return false;
+  const status = rulesUI.normalizeWebUIStatus(data);
+  ui.servicePaused = status.servicePaused;
+  ui.webUIPaused = status.webUIPaused;
+  ui.webUIAutoPaused = status.webUIAutoPaused;
+  ui.webUIDisabledReason = status.disabledReason;
+  ui.webUIIdleDeadlineAt = status.idleDeadlineAt;
+  ui.webUIIdleTimeoutSeconds = status.idleTimeoutSeconds;
+  renderServicePauseToggle();
+  renderWebUIStatus();
+  updateStatusLine();
+  if (ui.webUIPaused) {
+    clearWebUIIdleTimer();
+    stopWebUIBackgroundWork();
+  } else if (ui.servicePaused) {
+    stopWebUIBackgroundWork();
+    scheduleWebUIIdleCheck(true);
+  } else {
+    scheduleWebUIIdleCheck(true);
+  }
+  return true;
+}
+
+async function loadWebUIStatus() {
+  if (ui.webUIStatusRequest) return false;
+  const generation = ui.webUIStatusGeneration + 1;
+  ui.webUIStatusGeneration = generation;
+  const controller = new AbortController();
+  ui.webUIStatusRequest = controller;
+  renderWebUIStatus();
+  try {
+    const data = await api('/api/control/webui/status', { signal: controller.signal });
+    if (ui.webUIStatusRequest !== controller || generation !== ui.webUIStatusGeneration) return false;
+    ui.webUIStatusFailures = 0;
+    return applyWebUIStatus(data);
+  } catch (error) {
+    if (!isAbortError(error)) {
+      ui.webUIStatusFailures = Math.min(5, ui.webUIStatusFailures + 1);
+      console.error(error);
+    }
+    return false;
+  } finally {
+    if (ui.webUIStatusRequest === controller) {
+      ui.webUIStatusRequest = null;
+      renderWebUIStatus();
+    }
+  }
+}
+
+async function recheckWebUIStatus() {
+  const wasPaused = ui.webUIPaused;
+  const checked = await loadWebUIStatus();
+  if (!checked) {
+    showToast('Не удалось проверить состояние WebUI', 'error');
+    return false;
+  }
+  if (ui.webUIPaused) {
+    showToast('WebUI всё ещё приостановлен. Возобновите его из меню pitchProx в трее.', 'warn', 6000);
+    return false;
+  }
+  if (wasPaused || !state) {
+    try {
+      await loadConfig({ force: true });
+      ui.initialized = true;
+      setRoute(ui.route, { updateHash: false });
+      await resumeCurrentRouteLifecycle(true);
+      flashStatus('WebUI возобновлён');
+    } catch (error) {
+      console.error(error);
+      flashStatus(`WebUI включён, но данные не загрузились: ${error.message}`, 'error', 7000);
+      return false;
+    }
+  }
+  return true;
+}
+
 function renderServicePauseToggle() {
   const toggle = $('servicePauseToggle');
   if (!toggle) return;
   toggle.checked = !!ui.servicePaused;
-  toggle.disabled = !!ui.serviceBusy;
+  toggle.disabled = !!ui.serviceBusy || !!ui.webUIPaused;
+  const settings = $('settingsBtn');
+  if (settings) settings.disabled = !!ui.webUIPaused;
   document.body.classList.toggle('service-paused', !!ui.servicePaused);
   const card = document.querySelector('.system-card');
   const text = $('systemStateText');
@@ -331,13 +542,24 @@ async function loadServiceStatus() {
 }
 
 async function resumeCurrentRouteLifecycle(forceRefresh = true) {
-  if (!ui.initialized || document.hidden || ui.servicePaused) {
+  if (!ui.initialized || document.hidden || ui.servicePaused || ui.webUIPaused) {
     void postUIVisibility(false);
     return false;
   }
+  if (ui.configReloadOnResume || !state) {
+    const loaded = await loadConfig();
+    if (!loaded && !state) return false;
+    if (loaded) ui.configReloadOnResume = false;
+  }
   if (routeNeedsLive()) return enterLiveMode(forceRefresh);
-  if (ui.route === 'rules') startRuleActivityPolling(true);
-  if (ui.route === 'dropped') await loadDropped();
+  if (ui.route === 'rules') {
+    renderRules();
+    startRuleActivityPolling(true);
+  }
+  if (ui.route === 'dropped') {
+    ui.dropped.open = true;
+    await loadDropped();
+  }
   void postUIVisibility(false);
   return true;
 }
@@ -349,6 +571,7 @@ async function setServicePaused(paused) {
     if (paused) {
       leaveLiveMode(false);
       stopRuleActivityPolling();
+      releaseCurrentViewForSuspension();
     }
     const action = paused ? 'pause' : 'resume';
     const data = await api(`/api/control/service/${action}`, { method: 'POST', body: '{}' });
@@ -365,7 +588,7 @@ async function setServicePaused(paused) {
     console.error(e);
     flashStatus(`Не удалось ${paused ? 'приостановить' : 'запустить'} сервис: ${e.message}`, 'error', 7000);
     await loadServiceStatus().catch(() => {});
-    if (!ui.servicePaused) await resumeCurrentRouteLifecycle(true);
+    if (!ui.servicePaused && !ui.webUIPaused) await resumeCurrentRouteLifecycle(true);
   } finally {
     ui.serviceBusy = false;
     renderServicePauseToggle();
@@ -682,6 +905,13 @@ function updateStatusLine() {
     el.className = ui.statusTone === 'error' ? 'status-error' : (ui.statusTone === 'warn' ? 'status-warn' : 'muted');
     return;
   }
+  if (ui.webUIPaused) {
+    el.textContent = ui.webUIAutoPaused
+      ? 'WebUI автоматически приостановлен; проксирование продолжает работать.'
+      : 'WebUI приостановлен; проксирование продолжает работать.';
+    el.className = 'status-warn';
+    return;
+  }
   if (ui.servicePaused) {
     el.textContent = 'Сервис приостановлен. Слежение, правила и WebUI-обновления остановлены.';
     el.className = 'status-warn';
@@ -769,7 +999,7 @@ async function persistState(nextState, successMessage = 'Сохранено') {
   const transient = captureTransientState(nextState);
   const saveGeneration = ui.configSaveGeneration + 1;
   ui.configSaveGeneration = saveGeneration;
-  ui.configLoadGeneration += 1;
+  cancelConfigLoadRequest();
   ui.saving = true;
   updateStatusLine();
   try {
@@ -825,16 +1055,39 @@ async function applyStateChange(mutator, successMessage = 'Сохранено') 
 
 async function loadConfig(options = {}) {
   if (ui.saving && !options.force) return false;
+  if (ui.configLoadRequest) {
+    ui.configLoadRequest.abort();
+    ui.configLoadRequest = null;
+  }
   const generation = ui.configLoadGeneration + 1;
   const saveGeneration = ui.configSaveGeneration;
   const transient = options.transient || captureTransientState(state);
   ui.configLoadGeneration = generation;
-  const loaded = await api('/api/config');
-  if (generation !== ui.configLoadGeneration || saveGeneration !== ui.configSaveGeneration) return false;
-  state = restoreTransientState(loaded, transient);
-  pruneRuleSelection();
-  renderAll();
-  return true;
+  const controller = new AbortController();
+  ui.configLoadRequest = controller;
+  try {
+    const loaded = await api('/api/config', { signal: controller.signal });
+    if (ui.configLoadRequest !== controller || generation !== ui.configLoadGeneration || saveGeneration !== ui.configSaveGeneration) return false;
+    state = restoreTransientState(loaded, transient);
+    pruneRuleSelection();
+    renderAll();
+    return true;
+  } catch (error) {
+    if (isAbortError(error) || generation !== ui.configLoadGeneration) return false;
+    throw error;
+  } finally {
+    if (ui.configLoadRequest === controller) ui.configLoadRequest = null;
+  }
+}
+
+function cancelConfigLoadRequest() {
+  const cancelled = !!ui.configLoadRequest;
+  ui.configLoadGeneration += 1;
+  if (ui.configLoadRequest) {
+    ui.configLoadRequest.abort();
+    ui.configLoadRequest = null;
+  }
+  return cancelled;
 }
 
 function buildSnapshotURL(options = {}) {
@@ -1092,15 +1345,21 @@ function ruleCountText(count) {
   return `${n} правил`;
 }
 
+function activationCountText(count) {
+  const n = Math.max(0, Number(count || 0));
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${n.toLocaleString()} срабатывание`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return `${n.toLocaleString()} срабатывания`;
+  return `${n.toLocaleString()} срабатываний`;
+}
+
 function renderRuleValue(raw, kind) {
   const preview = rulesUI.previewValues(raw, kind === 'ports' ? 1 : 2);
   const values = preview.values.length ? preview.values : ['Any'];
   const visible = preview.values.length ? preview.visible : ['Any'];
   const title = escapeHtml(values.join('\n'));
-  const symbol = kind === 'applications'
-    ? `<span class="app-symbol" aria-hidden="true">${escapeHtml((visible[0] || '*').replace(/^.*[\\/]/, '').slice(0, 2) || '*')}</span>`
-    : '';
-  return `<div class="value-stack" title="${title}">${symbol}${visible.map((value) => `<span class="value-chip">${escapeHtml(value)}</span>`).join('')}${preview.hidden ? `<span class="value-more">+${preview.hidden}</span>` : ''}</div>`;
+  return `<div class="value-stack" title="${title}">${visible.map((value) => `<span class="value-chip">${escapeHtml(value)}</span>`).join('')}${preview.hidden ? `<span class="value-more">+${preview.hidden}</span>` : ''}</div>`;
 }
 
 function ruleRouteMarkup(rule) {
@@ -1138,7 +1397,7 @@ function ruleActivityMarkup(rule, statsMaps) {
   const windowMinutes = Number(stat.window_minutes || Math.min(retentionMinutes(), 60));
   const rate = windowMinutes > 0 ? connections / windowMinutes : 0;
   const rateText = rate >= 10 ? Math.round(rate).toLocaleString() : rate.toFixed(rate > 0 && rate < 1 ? 1 : 0);
-  return `<div class="activity-cell" title="За последние ${windowMinutes} мин: вход ${escapeHtml(formatBytes(stat.down_bytes || 0))}, исход ${escapeHtml(formatBytes(stat.up_bytes || 0))}"><div class="activity-values"><div class="activity-bytes">${escapeHtml(bytesText)}</div><div class="activity-connections">▲ ${escapeHtml(rateText)} соед./мин</div></div>${sparklineMarkup(stat)}</div>`;
+  return `<div class="activity-cell-wrap"><div class="activity-cell" title="За последние ${windowMinutes} мин: вход ${escapeHtml(formatBytes(stat.down_bytes || 0))}, исход ${escapeHtml(formatBytes(stat.up_bytes || 0))}"><div class="activity-values"><div class="activity-bytes">${escapeHtml(bytesText)}</div><div class="activity-connections">▲ ${escapeHtml(rateText)} соед./мин</div></div>${sparklineMarkup(stat)}</div><button type="button" class="condition-details-link" data-action="condition-activity">Детали условий</button></div>`;
 }
 
 function renderRulePager(page) {
@@ -1216,12 +1475,6 @@ function renderRuleColumnState() {
       checkbox.closest('label').title = autoHidden ? 'Столбец временно скрыт на этой ширине окна' : '';
     }
   }
-  table.classList.toggle('compact', ui.rules.compact);
-  const compact = $('compactRulesBtn');
-  if (compact) {
-    compact.setAttribute('aria-pressed', ui.rules.compact ? 'true' : 'false');
-    compact.textContent = ui.rules.compact ? '☷ Компактно' : '☰ Просторно';
-  }
 }
 
 function ruleActivityShouldRun() {
@@ -1292,7 +1545,7 @@ function renderRules() {
         <td class="col-ports">${renderRuleValue(rule.target_ports, 'ports')}</td>
         <td class="col-route">${route}</td>
         <td class="col-activity" data-rule-activity="${escapeHtml(ruleId)}">${ruleActivityMarkup(rule, statsMaps)}</td>
-        <td class="col-actions"><details class="row-menu"><summary aria-label="Действия с правилом">•••</summary><div class="row-menu-popover"><button type="button" data-action="edit">Изменить</button><button type="button" data-action="duplicate">Дублировать</button><button type="button" data-action="delete">Удалить</button></div></details></td>
+        <td class="col-actions"><details class="row-menu"><summary aria-label="Действия с правилом">•••</summary><div class="row-menu-popover"><button type="button" data-action="edit">Изменить</button><button type="button" data-action="condition-activity">Активность условий</button><button type="button" data-action="duplicate">Дублировать</button><button type="button" data-action="delete">Удалить</button></div></details></td>
       </tr>`;
   }).join('');
 }
@@ -1310,7 +1563,7 @@ function renderRuleActivityCells() {
 
 function scheduleRuleActivityRefresh(delay = 350) {
   stopRuleActivityPolling();
-  if (ui.route !== 'rules' || document.hidden || ui.servicePaused || !ruleActivityShouldRun()) return;
+  if (ui.route !== 'rules' || document.hidden || ui.servicePaused || ui.webUIPaused || !ruleActivityShouldRun()) return;
   const generation = ui.rules.activityGeneration;
   ui.rules.activityTimer = setTimeout(() => {
     ui.rules.activityTimer = null;
@@ -1319,7 +1572,7 @@ function scheduleRuleActivityRefresh(delay = 350) {
 }
 
 async function loadRuleActivity() {
-  if (!state || ui.route !== 'rules' || document.hidden || ui.servicePaused || !ruleActivityShouldRun() || ui.rules.activityLoading) return;
+  if (!state || ui.route !== 'rules' || document.hidden || ui.servicePaused || ui.webUIPaused || !ruleActivityShouldRun() || ui.rules.activityLoading) return;
   const { page } = currentRulePage();
   const ids = page.items.map((entry) => entry.ruleId).filter(Boolean).slice(0, 50);
   if (!ids.length) {
@@ -1359,7 +1612,7 @@ async function loadRuleActivity() {
 
 async function runRuleActivityPoll(generation = ui.rules.activityGeneration) {
   await loadRuleActivity();
-  if (generation === ui.rules.activityGeneration && ui.route === 'rules' && !document.hidden && !ui.servicePaused && ruleActivityShouldRun()) {
+  if (generation === ui.rules.activityGeneration && ui.route === 'rules' && !document.hidden && !ui.servicePaused && !ui.webUIPaused && ruleActivityShouldRun()) {
     ui.rules.activityTimer = setTimeout(() => {
       ui.rules.activityTimer = null;
       void runRuleActivityPoll(generation);
@@ -1566,6 +1819,7 @@ function handleRulesTableClick(event) {
   const ruleID = row?.getAttribute('data-rule-row') || '';
   const action = actionElement.getAttribute('data-action');
   if (action === 'edit') openRuleEditor(ruleID);
+  else if (action === 'condition-activity') openRuleEditor(ruleID, { focusConditionActivity: true });
   else if (action === 'up') void changeRuleOrder(ruleID, -1);
   else if (action === 'down') void changeRuleOrder(ruleID, 1);
   else if (action === 'duplicate') duplicateRule(ruleID);
@@ -1691,11 +1945,6 @@ function setupRulesUI() {
     input.value = '';
     await handleRulesImportFile(file);
   };
-  $('compactRulesBtn').onclick = () => {
-    ui.rules.compact = !ui.rules.compact;
-    writeStorage(localStorage, 'pitchprox_rule_compact', ui.rules.compact ? '1' : '0');
-    renderRuleColumnState();
-  };
   document.querySelectorAll('[data-rule-column]').forEach((checkbox) => {
     checkbox.onchange = () => {
       const column = checkbox.getAttribute('data-rule-column');
@@ -1731,6 +1980,130 @@ function clearRuleEditorAnalysisTimer() {
   }
 }
 
+function cancelRuleConditionActivity() {
+  ui.editorConditionGeneration += 1;
+  if (ui.editorConditionRequest) {
+    ui.editorConditionRequest.abort();
+    ui.editorConditionRequest = null;
+  }
+}
+
+function conditionLastSeenText(value) {
+  const timestamp = Date.parse(value || '');
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : 'нет данных';
+}
+
+function conditionCoverageMarkup(label, raw, dimension, kind) {
+  const coverage = rulesUI.buildConditionCoverage(raw, dimension, 100, kind);
+  const rows = coverage.items.map((item) => {
+    let status = 'не попало в наблюдаемую выборку';
+    if (item.state === 'observed') {
+      const percent = Math.max(0, Math.min(100, Number(item.share || 0) * 100));
+      status = `${Number(item.hits || 0).toLocaleString()} · ${percent >= 10 ? Math.round(percent) : percent.toFixed(1)}%`;
+    } else if (item.state === 'zero') {
+      status = '0 · нет наблюдавшихся срабатываний';
+    }
+    return `<div class="condition-coverage-row coverage-${escapeHtml(item.state)}"><span title="${escapeHtml(item.token)}">${escapeHtml(truncate(item.token, 46))}</span><strong>${escapeHtml(status)}</strong></div>`;
+  }).join('');
+  const note = coverage.omitted > 0 ? `<div class="condition-coverage-omitted">Ещё ${coverage.omitted.toLocaleString()} значений не показано</div>` : '';
+  return `<section class="condition-coverage-axis"><h4>${escapeHtml(label)}</h4>${rows || '<div class="condition-coverage-omitted">Значений нет</div>'}${note}</section>`;
+}
+
+function renderRuleConditionActivity(data, rule) {
+  const box = $('ed_condition_activity');
+  const meta = $('ed_condition_activity_meta');
+  const coverage = $('ed_condition_coverage');
+  if (!box || !meta || !coverage) return;
+  const conditions = Array.isArray(data?.conditions) ? data.conditions : [];
+  const totalHits = Number(data?.total_hits || 0);
+  const otherHits = Number(data?.other_hits || 0);
+  const unattributedHits = Number(data?.unattributed_hits || 0);
+  meta.textContent = `${activationCountText(totalHits)} за ${Number(data?.window_minutes || 15)} мин`;
+  coverage.innerHTML = [
+    conditionCoverageMarkup('Applications', rule?.applications, data?.dimensions?.applications, 'applications'),
+    conditionCoverageMarkup('Hosts', rule?.target_hosts, data?.dimensions?.hosts, 'hosts'),
+    conditionCoverageMarkup('Ports', rule?.target_ports, data?.dimensions?.ports, 'ports'),
+  ].join('');
+  if (!conditions.length) {
+    box.innerHTML = totalHits > 0
+      ? `<div class="condition-activity-empty">${escapeHtml(activationCountText(totalHits))} были учтены, но фактические связки не удалось атрибутировать или они не попали в ограниченную выборку.</div>`
+      : '<div class="condition-activity-empty">За выбранное окно наблюдаемых срабатываний не было.</div>';
+  } else {
+    box.innerHTML = conditions.map((condition) => {
+      const share = Math.max(0, Math.min(1, Number(condition.share || 0)));
+      const percent = share * 100;
+      const percentText = percent >= 10 ? Math.round(percent).toLocaleString() : percent.toFixed(percent > 0 && percent < 1 ? 1 : 0);
+      const sources = [];
+      if (condition.sources?.intercepted) sources.push(`перехвачено: ${Number(condition.sources.intercepted).toLocaleString()}`);
+      if (condition.sources?.direct_observer) sources.push(`наблюдатель Direct: ${Number(condition.sources.direct_observer).toLocaleString()}`);
+      return `
+        <div class="condition-activity-row">
+          <div class="condition-tuple" title="${escapeHtml(`${condition.application} → ${condition.host}:${condition.port}`)}">
+            <span>${escapeHtml(truncate(condition.application, 54))}</span><b aria-hidden="true">›</b>
+            <span>${escapeHtml(truncate(condition.host, 54))}</span><b aria-hidden="true">:</b>
+            <span>${escapeHtml(condition.port)}</span>
+          </div>
+          <div class="condition-count"><strong>${Number(condition.hits || 0).toLocaleString()}</strong><span>${escapeHtml(percentText)}%</span></div>
+          <div class="condition-share" role="img" aria-label="Доля ${escapeHtml(percentText)}%"><i style="width:${percent.toFixed(2)}%"></i></div>
+          <div class="condition-source">${escapeHtml(sources.join(' · ') || 'источник не указан')} · последнее ${escapeHtml(conditionLastSeenText(condition.last_seen))}</div>
+        </div>`;
+    }).join('');
+  }
+  const footnotes = [];
+  if (otherHits > 0) footnotes.push(`Прочие связки: ${activationCountText(otherHits)}`);
+  if (unattributedHits > 0) footnotes.push(`Не удалось атрибутировать к связке: ${activationCountText(unattributedHits)} (входит в прочие)`);
+  if (data?.malformed_conditions > 0) footnotes.push(`Повреждённые записи пропущены: ${Number(data.malformed_conditions).toLocaleString()}`);
+  if (data?.truncated) footnotes.push('Показаны наиболее частые сочетания');
+  if (data?.accuracy?.notice) footnotes.push(String(data.accuracy.notice));
+  else if (data?.accuracy?.direct_complete === false) footnotes.push('Учёт Direct-соединений может быть неполным');
+  if (footnotes.length) box.insertAdjacentHTML('beforeend', `<div class="condition-activity-note">${footnotes.map(escapeHtml).join(' · ')}</div>`);
+}
+
+async function loadRuleConditionActivity(ruleID, editorSession) {
+  if (!ruleID || ui.webUIPaused || editorSession !== ui.editorSession || !$('editorDialog')?.open) return false;
+  cancelRuleConditionActivity();
+  const generation = ui.editorConditionGeneration;
+  const controller = new AbortController();
+  ui.editorConditionRequest = controller;
+  const box = $('ed_condition_activity');
+  const meta = $('ed_condition_activity_meta');
+  const coverage = $('ed_condition_coverage');
+  const refresh = $('ed_condition_activity_refresh');
+  const windowMinutes = Math.max(1, Math.min(60, Number($('ed_condition_activity_window')?.value || 15)));
+  if (box) box.innerHTML = '<div class="condition-activity-empty">Загрузка…</div>';
+  if (coverage) coverage.innerHTML = '<div class="condition-activity-empty">Загрузка покрытия…</div>';
+  if (meta) meta.textContent = `Окно ${windowMinutes} мин`;
+  if (refresh) {
+    refresh.dataset.conditionLoading = '1';
+    refresh.disabled = true;
+  }
+  try {
+    const params = new URLSearchParams({ id: ruleID, window_minutes: String(windowMinutes), limit: '20' });
+    const payload = await api(`/api/rules/condition-activity?${params.toString()}`, { signal: controller.signal });
+    if (generation !== ui.editorConditionGeneration || ui.editorConditionRequest !== controller || editorSession !== ui.editorSession) return false;
+    const ruleIndex = findRuleIndexByID(ruleID);
+    const appliedRule = ruleIndex >= 0 ? state?.rules?.[ruleIndex] : null;
+    if (!appliedRule) throw new Error('Сохранённое правило больше не найдено');
+    renderRuleConditionActivity(rulesUI.normalizeConditionActivity(payload, ruleID, 20), appliedRule);
+    return true;
+  } catch (error) {
+    if (isAbortError(error) || generation !== ui.editorConditionGeneration || editorSession !== ui.editorSession) return false;
+    console.error(error);
+    if (box) box.innerHTML = `<div class="condition-activity-empty status-error">Не удалось загрузить детали: ${escapeHtml(error.message || String(error))}</div>`;
+    if (coverage) coverage.innerHTML = '<div class="condition-activity-empty status-error">Покрытие условий недоступно.</div>';
+    if (meta) meta.textContent = 'Данные недоступны';
+    return false;
+  } finally {
+    if (ui.editorConditionRequest === controller) {
+      ui.editorConditionRequest = null;
+      if (refresh && editorSession === ui.editorSession) {
+        delete refresh.dataset.conditionLoading;
+        if (ui.editorSavingSession !== editorSession) refresh.disabled = false;
+      }
+    }
+  }
+}
+
 function scheduleRuleEditorAnalysis(originalRuleID) {
   clearRuleEditorAnalysisTimer();
   ui.editorAnalysisTimer = setTimeout(() => {
@@ -1759,6 +2132,8 @@ function setEditorBusy(session, busy) {
     control.disabled = control.dataset.editorBusyWasDisabled === '1';
     delete control.dataset.editorBusyWasDisabled;
   });
+  const conditionRefresh = $('ed_condition_activity_refresh');
+  if (conditionRefresh && !conditionRefresh.dataset.conditionLoading) conditionRefresh.disabled = false;
   dialog.removeAttribute('aria-busy');
   ui.editorSavingSession = 0;
   return true;
@@ -1795,8 +2170,8 @@ function openEditor({ title, hint, bodyHTML, onSave, extraActionsHTML = '', onOp
   ui.editorDirty = false;
   dialog.showModal();
   const body = $('editorBody');
-  body.oninput = () => { ui.editorDirty = true; };
-  body.onchange = () => { ui.editorDirty = true; };
+  body.oninput = (event) => { if (!event.target.closest('[data-editor-transient]')) ui.editorDirty = true; };
+  body.onchange = (event) => { if (!event.target.closest('[data-editor-transient]')) ui.editorDirty = true; };
   if (typeof onOpen === 'function') onOpen(session);
   return session;
 }
@@ -1811,6 +2186,7 @@ function closeEditor(force = false, expectedSession = null) {
   if (!force && dialog.open && ui.editorDirty && !confirm('Закрыть редактор и потерять несохранённые изменения?')) return false;
   if (ui.editorSavingSession === ui.editorSession) setEditorBusy(ui.editorSession, false);
   clearRuleEditorAnalysisTimer();
+  cancelRuleConditionActivity();
   if (dialog.open) dialog.close();
   const body = $('editorBody');
   const extra = $('editorExtraActions');
@@ -1980,6 +2356,39 @@ function openRuleEditor(target, options = {}) {
       <button id="editorDuplicateRuleBtn" type="button" class="rule-duplicate-btn">Дублировать</button>
       <button id="editorDeleteRuleBtn" type="button" class="rule-delete-btn">Удалить</button>
     `;
+  const conditionActivityHTML = isDraft ? '' : `
+      <details id="ed_condition_activity_details" class="editor-details condition-activity-details" data-editor-transient ${options.focusConditionActivity ? 'open' : ''}>
+        <summary>Фактические срабатывания условий</summary>
+        <div class="condition-activity-panel">
+          <div class="condition-activity-head">
+            <div>
+              <strong>Наблюдаемая активность применённой версии правила</strong>
+              <span id="ed_condition_activity_meta" class="hint">Данные загрузятся при открытии раздела</span>
+              <span class="condition-saved-note">Несохранённые правки не учитываются; окно может включать предыдущую сохранённую редакцию этого ID.</span>
+            </div>
+            <div class="condition-activity-controls">
+              <label>Окно
+                <select id="ed_condition_activity_window" data-editor-transient>
+                  <option value="5">5 мин</option>
+                  <option value="15" selected>15 мин</option>
+                  <option value="60">60 мин</option>
+                </select>
+              </label>
+              <button id="ed_condition_activity_refresh" type="button" data-editor-transient>Обновить</button>
+            </div>
+          </div>
+          <section class="condition-coverage-section">
+            <div class="condition-subhead"><strong>Покрытие условий</strong><span>Каждое исходное значение оценивается отдельно, без построения всех комбинаций.</span></div>
+            <div id="ed_condition_coverage" class="condition-coverage-grid"></div>
+          </section>
+          <section class="condition-combinations-section">
+            <div class="condition-subhead"><strong>Частые фактические связки</strong><span>Application › host : port — одно наблюдавшееся TCP-соединение считается одним срабатыванием.</span></div>
+          <div id="ed_condition_activity" class="condition-activity-list" aria-live="polite">
+            <div class="condition-activity-empty">Откройте раздел, чтобы загрузить детали.</div>
+          </div>
+          </section>
+        </div>
+      </details>`;
   openEditor({
     title: isDraft ? 'Новое правило' : 'Редактирование правила',
     hint: isDraft
@@ -2022,6 +2431,8 @@ function openRuleEditor(target, options = {}) {
         <div id="ed_similar_rules" class="analysis-box"></div>
       </div>
 
+      ${conditionActivityHTML}
+
       <details class="editor-details">
         <summary>Дополнительно: стабильный ID правила</summary>
         <div><label>ID<input id="ed_id" type="text" value="${escapeHtml(src.id || '')}" placeholder="rule_unique_id"><span class="hint">ID используется статистикой и импортом. Меняйте его только при необходимости.</span></label></div>
@@ -2043,6 +2454,25 @@ function openRuleEditor(target, options = {}) {
       }
       updateRuleEditorAnalysis(originalRuleID);
       if (isDraft) return;
+      const activityDetails = $('ed_condition_activity_details');
+      const refreshConditionActivity = () => void loadRuleConditionActivity(originalRuleID, editorSession);
+      if (activityDetails) {
+        activityDetails.addEventListener('toggle', () => {
+          if (activityDetails.open && !activityDetails.dataset.loaded) {
+            activityDetails.dataset.loaded = '1';
+            refreshConditionActivity();
+          }
+        });
+      }
+      const conditionWindow = $('ed_condition_activity_window');
+      if (conditionWindow) conditionWindow.addEventListener('change', refreshConditionActivity);
+      const conditionRefresh = $('ed_condition_activity_refresh');
+      if (conditionRefresh) conditionRefresh.onclick = refreshConditionActivity;
+      if (activityDetails?.open) {
+        activityDetails.dataset.loaded = '1';
+        refreshConditionActivity();
+        activityDetails.scrollIntoView({ block: 'nearest' });
+      }
       const dupBtn = $('editorDuplicateRuleBtn');
       if (dupBtn) dupBtn.onclick = () => {
         const currentIndex = findRuleIndexByID(originalRuleID);
@@ -2386,7 +2816,7 @@ function suspendDroppedLoading() {
 }
 
 async function loadDropped(options = {}) {
-  if (ui.route !== 'dropped') return false;
+  if (ui.route !== 'dropped' || document.hidden || ui.servicePaused || ui.webUIPaused) return false;
   if (options.resetOffset) ui.dropped.offset = 0;
   cancelDroppedRequest();
   const generation = ui.dropped.generation;
@@ -2433,6 +2863,7 @@ function releaseMonitorView() {
   snapshot.new_connections = [];
   snapshot.traffic = [];
   snapshot.traffic_totals = { up_bytes: 0, down_bytes: 0 };
+  snapshot.rule_stats = [];
   $('connectionsTable')?.querySelector('tbody')?.replaceChildren();
   if ($('connectionSummary')) $('connectionSummary').textContent = '';
   $('activityStats')?.replaceChildren();
@@ -2440,6 +2871,32 @@ function releaseMonitorView() {
   if (canvas) {
     canvas.width = 0;
     canvas.height = 0;
+  }
+}
+
+function releaseEditorConditionView() {
+  cancelRuleConditionActivity();
+  const details = $('ed_condition_activity_details');
+  if (!details) return;
+  details.open = false;
+  delete details.dataset.loaded;
+  const coverage = $('ed_condition_coverage');
+  const activity = $('ed_condition_activity');
+  if (coverage) coverage.replaceChildren();
+  if (activity) activity.innerHTML = '<div class="condition-activity-empty">Откройте раздел, чтобы загрузить детали.</div>';
+  const meta = $('ed_condition_activity_meta');
+  if (meta) meta.textContent = 'Данные освобождены, пока вкладка неактивна';
+}
+
+function releaseCurrentViewForSuspension() {
+  if (ui.route === 'rules') releaseRulesView();
+  else if (ui.route === 'monitor') releaseMonitorView();
+  else if (ui.route === 'logs') releaseLogView();
+  else if (ui.route === 'dropped') closeDroppedDialog();
+  releaseEditorConditionView();
+  if (ui.resizeFrame != null) {
+    cancelAnimationFrame(ui.resizeFrame);
+    ui.resizeFrame = null;
   }
 }
 
@@ -2820,13 +3277,16 @@ function handleLiveEvent(event) {
     case 'log':
       applyLogEntry(event.data);
       break;
+    case 'webui_status':
+      applyWebUIStatus(event.data);
+      break;
     default:
       break;
   }
 }
 
 async function backfillLiveLogs(generation, eventSource) {
-  if (generation !== ui.liveGeneration || ui.route !== 'logs' || ui.events !== eventSource || document.hidden || ui.servicePaused) return false;
+  if (generation !== ui.liveGeneration || ui.route !== 'logs' || ui.events !== eventSource || document.hidden || ui.servicePaused || ui.webUIPaused) return false;
   try {
     return await loadTrackedSnapshot({
       includeLogs: true,
@@ -2844,7 +3304,7 @@ async function backfillLiveLogs(generation, eventSource) {
 function startLiveEvents(generation = ui.liveGeneration) {
   if (generation !== ui.liveGeneration || !routeNeedsEvents()) return;
   ui.eventsWanted = true;
-  if (document.hidden || ui.servicePaused) return;
+  if (document.hidden || ui.servicePaused || ui.webUIPaused) return;
   if (ui.events) {
     ui.events.close();
     ui.events = null;
@@ -2853,10 +3313,11 @@ function startLiveEvents(generation = ui.liveGeneration) {
     clearTimeout(ui.eventsRetryTimer);
     ui.eventsRetryTimer = null;
   }
-  const es = new EventSource('/api/events');
+  const es = new EventSource('/api/events?_ui=1');
   ui.events = es;
   es.onopen = () => {
     if (ui.events !== es || generation !== ui.liveGeneration || !routeNeedsEvents()) return;
+    ui.eventsRetryAttempt = 0;
     void backfillLiveLogs(generation, es);
   };
   es.onmessage = (evt) => {
@@ -2871,8 +3332,10 @@ function startLiveEvents(generation = ui.liveGeneration) {
     if (ui.events === es) {
       es.close();
       ui.events = null;
-      if (ui.eventsWanted && generation === ui.liveGeneration && routeNeedsEvents() && !document.hidden && !ui.servicePaused) {
-        ui.eventsRetryTimer = setTimeout(() => startLiveEvents(generation), 1500);
+      if (ui.eventsWanted && generation === ui.liveGeneration && routeNeedsEvents() && !document.hidden && !ui.servicePaused && !ui.webUIPaused) {
+        const retryDelay = Math.min(30000, 1500 * (2 ** Math.min(5, ui.eventsRetryAttempt)));
+        ui.eventsRetryAttempt = Math.min(5, ui.eventsRetryAttempt + 1);
+        ui.eventsRetryTimer = setTimeout(() => startLiveEvents(generation), retryDelay);
       }
     }
   };
@@ -2880,6 +3343,7 @@ function startLiveEvents(generation = ui.liveGeneration) {
 
 function stopLiveEvents() {
   ui.eventsWanted = false;
+  ui.eventsRetryAttempt = 0;
   if (ui.events) {
     ui.events.close();
     ui.events = null;
@@ -2903,14 +3367,23 @@ function stopSnapshotPolling() {
 }
 
 async function postUIVisibility(active, keepalive = false) {
+  if (ui.visibilityRequest) {
+    ui.visibilityRequest.abort();
+    ui.visibilityRequest = null;
+  }
+  const controller = keepalive ? null : new AbortController();
+  if (controller) ui.visibilityRequest = controller;
   try {
     await fetch('/api/ui/visibility', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-PitchProx-WebUI': '1' },
       body: JSON.stringify({ active }),
       keepalive,
+      ...(controller ? { signal: controller.signal } : {}),
     });
   } catch (_) {
+  } finally {
+    if (controller && ui.visibilityRequest === controller) ui.visibilityRequest = null;
   }
 }
 
@@ -2923,7 +3396,7 @@ function leaveLiveMode(keepalive = false, notifyInactive = true) {
 
 async function enterLiveMode(forceFullSnapshot = false) {
   const route = ui.route;
-  if (!routeNeedsLive(route) || document.hidden || ui.servicePaused) return false;
+  if (!routeNeedsLive(route) || document.hidden || ui.servicePaused || ui.webUIPaused) return false;
   const generation = ui.liveGeneration + 1;
   ui.liveGeneration = generation;
   stopLiveEvents();
@@ -2943,7 +3416,7 @@ async function enterLiveMode(forceFullSnapshot = false) {
       console.error(error);
     }
   }
-  if (generation !== ui.liveGeneration || route !== ui.route || document.hidden || ui.servicePaused) return false;
+  if (generation !== ui.liveGeneration || route !== ui.route || document.hidden || ui.servicePaused || ui.webUIPaused) return false;
   if (routeNeedsSnapshot(route)) startSnapshotPolling(generation);
   return true;
 }
@@ -3056,7 +3529,7 @@ function renderActivity() {
 }
 
 async function refreshSnapshot(options = { includeLogs: false }, generation = ui.liveGeneration, route = ui.route) {
-  if (ui.snapshotLoading || generation !== ui.liveGeneration || route !== ui.route || !routeNeedsSnapshot(route) || document.hidden || ui.servicePaused) return false;
+  if (ui.snapshotLoading || generation !== ui.liveGeneration || route !== ui.route || !routeNeedsSnapshot(route) || document.hidden || ui.servicePaused || ui.webUIPaused) return false;
   try {
     return await loadTrackedSnapshot({ ...options, generation, route });
   } catch (e) {
@@ -3067,11 +3540,11 @@ async function refreshSnapshot(options = { includeLogs: false }, generation = ui
 
 function startSnapshotPolling(generation = ui.liveGeneration) {
   const route = ui.route;
-  if (generation !== ui.liveGeneration || ui.servicePaused || !routeNeedsSnapshot(route) || document.hidden) return;
+  if (generation !== ui.liveGeneration || ui.servicePaused || ui.webUIPaused || !routeNeedsSnapshot(route) || document.hidden) return;
   clearSnapshotTimer();
   const poll = async () => {
     await refreshSnapshot({ includeLogs: false }, generation, route);
-    if (generation === ui.liveGeneration && route === ui.route && !ui.servicePaused && routeNeedsSnapshot(route) && !document.hidden) {
+    if (generation === ui.liveGeneration && route === ui.route && !ui.servicePaused && !ui.webUIPaused && routeNeedsSnapshot(route) && !document.hidden) {
       ui.snapshotTimer = setTimeout(poll, SNAPSHOT_POLL_MS);
     }
   };
@@ -3080,6 +3553,10 @@ function startSnapshotPolling(generation = ui.liveGeneration) {
 
 async function refreshCurrentPage() {
   if (ui.refreshing) return;
+  if (ui.webUIPaused) {
+    await recheckWebUIStatus();
+    return;
+  }
   ui.refreshing = true;
   const button = $('refreshBtn');
   if (button) button.disabled = true;
@@ -3114,6 +3591,7 @@ $('sidebarSettingsBtn').onclick = () => {
   openSettingsEditor();
 };
 $('refreshBtn').onclick = () => void refreshCurrentPage();
+$('webUIStatusCheckBtn').onclick = () => void recheckWebUIStatus();
 $('addProxyBtn').onclick = () => {
   openProxyEditor(makeProxyDraft(), { isDraft: true });
 };
@@ -3206,6 +3684,7 @@ document.addEventListener('keydown', (event) => {
     return;
   }
   if ($('editorDialog')?.open) return;
+  if (ui.webUIPaused) return;
   if (event.repeat) return;
   const target = event.target;
   const typing = target && (target.matches('input, textarea, select') || target.isContentEditable);
@@ -3220,20 +3699,39 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    clearWebUIIdleTimer();
+    cancelWebUIStatusRequest();
+    if (cancelConfigLoadRequest()) ui.configReloadOnResume = true;
     leaveLiveMode(true);
     stopRuleActivityPolling();
     suspendDroppedLoading();
+    cancelPendingRouteTask();
+    releaseCurrentViewForSuspension();
     return;
   }
-  void resumeCurrentRouteLifecycle(true);
+  void (async () => {
+    await loadWebUIStatus();
+    if (!ui.webUIPaused) await resumeCurrentRouteLifecycle(true);
+  })();
 });
 window.addEventListener('pagehide', () => {
+  clearWebUIIdleTimer();
+  cancelWebUIStatusRequest();
+  if (cancelConfigLoadRequest()) ui.configReloadOnResume = true;
+  cancelPendingRouteTask();
+  clearToasts();
   leaveLiveMode(true);
   stopRuleActivityPolling();
   suspendDroppedLoading();
+  releaseCurrentViewForSuspension();
 });
 window.addEventListener('pageshow', (event) => {
-  if (event.persisted) void resumeCurrentRouteLifecycle(true);
+  if (event.persisted) {
+    void (async () => {
+      await loadWebUIStatus();
+      if (!ui.webUIPaused) await resumeCurrentRouteLifecycle(true);
+    })();
+  }
 });
 window.addEventListener('beforeunload', (event) => {
   if (ui.editorDirty) {
@@ -3249,10 +3747,27 @@ window.addEventListener('beforeunload', (event) => {
   await Promise.all([
     loadHealth().catch(() => {}),
     loadServiceStatus().catch(() => {}),
+    loadWebUIStatus().catch(() => {}),
   ]);
+  if (ui.webUIPaused) {
+    ui.initialized = true;
+    renderServicePauseToggle();
+    renderWebUIStatus();
+    updateStatusLine();
+    return;
+  }
   try {
     await loadConfig();
   } catch (e) {
+    if (e.status === 503) {
+      await loadWebUIStatus();
+      if (ui.webUIPaused) {
+        ui.initialized = true;
+        renderWebUIStatus();
+        updateStatusLine();
+        return;
+      }
+    }
     console.error(e);
     const card = document.querySelector('.system-card');
     if (card) card.classList.add('error');
@@ -3267,4 +3782,5 @@ window.addEventListener('beforeunload', (event) => {
     return;
   }
   if (!routeNeedsLive()) void postUIVisibility(false);
+  scheduleWebUIIdleCheck();
 })();

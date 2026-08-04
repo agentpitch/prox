@@ -15,12 +15,13 @@ import (
 )
 
 type RouteResult struct {
-	RuleID   string
-	RuleName string
-	Action   config.RuleAction
-	ProxyID  string
-	ChainID  string
-	Hostname string
+	RuleID    string
+	RuleName  string
+	Action    config.RuleAction
+	ProxyID   string
+	ChainID   string
+	Hostname  string
+	RuleMatch monitor.RuleConditionMatch
 }
 
 type RouteFunc func(flow Flow, sniff SniffResult) (RouteResult, config.Config, error)
@@ -50,8 +51,10 @@ var relayBufPool = sync.Pool{New: func() any {
 }}
 
 const (
-	trafficFlushEvery = 750 * time.Millisecond
-	trafficFlushBytes = 256 * 1024
+	trafficFlushEvery        = 750 * time.Millisecond
+	trafficFlushBytes        = 256 * 1024
+	activeConnCompactMinPeak = 64
+	activeConnCompactRatio   = 4
 )
 
 func (s *Server) Start(ctx context.Context) error {
@@ -187,7 +190,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	if s.Monitor != nil {
 		s.Monitor.UpsertConnection(baseConn)
-		s.Monitor.AddRuleConnection(route.RuleID, route.RuleName, route.Action)
+		s.Monitor.AddRuleConditionConnection(route.RuleID, route.RuleName, route.Action, route.RuleMatch)
 	}
 
 	if route.Action == config.ActionBlock {
@@ -298,10 +301,24 @@ func (s *Server) untrackActiveConn(conn net.Conn) {
 		return
 	}
 	s.activeMu.Lock()
+	if _, ok := s.activeConns[conn]; !ok {
+		s.activeMu.Unlock()
+		return
+	}
 	delete(s.activeConns, conn)
-	if len(s.activeConns) == 0 && s.activePeak >= 64 {
-		s.activeConns = map[net.Conn]struct{}{}
+	live := len(s.activeConns)
+	if live == 0 {
+		if s.activePeak >= activeConnCompactMinPeak {
+			s.activeConns = map[net.Conn]struct{}{}
+		}
 		s.activePeak = 0
+	} else if s.activePeak >= activeConnCompactMinPeak && live <= s.activePeak/activeConnCompactRatio {
+		compacted := make(map[net.Conn]struct{}, live)
+		for active := range s.activeConns {
+			compacted[active] = struct{}{}
+		}
+		s.activeConns = compacted
+		s.activePeak = live
 	}
 	s.activeMu.Unlock()
 }

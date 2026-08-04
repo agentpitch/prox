@@ -1,6 +1,8 @@
 package history
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -122,6 +124,290 @@ func TestRuleActivityTimelineIsBoundedAndUsesStableRuleID(t *testing.T) {
 	}
 	if connections != 3 {
 		t.Fatalf("bucket connections = %d, want 3", connections)
+	}
+}
+
+func TestRuleConditionActivityAggregatesSourcesAndTopLimit(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC().Add(-time.Second)
+	for i := 0; i < 2; i++ {
+		store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceIntercepted)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush intercepted condition hits: %v", err)
+	}
+	store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceDirectObserver)
+	store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "curl.exe", "api.example.com", "400-500", RuleConditionSourceIntercepted)
+	store.AddRuleConditionHit(now, "rule-id", "Different exact ID", config.ActionProxy, "ignored.exe", "Any", "Any", RuleConditionSourceIntercepted)
+	// Legacy activity and traffic-only records have no exact tuple and must not
+	// dilute condition shares.
+	store.AddRuleActivity(now, "Rule-ID", "Rule", config.ActionProxy, 7, 100, 200)
+
+	result, err := store.RuleConditionActivity("Rule-ID", time.Minute, 1)
+	if err != nil {
+		t.Fatalf("condition activity: %v", err)
+	}
+	if result.TotalHits != 4 || result.OtherHits != 1 || !result.Truncated {
+		t.Fatalf("bounded totals = %+v", result)
+	}
+	if result.SourceHits.Intercepted != 3 || result.SourceHits.DirectObserver != 1 {
+		t.Fatalf("source totals = %+v", result.SourceHits)
+	}
+	if len(result.Conditions) != 1 {
+		t.Fatalf("conditions = %d, want 1", len(result.Conditions))
+	}
+	condition := result.Conditions[0]
+	if condition.Application != "chrome.exe" || condition.Host != "*.example.com" || condition.Port != "443" {
+		t.Fatalf("condition labels = %+v", condition)
+	}
+	if condition.Hits != 3 || condition.Sources.Intercepted != 2 || condition.Sources.DirectObserver != 1 {
+		t.Fatalf("condition counts = %+v", condition)
+	}
+	if condition.Share != 0.75 {
+		t.Fatalf("share = %v, want 0.75", condition.Share)
+	}
+	apps := result.Dimensions.Applications
+	if apps.TotalHits != 4 || apps.OtherHits != 0 || apps.Truncated || len(apps.Values) != 2 {
+		t.Fatalf("application dimension = %+v", apps)
+	}
+	if apps.Values[0].Value != "chrome.exe" || apps.Values[0].Hits != 3 || apps.Values[0].Share != 0.75 {
+		t.Fatalf("top application dimension = %+v", apps.Values[0])
+	}
+	if hosts := result.Dimensions.Hosts; hosts.TotalHits != 4 || len(hosts.Values) != 2 || hosts.Truncated {
+		t.Fatalf("host dimension = %+v", hosts)
+	}
+	if ports := result.Dimensions.Ports; ports.TotalHits != 4 || len(ports.Values) != 2 || ports.Truncated {
+		t.Fatalf("port dimension = %+v", ports)
+	}
+}
+
+func TestRuleConditionActivityBoundsUniqueGroups(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	now := time.Now().UTC().Add(-time.Second)
+	for i := 0; i < maxConditionQueryGroups+5; i++ {
+		store.AddRuleConditionHit(now, "rule", "Rule", config.ActionDirect, fmt.Sprintf("app-%04d.exe", i), "Any", "Any", RuleConditionSourceIntercepted)
+	}
+	result, err := store.RuleConditionActivity("rule", time.Minute, 100)
+	if err != nil {
+		t.Fatalf("condition activity: %v", err)
+	}
+	wantOverflow := int64(maxConditionQueryGroups + 5 - maxConditionAdmissions)
+	if result.TotalHits != maxConditionQueryGroups+5 || result.UnattributedHits != wantOverflow || len(result.Conditions) != 100 || !result.Truncated {
+		t.Fatalf("bounded result = total=%d conditions=%d truncated=%v", result.TotalHits, len(result.Conditions), result.Truncated)
+	}
+	if result.OtherHits != maxConditionQueryGroups+5-100 {
+		t.Fatalf("other hits = %d", result.OtherHits)
+	}
+	apps := result.Dimensions.Applications
+	if apps.TotalHits != maxConditionQueryGroups+5 || len(apps.Values) != maxConditionAdmissions || !apps.Truncated {
+		t.Fatalf("bounded application dimension = total=%d values=%d truncated=%v", apps.TotalHits, len(apps.Values), apps.Truncated)
+	}
+	if apps.OtherHits != wantOverflow {
+		t.Fatalf("application other hits = %d", apps.OtherHits)
+	}
+	if hosts := result.Dimensions.Hosts; hosts.TotalHits != maxConditionQueryGroups+5 || hosts.OtherHits != wantOverflow || len(hosts.Values) != 1 || !hosts.Truncated {
+		t.Fatalf("host dimension = %+v", hosts)
+	}
+	stats := store.DiagnosticStats()
+	if stats.PendingConditionBuckets != maxConditionAdmissions || stats.ConditionOverflowHits != wantOverflow {
+		t.Fatalf("condition diagnostics = %+v", stats)
+	}
+	snapshot, err := store.Snapshot(time.Minute)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot.RuleStats) != 1 || snapshot.RuleStats[0].Connections != maxConditionQueryGroups+5 {
+		t.Fatalf("rule stats lost overflow connections: %+v", snapshot.RuleStats)
+	}
+}
+
+func TestOversizedOrCorruptConditionLabelsBecomeUnattributed(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	now := time.Now().UTC()
+	store.AddRuleConditionHit(now, "rule", "Rule", config.ActionProxy, strings.Repeat("a", maxConditionLabelBytes+1), "example.test", "443", RuleConditionSourceIntercepted)
+	store.AddRuleConditionHit(now, "rule", "Rule", config.ActionProxy, "valid.exe", string([]byte{'b', 0xff}), "443", RuleConditionSourceDirectObserver)
+
+	result, err := store.RuleConditionActivity("rule", time.Minute, 20)
+	if err != nil {
+		t.Fatalf("condition activity: %v", err)
+	}
+	if result.TotalHits != 2 || result.UnattributedHits != 2 || result.OtherHits != 2 || len(result.Conditions) != 0 || !result.Truncated {
+		t.Fatalf("unattributed oversized labels = %+v", result)
+	}
+	if got := store.DiagnosticStats().ConditionOverflowHits; got != 2 {
+		t.Fatalf("condition overflow hits = %d, want 2", got)
+	}
+}
+
+func TestRuleConditionAdmissionBudgetSurvivesFlushAndResetsPerBucket(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	bucket := time.Now().UTC().Truncate(ruleActivityWriteBucket)
+	now := bucket.Add(time.Second)
+	for i := 0; i < maxConditionAdmissions; i++ {
+		store.AddRuleConditionHit(now, "first", "First", config.ActionProxy, fmt.Sprintf("app-%04d.exe", i), "Any", "Any", RuleConditionSourceIntercepted)
+	}
+	if got := store.DiagnosticStats().PendingConditionBuckets; got != maxConditionAdmissions {
+		t.Fatalf("pending condition buckets before flush = %d", got)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+	if got := store.DiagnosticStats().PendingConditionBuckets; got != maxConditionAdmissions {
+		t.Fatalf("current condition bucket was flushed early: pending=%d", got)
+	}
+	store.AddRuleConditionHit(now, "first", "First", config.ActionProxy, "over-budget.exe", "Any", "443", RuleConditionSourceIntercepted)
+	if got := store.DiagnosticStats().ConditionOverflowHits; got != 1 {
+		t.Fatalf("same-bucket admission overflow = %d, want 1", got)
+	}
+	if err := store.flushAll(); err != nil {
+		t.Fatalf("forced flush: %v", err)
+	}
+	store.AddRuleConditionHit(bucket.Add(ruleActivityWriteBucket+time.Second), "second", "Second", config.ActionProxy, "fresh.exe", "Any", "443", RuleConditionSourceIntercepted)
+	if got := store.DiagnosticStats().PendingConditionBuckets; got != 1 {
+		t.Fatalf("fresh condition in next bucket was not admitted: pending=%d", got)
+	}
+}
+
+func TestRuleConditionCurrentBucketPersistsOneAggregateAcrossFlushes(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ts := time.Now().UTC().Truncate(ruleActivityWriteBucket).Add(time.Second)
+	for i := 0; i < 10; i++ {
+		store.AddRuleConditionHit(ts, "rule", "Rule", config.ActionProxy, "app.exe", "example.test", "443", RuleConditionSourceIntercepted)
+		if err := store.Flush(); err != nil {
+			t.Fatalf("intermediate flush %d: %v", i, err)
+		}
+	}
+	if got := store.DiagnosticStats().PendingConditionBuckets; got != 1 {
+		t.Fatalf("pending aggregates = %d, want 1", got)
+	}
+	if err := store.flushAll(); err != nil {
+		t.Fatalf("forced flush: %v", err)
+	}
+	store.mu.Lock()
+	admissionAt, admissionKeys := store.conditionAdmissionAt, len(store.conditionAdmissionKeys)
+	store.mu.Unlock()
+	if admissionAt != 0 || admissionKeys != 0 {
+		t.Fatalf("condition admission memory retained after forced flush: bucket=%d keys=%d", admissionAt, admissionKeys)
+	}
+	path := filepath.Join(store.root, segmentFileName("rules", ts))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rule segment: %v", err)
+	}
+	if lines := bytes.Count(data, []byte{'\n'}); lines != 1 {
+		t.Fatalf("persisted condition lines = %d, want 1", lines)
+	}
+}
+
+func TestCompletedConditionBucketFlushReleasesAdmissionMemory(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ts := time.Now().UTC().Truncate(ruleActivityWriteBucket).Add(-time.Second)
+	store.AddRuleConditionHit(ts, "rule", "Rule", config.ActionDirect, "app.exe", "Any", "Any", RuleConditionSourceDirectObserver)
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush completed condition bucket: %v", err)
+	}
+	store.mu.Lock()
+	pending, admissionAt, admissionKeys := store.pendingConditionBuckets, store.conditionAdmissionAt, len(store.conditionAdmissionKeys)
+	store.mu.Unlock()
+	if pending != 0 || admissionAt != ts.Truncate(ruleActivityWriteBucket).Unix() || admissionKeys != 0 {
+		t.Fatalf("completed bucket retained memory: pending=%d bucket=%d keys=%d", pending, admissionAt, admissionKeys)
+	}
+}
+
+func TestConditionAdmissionDoesNotReopenOlderBucket(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "pitchProx.history"), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	current := time.Now().UTC().Truncate(ruleActivityWriteBucket).Add(time.Second)
+	for i := 0; i < maxConditionAdmissions; i++ {
+		store.AddRuleConditionHit(current, "rule", "Rule", config.ActionProxy, fmt.Sprintf("app-%04d.exe", i), "Any", "Any", RuleConditionSourceIntercepted)
+	}
+	store.AddRuleConditionHit(current.Add(-ruleActivityWriteBucket), "rule", "Rule", config.ActionProxy, "late-old.exe", "Any", "Any", RuleConditionSourceIntercepted)
+	store.AddRuleConditionHit(current, "rule", "Rule", config.ActionProxy, "over-current.exe", "Any", "Any", RuleConditionSourceIntercepted)
+	stats := store.DiagnosticStats()
+	if stats.PendingConditionBuckets != maxConditionAdmissions || stats.ConditionOverflowHits != 2 {
+		t.Fatalf("out-of-order admission diagnostics = %+v", stats)
+	}
+}
+
+func TestFailedFlushRestoresBoundedConditionCountAndPreservesOverflowTotals(t *testing.T) {
+	store := &Store{
+		pendingTraffic: map[int64]TrafficSample{},
+		pendingRule:    map[string]rulePending{},
+		retry:          make(chan struct{}, 1),
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	batch := flushBatch{rules: make(map[string]rulePending, maxPendingConditionBuckets+2)}
+	for i := 0; i < maxPendingConditionBuckets+2; i++ {
+		activity := RuleActivity{
+			RuleID:               "rule",
+			RuleName:             "Rule",
+			Action:               config.ActionProxy,
+			Connections:          1,
+			ConditionApplication: fmt.Sprintf("app-%04d.exe", i),
+			ConditionHost:        "Any",
+			ConditionPort:        "Any",
+			ConditionSource:      RuleConditionSourceIntercepted,
+		}
+		key := fmt.Sprintf("%d\x1f%s", now.Truncate(ruleActivityWriteBucket).Unix(), ruleActivityPendingIdentity(activity))
+		batch.rules[key] = rulePending{Ts: now.Unix(), Item: activity}
+	}
+	wantErr := errors.New("forced append failure")
+	if err := store.failFlush(batch, wantErr); !errors.Is(err, wantErr) {
+		t.Fatalf("failFlush error = %v", err)
+	}
+	if store.pendingConditionBuckets != maxPendingConditionBuckets {
+		t.Fatalf("restored pending condition buckets = %d", store.pendingConditionBuckets)
+	}
+	if got := store.conditionOverflowHits.Load(); got != 2 {
+		t.Fatalf("restored condition overflow hits = %d, want 2", got)
+	}
+	var connections int64
+	var overflow int64
+	for _, item := range store.pendingRule {
+		connections += item.Item.Connections
+		if item.Item.ConditionOverflow {
+			overflow += item.Item.Connections
+		}
+	}
+	if connections != maxPendingConditionBuckets+2 || overflow != 2 {
+		t.Fatalf("restored totals connections=%d overflow=%d", connections, overflow)
 	}
 }
 

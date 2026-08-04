@@ -12,6 +12,7 @@ type CompiledRule struct {
 	Rule                config.Rule
 	apps                []appPattern
 	appsAny             bool
+	appsAnyStar         bool
 	hosts               []hostPattern
 	hostsAny            bool
 	ports               []portRange
@@ -41,12 +42,23 @@ type Decision struct {
 	Action  config.RuleAction
 	ProxyID string
 	ChainID string
+	Match   MatchDetails
+}
+
+// MatchDetails identifies the first declared alternative that matched in each
+// rule dimension. The labels come from the parsed rule text and are intended
+// for bounded condition telemetry, not for making routing decisions.
+type MatchDetails struct {
+	Application string
+	Host        string
+	Port        string
 }
 
 type PreflightResult struct {
 	Decision
-	Definitive    bool
-	NeedsHostname bool
+	Definitive      bool
+	MatchDefinitive bool
+	NeedsHostname   bool
 }
 
 func Compile(cfg config.Config, computerName string) (*Engine, error) {
@@ -57,6 +69,9 @@ func Compile(cfg config.Config, computerName string) (*Engine, error) {
 		cr.apps, cr.appsAny, err = parseApplications(r.Applications)
 		if err != nil {
 			return nil, fmt.Errorf("rule %q applications: %w", r.Name, err)
+		}
+		if cr.appsAny {
+			cr.appsAnyStar = anyConditionUsesStar(r.Applications)
 		}
 		cr.hosts, cr.hostsAny, err = parseHosts(r.TargetHosts)
 		if err != nil {
@@ -91,13 +106,16 @@ func (e *Engine) Match(req Request) Decision {
 		if !r.Rule.Enabled {
 			continue
 		}
-		if !r.matchApp(req.AppPath, req.PID) {
+		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		if !ok {
 			continue
 		}
-		if !r.matchHost(req.Hostname, req.TargetIP, e.computerName) {
+		host, ok := r.matchHostCondition(req.Hostname, req.TargetIP, e.computerName)
+		if !ok {
 			continue
 		}
-		if !r.matchPort(req.TargetPort) {
+		port, ok := r.matchPortCondition(req.TargetPort)
+		if !ok {
 			continue
 		}
 		return Decision{
@@ -107,6 +125,11 @@ func (e *Engine) Match(req Request) Decision {
 			Action:  r.Rule.Action,
 			ProxyID: r.Rule.ProxyID,
 			ChainID: r.Rule.ChainID,
+			Match: MatchDetails{
+				Application: application,
+				Host:        host,
+				Port:        port,
+			},
 		}
 	}
 	return Decision{Action: config.ActionDirect}
@@ -117,25 +140,22 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 		if !r.Rule.Enabled {
 			continue
 		}
-		if !r.matchApp(req.AppPath, req.PID) {
+		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		if !ok {
 			continue
 		}
-		if !r.matchPort(req.TargetPort) {
+		port, ok := r.matchPortCondition(req.TargetPort)
+		if !ok {
 			continue
 		}
-		hostState := r.preflightHost(req.Hostname, req.TargetIP, e.computerName)
+		hostState, host := r.preflightHostCondition(req.Hostname, req.TargetIP, e.computerName)
+		match := MatchDetails{Application: application, Host: host, Port: port}
 		switch hostState {
 		case hostPreflightMatch:
 			return PreflightResult{
-				Decision: Decision{
-					Matched: true,
-					RuleID:  r.Rule.ID,
-					Rule:    r.Rule.Name,
-					Action:  r.Rule.Action,
-					ProxyID: r.Rule.ProxyID,
-					ChainID: r.Rule.ChainID,
-				},
-				Definitive: true,
+				Decision:        decisionFromRule(r, match),
+				Definitive:      true,
+				MatchDefinitive: true,
 			}
 		case hostPreflightNeedHostname:
 			if r.Rule.Action == config.ActionDirect {
@@ -147,14 +167,7 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 				}
 			}
 			return PreflightResult{
-				Decision: Decision{
-					Matched: true,
-					RuleID:  r.Rule.ID,
-					Rule:    r.Rule.Name,
-					Action:  r.Rule.Action,
-					ProxyID: r.Rule.ProxyID,
-					ChainID: r.Rule.ChainID,
-				},
+				Decision:      decisionFromRule(r, match),
 				NeedsHostname: true,
 			}
 		case hostPreflightNoMatch:
@@ -169,19 +182,21 @@ func (e *Engine) definitiveDirectWithoutHostname(req Request, start int) (Decisi
 		if !r.Rule.Enabled {
 			continue
 		}
-		if !r.matchApp(req.AppPath, req.PID) {
+		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		if !ok {
 			continue
 		}
-		if !r.matchPort(req.TargetPort) {
+		port, ok := r.matchPortCondition(req.TargetPort)
+		if !ok {
 			continue
 		}
-		hostState := r.preflightHost(req.Hostname, req.TargetIP, e.computerName)
+		hostState, host := r.preflightHostCondition(req.Hostname, req.TargetIP, e.computerName)
 		switch hostState {
 		case hostPreflightMatch:
 			if r.Rule.Action != config.ActionDirect {
 				return Decision{}, false
 			}
-			return decisionFromRule(r), true
+			return decisionFromRule(r, MatchDetails{Application: application, Host: host, Port: port}), true
 		case hostPreflightNeedHostname:
 			if r.Rule.Action != config.ActionDirect {
 				return Decision{}, false
@@ -193,7 +208,7 @@ func (e *Engine) definitiveDirectWithoutHostname(req Request, start int) (Decisi
 	return Decision{Action: config.ActionDirect}, true
 }
 
-func decisionFromRule(r CompiledRule) Decision {
+func decisionFromRule(r CompiledRule, match MatchDetails) Decision {
 	return Decision{
 		Matched: true,
 		RuleID:  r.Rule.ID,
@@ -201,77 +216,91 @@ func decisionFromRule(r CompiledRule) Decision {
 		Action:  r.Rule.Action,
 		ProxyID: r.Rule.ProxyID,
 		ChainID: r.Rule.ChainID,
+		Match:   match,
 	}
 }
 
 func (r CompiledRule) matchApp(path string, pid uint32) bool {
+	_, ok := r.matchAppCondition(path, pid)
+	return ok
+}
+
+func (r CompiledRule) matchAppCondition(path string, pid uint32) (string, bool) {
 	if r.appsAny {
-		return true
+		if r.appsAnyStar {
+			return "*", true
+		}
+		return "Any", true
 	}
 	path = normalizeWindowsPath(path)
 	base := pathBaseAny(path)
 	for _, p := range r.apps {
 		if p.pidOnly {
 			if pid != 0 && pid == p.pid {
-				return true
+				return p.raw, true
 			}
 			continue
 		}
 		if p.fullPath {
 			if wildcardMatch(p.raw, path) {
-				return true
+				return p.raw, true
 			}
 		} else if wildcardMatch(p.raw, base) {
-			return true
+			return p.raw, true
 		}
 	}
-	return false
+	return "", false
 }
 
 func (r CompiledRule) matchHost(hostname string, ip netip.Addr, computerName string) bool {
+	_, ok := r.matchHostCondition(hostname, ip, computerName)
+	return ok
+}
+
+func (r CompiledRule) matchHostCondition(hostname string, ip netip.Addr, computerName string) (string, bool) {
 	if r.hostsAny {
-		return true
+		return "Any", true
 	}
 	h := strings.ToLower(strings.TrimSpace(hostname))
 	ipStr := ""
 	for _, p := range r.hosts {
 		switch p.kind {
 		case hostAny:
-			return true
+			return p.raw, true
 		case hostComputerName:
 			if h != "" && h == computerName {
-				return true
+				return p.raw, true
 			}
 		case hostExactName:
 			if h != "" && h == p.raw {
-				return true
+				return p.raw, true
 			}
 		case hostGlobName:
 			if h != "" && wildcardMatch(p.raw, h) {
-				return true
+				return p.raw, true
 			}
 		case hostExactIP:
 			if ip.IsValid() && ip == p.ip {
-				return true
+				return p.raw, true
 			}
 		case hostCIDR:
 			if ip.IsValid() && p.pref.Contains(ip) {
-				return true
+				return p.raw, true
 			}
 		case hostIPRange:
 			if ip.IsValid() && ipCompare(ip, p.ip) >= 0 && ipCompare(ip, p.end) <= 0 {
-				return true
+				return p.raw, true
 			}
 		case hostGlobIP:
 			if ipStr == "" && ip.IsValid() {
 				ipStr = strings.ToLower(ip.String())
 			}
 			if ip.IsValid() && wildcardMatch(p.raw, ipStr) {
-				return true
+				return p.raw, true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 type hostPreflightState int
@@ -283,31 +312,59 @@ const (
 )
 
 func (r CompiledRule) preflightHost(hostname string, ip netip.Addr, computerName string) hostPreflightState {
+	state, _ := r.preflightHostCondition(hostname, ip, computerName)
+	return state
+}
+
+func (r CompiledRule) preflightHostCondition(hostname string, ip netip.Addr, computerName string) (hostPreflightState, string) {
 	if r.hostsAny {
-		return hostPreflightMatch
+		return hostPreflightMatch, "Any"
 	}
 	if strings.TrimSpace(hostname) != "" {
-		if r.matchHost(hostname, ip, computerName) {
-			return hostPreflightMatch
+		if label, ok := r.matchHostCondition(hostname, ip, computerName); ok {
+			return hostPreflightMatch, label
 		}
-		return hostPreflightNoMatch
+		return hostPreflightNoMatch, ""
 	}
-	if r.matchHost("", ip, computerName) {
-		return hostPreflightMatch
+	if label, ok := r.matchHostCondition("", ip, computerName); ok {
+		return hostPreflightMatch, label
 	}
 	if r.hostnameDependent {
-		return hostPreflightNeedHostname
+		return hostPreflightNeedHostname, ""
 	}
-	return hostPreflightNoMatch
+	return hostPreflightNoMatch, ""
 }
 
 func (r CompiledRule) matchPort(port uint16) bool {
+	_, ok := r.matchPortCondition(port)
+	return ok
+}
+
+func (r CompiledRule) matchPortCondition(port uint16) (string, bool) {
 	if r.portsAny {
-		return true
+		return "Any", true
 	}
 	for _, pr := range r.ports {
 		if port >= pr.from && port <= pr.to {
-			return true
+			return pr.label, true
+		}
+	}
+	return "", false
+}
+
+func anyConditionUsesStar(input string) bool {
+	tokens, err := splitField(input)
+	if err == nil {
+		for _, token := range tokens {
+			// parseApplications makes the whole dimension unconditional as
+			// soon as either spelling is present. Attribute it to the first
+			// unconditional alternative in authored order.
+			if strings.EqualFold(token, "Any") {
+				return false
+			}
+			if token == "*" {
+				return true
+			}
 		}
 	}
 	return false

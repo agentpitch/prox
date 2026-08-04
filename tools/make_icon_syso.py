@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Generate cmd/pitchprox/pitchprox_windows_amd64.syso from assets/pp_icon_256.png.
-This is a self-contained resource generator so the executable icon can be regenerated
-without external Windows tooling.
+"""Generate the executable and WebUI icons from assets/pp_icon_256.png.
+
+This is a self-contained resource generator so every application-icon copy can
+be regenerated without external Windows resource tooling.
 """
 from __future__ import annotations
 import pathlib
@@ -12,8 +13,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PNG_PATH = ROOT / "assets" / "pp_icon_256.png"
 ICO_PATH = ROOT / "assets" / "pp_icon.ico"
 SYSO_PATH = ROOT / "cmd" / "pitchprox" / "pitchprox_windows_amd64.syso"
+WEB_PNG_PATH = ROOT / "internal" / "webui" / "dist" / "pp_icon_256.png"
+FAVICON_PATH = ROOT / "internal" / "webui" / "dist" / "favicon.ico"
 
 SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+FAVICON_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48)]
 IMAGE_REL_AMD64_ADDR32NB = 0x0003
 
 
@@ -33,7 +37,12 @@ def patch_u32(buf: bytearray, off: int, value: int) -> None:
 
 
 def main() -> None:
-    img = Image.open(PNG_PATH).convert("RGBA")
+    with Image.open(PNG_PATH) as source:
+        img = source.convert("RGBA")
+    if img.size != (256, 256):
+        raise SystemExit(f"expected a 256x256 source icon, got {img.width}x{img.height}")
+    img.save(WEB_PNG_PATH, format="PNG", optimize=True)
+    img.save(FAVICON_PATH, format="ICO", sizes=FAVICON_SIZES)
     img.save(ICO_PATH, format="ICO", sizes=SIZES)
     ico = ICO_PATH.read_bytes()
 
@@ -162,7 +171,7 @@ def main() -> None:
     out += b".rsrc\x00\x00\x00" + struct.pack("<IhHBB", 0, 1, 0, 3, 0)
     out += struct.pack("<I", 4)
     SYSO_PATH.write_bytes(out)
-    print(f"wrote {SYSO_PATH}")
+    print(f"wrote {SYSO_PATH}, {WEB_PNG_PATH}, and {FAVICON_PATH}")
 
 
 if __name__ == "__main__":

@@ -14,10 +14,11 @@ import (
 )
 
 type fakeDirectObserverMonitor struct {
-	mu      sync.RWMutex
-	active  bool
-	wake    chan struct{}
-	upserts chan monitor.Connection
+	mu           sync.RWMutex
+	active       bool
+	wake         chan struct{}
+	upserts      chan monitor.Connection
+	activeChecks atomic.Int32
 }
 
 func newFakeDirectObserverMonitor(active bool) *fakeDirectObserverMonitor {
@@ -29,6 +30,7 @@ func newFakeDirectObserverMonitor(active bool) *fakeDirectObserverMonitor {
 }
 
 func (m *fakeDirectObserverMonitor) UIActive() bool {
+	m.activeChecks.Add(1)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.active
@@ -41,6 +43,9 @@ func (m *fakeDirectObserverMonitor) UpsertConnection(c monitor.Connection) {
 }
 
 func (m *fakeDirectObserverMonitor) AddRuleConnection(string, string, config.RuleAction) {}
+
+func (m *fakeDirectObserverMonitor) AddRuleConditionConnection(string, string, config.RuleAction, monitor.RuleConditionMatch) {
+}
 
 func (m *fakeDirectObserverMonitor) AddLog(string, string, ...interface{}) {}
 
@@ -91,7 +96,7 @@ func TestDirectObserverDormantFinalizesSeenConnections(t *testing.T) {
 				SeenAt:     time.Now().UTC(),
 			}}, nil
 		},
-		Decide: func(item win.TCPConnection) (monitor.Connection, bool) {
+		Decide: func(item win.TCPConnection) (monitor.Connection, monitor.RuleConditionMatch, bool) {
 			return monitor.Connection{
 				ID:           monitor.ConnID(item.PID, item.LocalIP, item.LocalPort, item.RemoteIP, item.RemotePort),
 				PID:          item.PID,
@@ -104,7 +109,7 @@ func TestDirectObserverDormantFinalizesSeenConnections(t *testing.T) {
 				State:        "open",
 				CreatedAt:    item.SeenAt,
 				Count:        1,
-			}, true
+			}, monitor.RuleConditionMatch{}, true
 		},
 	}
 
@@ -151,7 +156,7 @@ func TestDirectObserverWakesImmediatelyOnUIActivity(t *testing.T) {
 				SeenAt:     time.Now().UTC(),
 			}}, nil
 		},
-		Decide: func(item win.TCPConnection) (monitor.Connection, bool) {
+		Decide: func(item win.TCPConnection) (monitor.Connection, monitor.RuleConditionMatch, bool) {
 			return monitor.Connection{
 				ID:           monitor.ConnID(item.PID, item.LocalIP, item.LocalPort, item.RemoteIP, item.RemotePort),
 				PID:          item.PID,
@@ -164,7 +169,7 @@ func TestDirectObserverWakesImmediatelyOnUIActivity(t *testing.T) {
 				State:        "open",
 				CreatedAt:    item.SeenAt,
 				Count:        1,
-			}, true
+			}, monitor.RuleConditionMatch{}, true
 		},
 	}
 
@@ -189,4 +194,42 @@ func TestDirectObserverWakesImmediatelyOnUIActivity(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestDirectObserverWithWakeChannelDoesNotPollWhileDormant(t *testing.T) {
+	mon := newFakeDirectObserverMonitor(false)
+	var releases atomic.Int32
+	observer := &directObserver{
+		Monitor:         mon,
+		ActiveInterval:  10 * time.Millisecond,
+		DormantInterval: 5 * time.Millisecond,
+		List: func() ([]win.TCPConnection, error) {
+			t.Fatal("dormant observer unexpectedly scanned TCP connections")
+			return nil, nil
+		},
+		Decide: func(win.TCPConnection) (monitor.Connection, monitor.RuleConditionMatch, bool) {
+			return monitor.Connection{}, monitor.RuleConditionMatch{}, false
+		},
+		ReleaseDormant: func() { releases.Add(1) },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		observer.Start(ctx)
+	}()
+
+	time.Sleep(45 * time.Millisecond)
+	if checks := mon.activeChecks.Load(); checks != 1 {
+		t.Fatalf("UIActive checks while dormant = %d, want 1", checks)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("dormant releases = %d, want 1", got)
+	}
+	cancel()
+	<-done
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("releases after dormant shutdown = %d, want 1", got)
+	}
 }

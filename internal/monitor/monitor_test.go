@@ -70,6 +70,37 @@ func TestActiveMapCompactsAfterDeletes(t *testing.T) {
 	}
 }
 
+func TestDetailedRuleConnectionDoesNotDoubleCountRuleStats(t *testing.T) {
+	b, err := NewBus(filepath.Join(t.TempDir(), "pitchProx.history"))
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	b.AddRuleConditionConnection("rule", "Rule", config.ActionProxy, RuleConditionMatch{
+		Application: "browser.exe",
+		Host:        "*.example.com",
+		Port:        "443",
+		Source:      RuleConditionSourceIntercepted,
+	})
+	b.AddRuleTraffic("rule", "Rule", config.ActionProxy, 100, 200)
+
+	detail, err := b.RuleConditionActivity("rule", time.Minute, 20)
+	if err != nil {
+		t.Fatalf("condition activity: %v", err)
+	}
+	if detail.TotalHits != 1 || len(detail.Conditions) != 1 || detail.Conditions[0].Hits != 1 {
+		t.Fatalf("condition detail = %+v", detail)
+	}
+	snapshot := b.SnapshotWithOptions(SnapshotOptions{IncludeLogs: false})
+	if len(snapshot.RuleStats) != 1 || snapshot.RuleStats[0].Connections != 1 {
+		t.Fatalf("rule stats = %+v, want one connection", snapshot.RuleStats)
+	}
+	if snapshot.RuleStats[0].UpBytes != 100 || snapshot.RuleStats[0].DownBytes != 200 {
+		t.Fatalf("rule traffic = %+v", snapshot.RuleStats[0])
+	}
+}
+
 func TestSnapshotIncludesNewConnections(t *testing.T) {
 	b, err := NewBus(filepath.Join(t.TempDir(), "pitchProx.history"))
 	if err != nil {

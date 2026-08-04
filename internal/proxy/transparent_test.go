@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -109,4 +110,53 @@ func (s *Server) activeConnCountForTest() int {
 	s.activeMu.Lock()
 	defer s.activeMu.Unlock()
 	return len(s.activeConns)
+}
+
+type trackedConnStub struct{ id int }
+
+func (*trackedConnStub) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*trackedConnStub) Write(p []byte) (int, error)      { return len(p), nil }
+func (*trackedConnStub) Close() error                     { return nil }
+func (*trackedConnStub) LocalAddr() net.Addr              { return nil }
+func (*trackedConnStub) RemoteAddr() net.Addr             { return nil }
+func (*trackedConnStub) SetDeadline(time.Time) error      { return nil }
+func (*trackedConnStub) SetReadDeadline(time.Time) error  { return nil }
+func (*trackedConnStub) SetWriteDeadline(time.Time) error { return nil }
+
+func TestServerActiveConnectionsCompactAfterBurstWithSurvivor(t *testing.T) {
+	const total = 1024
+	srv := &Server{}
+	conns := make([]net.Conn, total)
+	for i := range conns {
+		conns[i] = &trackedConnStub{id: i}
+		srv.trackActiveConn(conns[i])
+	}
+
+	for _, conn := range conns[:total-1] {
+		srv.untrackActiveConn(conn)
+	}
+
+	srv.activeMu.Lock()
+	live := len(srv.activeConns)
+	peak := srv.activePeak
+	_, survivorTracked := srv.activeConns[conns[total-1]]
+	srv.activeMu.Unlock()
+	if live != 1 {
+		t.Fatalf("active conns after burst = %d, want 1", live)
+	}
+	if !survivorTracked {
+		t.Fatal("long-lived survivor was lost during map compaction")
+	}
+	if peak >= activeConnCompactMinPeak {
+		t.Fatalf("active peak after compaction = %d, want below %d", peak, activeConnCompactMinPeak)
+	}
+
+	srv.untrackActiveConn(conns[total-1])
+	srv.activeMu.Lock()
+	live = len(srv.activeConns)
+	peak = srv.activePeak
+	srv.activeMu.Unlock()
+	if live != 0 || peak != 0 {
+		t.Fatalf("active state after final delete = len %d peak %d, want both zero", live, peak)
+	}
 }

@@ -7,6 +7,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const staticRoot = path.join(repoRoot, 'internal', 'webui', 'dist');
 const port = Math.max(1024, Number(process.argv[2]) || 18081);
 let paused = false;
+let webUIEnabled = true;
 
 const examples = [
   ['Figma', 'Макеты рабочего проекта', 'figma.exe; chrome.exe', '*.figma.com; static.figma.com', '443', 'proxy', 'office'],
@@ -128,6 +129,58 @@ function activitySeries(ids, points, windowMinutes) {
   });
 }
 
+function previewValues(raw) {
+  return String(raw || '').split(/[;,\r\n]+/).map((value) => value.trim().replace(/^"|"$/g, '')).filter(Boolean);
+}
+
+function conditionActivity(rule, windowMinutes) {
+  const applications = previewValues(rule.applications);
+  const hosts = previewValues(rule.target_hosts);
+  const ports = previewValues(rule.target_ports);
+  const app = applications[0] || 'Any';
+  const host = hosts[0] || 'Any';
+  const portValue = ports[0] || 'Any';
+  const sources = { intercepted: 9, direct_observer: 3 };
+  const dimension = (values, options = {}) => ({
+    total_hits: 12,
+    other_hits: options.otherHits || 0,
+    truncated: !!options.truncated,
+    values: values.map((value, index) => ({
+      value,
+      hits: Math.max(1, 12 - index * 4),
+      share: Math.max(1, 12 - index * 4) / 12,
+      last_seen: new Date(Date.now() - index * 70_000).toISOString(),
+      sources,
+    })),
+  });
+  return {
+    generated_at: new Date().toISOString(),
+    rule_id: rule.id,
+    window_minutes: windowMinutes,
+    total_hits: 12,
+    other_hits: 2,
+    unattributed_hits: 1,
+    truncated: true,
+    source_hits: sources,
+    conditions: [
+      { application: app, host, port: portValue, hits: 7, share: 7 / 12, last_seen: new Date().toISOString(), sources: { intercepted: 5, direct_observer: 2 } },
+      { application: applications[1] || app, host, port: ports[1] || portValue, hits: 3, share: 3 / 12, last_seen: new Date(Date.now() - 90_000).toISOString(), sources: { intercepted: 2, direct_observer: 1 } },
+    ],
+    dimensions: {
+      applications: dimension(applications.slice(0, 1).map((value) => value.toLowerCase().replaceAll('/', '\\'))),
+      hosts: dimension(hosts.slice(0, 1).map((value) => value.toLowerCase()), { truncated: hosts.length > 1, otherHits: hosts.length > 1 ? 3 : 0 }),
+      ports: dimension(ports.slice(0, 1)),
+    },
+    accuracy: {
+      unit: 'tcp_connection',
+      attribution: 'first_matching_alternative',
+      intercepted_complete: true,
+      direct_complete: false,
+      notice: 'Перехваченные соединения учтены точно; Direct наблюдается выборочно.',
+    },
+  };
+}
+
 function snapshot() {
   return {
     connections: [],
@@ -183,7 +236,17 @@ async function serveStatic(requestPath, response) {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || '/', `http://127.0.0.1:${port}`);
   try {
-    if (url.pathname === '/api/health') return json(response, 200, { ok: true, version: 'v0.43-rc.1-preview' });
+    if (url.pathname === '/api/health') return json(response, 200, { ok: true, version: 'v0.43-rc.2-preview' });
+    if (url.pathname === '/api/control/webui/status') {
+      return json(response, 200, {
+        enabled: webUIEnabled,
+        paused,
+        auto_paused: false,
+        disabled_reason: '',
+        idle_timeout_seconds: 3600,
+        idle_deadline_at: new Date(Date.now() + 3600_000).toISOString(),
+      });
+    }
     if (url.pathname === '/api/control/service/status') return json(response, 200, { paused, webui_enabled: true });
     if (url.pathname === '/api/control/service/pause' && request.method === 'POST') {
       paused = true;
@@ -216,6 +279,13 @@ const server = http.createServer(async (request, response) => {
         points,
         series: activitySeries(ids, points, windowMinutes),
       });
+    }
+    if (url.pathname === '/api/rules/condition-activity') {
+      const ruleID = url.searchParams.get('id') || '';
+      const rule = config.rules.find((item) => item.id === ruleID);
+      if (!rule) return text(response, 404, 'rule not found');
+      const windowMinutes = Math.max(1, Math.min(60, Number(url.searchParams.get('window_minutes')) || 15));
+      return json(response, 200, conditionActivity(rule, windowMinutes));
     }
     if (url.pathname === '/api/dropped' && request.method === 'GET') {
       return json(response, 200, { items: [], total: 0, offset: 0, limit: 100, file_bytes: 0, max_bytes: 10 * 1024 * 1024 });

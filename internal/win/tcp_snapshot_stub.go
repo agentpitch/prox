@@ -26,3 +26,5 @@ func ListTCPConnections() ([]TCPConnection, error) { return nil, nil }
 func NewTCPSnapshotter() *TCPSnapshotter { return &TCPSnapshotter{} }
 
 func (s *TCPSnapshotter) ListTCPConnections() ([]TCPConnection, error) { return nil, nil }
+
+func (s *TCPSnapshotter) Clear() {}

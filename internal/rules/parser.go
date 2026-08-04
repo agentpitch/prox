@@ -77,8 +77,9 @@ type hostPattern struct {
 }
 
 type portRange struct {
-	from uint16
-	to   uint16
+	from  uint16
+	to    uint16
+	label string
 }
 
 func parseApplications(input string) ([]appPattern, bool, error) {
@@ -98,7 +99,7 @@ func parseApplications(input string) ([]appPattern, bool, error) {
 			return nil, true, nil
 		}
 		if pid, ok := parsePIDToken(token); ok {
-			out = append(out, appPattern{pid: pid, pidOnly: true})
+			out = append(out, appPattern{raw: token, pid: pid, pidOnly: true})
 			continue
 		}
 		token = strings.ReplaceAll(token, "/", `\`)
@@ -144,7 +145,7 @@ func parseHosts(input string) ([]hostPattern, bool, error) {
 			return nil, true, nil
 		}
 		if strings.EqualFold(token, "%ComputerName%") {
-			out = append(out, hostPattern{kind: hostComputerName, raw: token})
+			out = append(out, hostPattern{kind: hostComputerName, raw: "%computername%"})
 			continue
 		}
 		if pref, err := netip.ParsePrefix(token); err == nil {
@@ -208,14 +209,14 @@ func parsePorts(input string) ([]portRange, bool, error) {
 			if a > b {
 				a, b = b, a
 			}
-			out = append(out, portRange{from: a, to: b})
+			out = append(out, portRange{from: a, to: b, label: token})
 			continue
 		}
 		p, err := parsePort(token)
 		if err != nil {
 			return nil, false, err
 		}
-		out = append(out, portRange{from: p, to: p})
+		out = append(out, portRange{from: p, to: p, label: token})
 	}
 	return out, false, nil
 }

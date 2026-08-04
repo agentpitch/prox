@@ -42,7 +42,7 @@ The full multi-value syntax remains supported:
 - multiple applications, hosts, ports, and ranges inside one rule;
 - wildcards, PID, full application paths, CIDR, IP ranges, and port ranges.
 
-Cells show the first values plus `+N`; their tooltip contains the full parsed list. Saving an otherwise unchanged rule preserves the raw text, apart from backend outer trimming.
+Cells show only the first configured values plus `+N`; no synthetic application symbol is rendered. Their tooltip contains the full parsed list. Saving an otherwise unchanged rule preserves the raw text, apart from backend outer trimming. The table has one intentionally compact density and no density preference.
 
 ### Search and filters
 
@@ -102,13 +102,25 @@ The three matching fields remain textareas so users can keep one rule with multi
 Client-side analysis reports:
 
 - unclosed quotes;
-- redundant `Any`/`*` mixed with narrower values;
+- redundant `Any` mixed with narrower values, plus the Applications-only `*`
+  alias; a Target-host `*` remains a hostname wildcard rather than `Any`;
 - duplicate rule ID;
 - up to three possible criteria overlaps.
 
 Similarity is advisory. It compares normalized values and does not claim full glob/CIDR/range subsumption.
 
 Closing a dirty editor requires confirmation. Save is single-flight. An existing rule is located by its original stable ID at save time rather than by a stale array index.
+
+Existing rules also contain a lazy **Фактические срабатывания условий** disclosure. It makes no request until opened (or opened directly from the row's **Детали условий** action). Unsaved editor text is not included; because history is keyed by stable rule ID, the selected window can still contain the previous saved revision of that ID.
+
+`GET /api/rules/condition-activity?id=<exact-id>&window_minutes=<1..60>&limit=20` supplies two complementary views without constructing the Applications × Hosts × Ports cross-product:
+
+- top observed `application › host : port` tuples with hit count, share, last-seen time, and localized source counts;
+- marginal coverage for every raw Applications, Hosts, and Ports token from the saved rule.
+
+For each marginal dimension, an absent token is shown as zero observed hits only when the backend marks that dimension complete. If its bounded aggregation is truncated, the UI says that the token did not enter the observed sample and never invents a zero. The backend accuracy notice remains visible because sampled Direct observation can make even a complete marginal scan incomplete evidence of real use. Loading, empty, partial, and error states are explicit. The request is aborted and the result DOM is released when the editor closes; no condition-detail polling or client cache is used.
+
+`unattributed_hits` is shown separately as a subset of **Прочие связки**, so bounded backend overflow is visible without double-counting totals. Malformed tuples or marginal values are discarded defensively and force a partial/truncated presentation; the frontend never invents `Any` for a missing tuple axis.
 
 ## 4. Rules import and export
 
@@ -160,6 +172,8 @@ Backend limits:
 
 Direct traffic bytes are not always observable. The table therefore treats byte totals as recorded relay traffic and presents connection rate separately.
 
+The per-rule condition drill-down counts observed TCP-соединения/срабатывания, not HTTP requests. Its response is bounded to 20 top tuples and 512 transient marginal labels per dimension on the backend; the frontend renders at most 100 authored tokens per dimension.
+
 ## 6. Other pages
 
 ### Monitoring
@@ -195,6 +209,23 @@ The routed UI must remain quiet when configuration pages are open:
 - export Blob URLs are revoked;
 - import file inputs are cleared immediately after reading;
 - no application-icon cache is introduced.
+- pending route callbacks, bounded toasts, config reads, editor condition reads, and view-specific animation frames are cancelled or released on their lifecycle boundary.
+
+After one hour without a browser request, the backend automatically pauses only
+the WebUI. It uses one reschedulable timer rather than a polling loop. A loaded
+page schedules one check for the advertised `idle_deadline_at`; SSE pages also
+receive the `webui_status` transition. On auto-pause the page must stop all
+timers, requests, retries and EventSource activity, retain a persistent notice
+that proxy routing continues, and explain that WebUI can be reopened from the
+tray. It must not silently treat this state as a full service pause.
+
+Every browser API call carries `X-PitchProx-WebUI: 1`; EventSource uses
+`/api/events?_ui=1`. A `503` from an ordinary API triggers one read of the
+still-available WebUI control status. Auto-pause and manual WebUI disable share
+the persistent banner, but a full service pause remains a separate state and
+never claims that proxy routing continues. No automatic retry runs after WebUI
+has paused; the banner offers only a manual status recheck after the user acts
+through the tray.
 
 ## 8. Responsive behavior
 
@@ -202,7 +233,7 @@ The routed UI must remain quiet when configuration pages are open:
 - Medium width: horizontal table scrolling and optional hidden columns.
 - Mobile: sidebar overlay and each rule row becomes a compact grid card while preserving every action.
 
-Users can hide Applications, Hosts, Ports, or Activity columns. Column choices, density, page size, and sidebar state are stored locally; rule search and filters are session-scoped.
+Users can hide Applications, Hosts, Ports, or Activity columns. Column choices, page size, and sidebar state are stored locally; rule search and filters are session-scoped.
 
 ## 9. Keyboard and accessibility
 
@@ -221,3 +252,5 @@ Tray behavior is unchanged:
 - the context menu controls WebUI and process shutdown;
 - the tray reads the lightweight traffic view;
 - disabling WebUI keeps health/tray/control endpoints available.
+- after an idle auto-pause, choosing **Управление** enables WebUI before opening
+  the browser; proxy routing never stopped.

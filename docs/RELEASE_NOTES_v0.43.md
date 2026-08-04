@@ -4,16 +4,26 @@
 
 - New application-shell WebUI with sidebar navigation and dedicated pages.
 - Dense rules table with search by name, ID, comment, every application, host, port, action, proxy, and chain.
-- Filters, 25/50 pagination, persistent density/column preferences, and responsive mobile layout.
+- Filters, 25/50 pagination, one consistently compact table, persistent column preferences, and responsive mobile layout.
 - Multi-selection and atomic bulk enable, disable, and delete.
 - Multiline rule comments using the existing compatible `notes` field.
 - Redesigned editor that preserves raw multi-app, multi-host, and multi-port syntax.
+- New route-style Windows, tray, and WebUI application icon.
 - Syntax warnings, stable-ID validation, dirty-editor protection, and advisory similar-rule detection.
 - Versioned rules-only import/export without proxy credentials.
 - Real demand-only rule activity sparklines with strict ID, window, and point bounds.
+- Lazy bounded per-rule breakdown of observed Application + Host + Port tuples,
+  including marginal coverage for identifying alternatives with no observed use.
+- Condition details are coalesced into one tuple/source record per 15-second
+  bucket with a 256-key admission budget, bounding disk and scan work even for
+  pathological rule cardinality or frequent WebUI snapshots.
 - Live SSE/snapshot work now runs only on Monitoring and Journal pages.
+- WebUI automatically pauses after one hour without marked browser requests,
+  while proxy routing continues; tray/control endpoints remain available to
+  enable it again. The deadline uses one lazy timer with no idle polling.
 - Build version is reported by the API and injected into release binaries.
 - Long-running resource hardening from the post-v0.41 work is included: bounded history recovery/retries, PID creation-time validation, released high-water buffers, stricter protocol parsing, and transactional runtime-config activation.
+- WebUI-only process metadata is released on dormancy, and connection maps compact geometrically after traffic bursts even when a long-lived connection remains.
 
 ## Release integrity
 

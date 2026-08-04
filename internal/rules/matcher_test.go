@@ -26,6 +26,78 @@ func TestEngineMatch(t *testing.T) {
 	}
 }
 
+func TestDecisionReportsFirstMatchedConditionAlternatives(t *testing.T) {
+	cfg := config.Config{Rules: []config.Rule{{
+		ID:           "r1",
+		Name:         "Detailed",
+		Enabled:      true,
+		Applications: "*.exe; chrome.exe",
+		TargetHosts:  "*.example.com; api.example.com",
+		TargetPorts:  "400-500; 443",
+		Action:       config.ActionProxy,
+		ProxyID:      "p1",
+	}}}
+	eng, err := Compile(cfg, "WORKSTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := eng.Match(Request{
+		AppPath:    `C:\Program Files\Chrome\chrome.exe`,
+		Hostname:   "api.example.com",
+		TargetPort: 443,
+	})
+	if !d.Matched {
+		t.Fatalf("expected match, got %+v", d)
+	}
+	if d.Match.Application != "*.exe" || d.Match.Host != "*.example.com" || d.Match.Port != "400-500" {
+		t.Fatalf("first alternatives = %+v", d.Match)
+	}
+}
+
+func TestPreflightReportsAnyConditionAlternatives(t *testing.T) {
+	cfg := config.Config{Rules: []config.Rule{{
+		ID: "r1", Name: "Any", Enabled: true,
+		Applications: "*", TargetHosts: "Any", TargetPorts: "Any", Action: config.ActionDirect,
+	}}}
+	eng, err := Compile(cfg, "WORKSTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := eng.Preflight(Request{AppPath: `C:\tool.exe`, TargetIP: netip.MustParseAddr("1.1.1.1"), TargetPort: 443})
+	if !pre.Definitive || !pre.Matched {
+		t.Fatalf("expected definitive match, got %+v", pre)
+	}
+	if pre.Match.Application != "*" || pre.Match.Host != "Any" || pre.Match.Port != "Any" {
+		t.Fatalf("any alternatives = %+v", pre.Match)
+	}
+}
+
+func TestApplicationAnyTelemetryUsesFirstUnconditionalAlternative(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		applications string
+		want         string
+	}{
+		{name: "Any before star", applications: "Any; *; chrome.exe", want: "Any"},
+		{name: "star before Any", applications: "*; Any; chrome.exe", want: "*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{Rules: []config.Rule{{
+				ID: "r1", Name: "Any", Enabled: true,
+				Applications: tc.applications, TargetHosts: "Any", TargetPorts: "Any", Action: config.ActionDirect,
+			}}}
+			eng, err := Compile(cfg, "WORKSTATION")
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision := eng.Match(Request{AppPath: `C:\tool.exe`, TargetPort: 443})
+			if !decision.Matched || decision.Match.Application != tc.want {
+				t.Fatalf("application attribution = %+v, want %q", decision, tc.want)
+			}
+		})
+	}
+}
+
 func TestSplitFieldSupportsSemicolonNewlineAndComma(t *testing.T) {
 	tokens, err := splitField("github.com;\ndownload.jetbrains.com\r\nplugins.jetbrains.com, \"quoted,value\"")
 	if err != nil {
@@ -228,7 +300,7 @@ func TestPreflightDirectBypassForIPRule(t *testing.T) {
 		t.Fatal(err)
 	}
 	pre := eng.Preflight(Request{AppPath: `C:\Apps\firefox.exe`, TargetIP: netip.MustParseAddr("192.168.1.22"), TargetPort: 443})
-	if !pre.Definitive || pre.Action != config.ActionDirect || pre.RuleID != "r1" {
+	if !pre.Definitive || !pre.MatchDefinitive || pre.Action != config.ActionDirect || pre.RuleID != "r1" {
 		t.Fatalf("expected definitive direct preflight, got %+v", pre)
 	}
 }
@@ -259,7 +331,7 @@ func TestPreflightSkipsHostnameOnlyDirectWhenLaterOutcomeIsDirect(t *testing.T) 
 		t.Fatal(err)
 	}
 	pre := eng.Preflight(Request{AppPath: `C:\Apps\codex.exe`, TargetIP: netip.MustParseAddr("104.18.32.47"), TargetPort: 443})
-	if !pre.Definitive || pre.NeedsHostname || pre.Action != config.ActionDirect || pre.RuleID != "default" {
+	if !pre.Definitive || pre.MatchDefinitive || pre.NeedsHostname || pre.Action != config.ActionDirect || pre.RuleID != "default" {
 		t.Fatalf("expected definitive default direct without hostname sniff, got %+v", pre)
 	}
 }

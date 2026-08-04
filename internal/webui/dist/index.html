@@ -88,6 +88,14 @@
         </div>
       </header>
 
+      <div id="webUIIdleBanner" class="webui-idle-banner" role="status" hidden>
+        <div>
+          <strong id="webUIIdleTitle">WebUI приостановлен</strong>
+          <span id="webUIIdleText">Проксирование продолжает работать. Возобновите WebUI через меню pitchProx в области уведомлений.</span>
+        </div>
+        <button id="webUIStatusCheckBtn" type="button">Проверить снова</button>
+      </div>
+
       <main class="workspace">
         <section id="pageRules" class="app-page rules-page" data-page-panel="rules">
           <div class="rules-toolbar toolbar-row">
@@ -101,7 +109,6 @@
               <input id="rulesImportFile" type="file" accept="application/json,.json" hidden>
             </div>
             <div class="toolbar-group toolbar-right">
-              <button id="compactRulesBtn" type="button" class="density-btn" aria-pressed="true">☷ Компактно</button>
               <span id="rulesTotalLabel" class="rules-total">0 правил</span>
             </div>
           </div>
@@ -140,7 +147,7 @@
             <div id="ruleOrderHint" class="rule-order-hint" hidden>Изменение порядка доступно только без поиска и фильтра, чтобы приоритет оставался однозначным.</div>
 
             <div class="rules-table-wrap">
-              <table id="rulesTable" class="rules-table compact">
+              <table id="rulesTable" class="rules-table">
                 <thead>
                   <tr>
                     <th class="col-select"><input id="selectPageRules" type="checkbox" aria-label="Выбрать правила на этой странице"></th>

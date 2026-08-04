@@ -96,6 +96,10 @@ Application orchestration.
 ### `internal/rules`
 
 Compiles Proxifier-style text fields into executable matchers.
+Along with the winning rule, a decision carries the first matching authored
+alternative for application, host and port. These labels are observational
+metadata only; the raw multi-value rule fields and first-rule-wins routing
+semantics are unchanged.
 
 ### `internal/proxy`
 
@@ -151,7 +155,10 @@ Persists:
 - log entries;
 - closed/blocked/error connection records;
 - per-second proxied traffic samples;
-- per-second rule activity samples.
+- 15-second rule activity aggregates, optionally carrying one bounded matched
+  application/host/port tuple and its observation source. Condition details
+  have a 256-key admission budget per bucket and remain coalesced until the
+  bucket closes, preventing snapshot frequency from amplifying disk writes.
 
 History store path:
 
@@ -202,6 +209,8 @@ Responsibilities:
 14. If not blocked, bytes are relayed both ways.
 15. Accounting updates are batched and attributed to:
     - rule stats;
+    - the first matching application/host/port alternatives for each newly
+      observed TCP connection;
     - proxy activity when action is `Proxy` or `Chain`.
 16. Closed/blocked/error connection history is persisted to the file-backed history store.
 17. Open connections remain only in RAM until they close.
@@ -228,6 +237,16 @@ The optimized design intentionally separates **core routing** from **heavy obser
 Verbose logging is only captured while the WebUI is open or recently active. Tray traffic does **not** mark the UI as active.
 When the browser tab is hidden or closing, the frontend explicitly marks the UI inactive so the backend can return to the colder quiet-mode behavior sooner.
 Traffic history for the WebUI is bucketed before it leaves the backend, so long retention windows do not require building or shipping giant per-second arrays.
+Condition details are queried lazily only while a rule is inspected. The query
+reverse-scans retained rule segments into fixed-cap transient maps (1,024 tuple
+groups and 512 marginal values per dimension), returns top-N tuples, and then
+releases all query memory. It never creates a Cartesian product of rule
+alternatives and adds no always-running goroutine or cache.
+Collection itself admits at most 1,024 distinct detailed keys per flush interval
+within the existing 4,096-entry rule pending-map limit. Excess cardinality is
+folded into a source-aware overflow aggregate: ordinary rule connection totals
+remain correct while the detail response reports unattributed hits and marks
+its affected summaries as truncated.
 
 ### Long-running resource lifecycle
 
@@ -235,8 +254,10 @@ Traffic history for the WebUI is bucketed before it leaves the backend, so long 
 - failed writes use a 30-second retry interval and bounded emergency queues, with a diagnostic counter for discarded overflow;
 - startup truncates only an incomplete JSONL tail, while malformed complete lines are skipped without hiding valid neighboring records;
 - dropped-connection pagination, deletion and size trimming stream files instead of loading the full log into RAM;
-- PID-to-executable cache entries use PID plus process creation time, expire after a TTL, and are compacted during on-demand owner refresh;
-- flow, relay and HTTP connection maps replace their backing maps after a high-water burst drains to zero;
+- PID-to-executable cache entries use PID plus process creation time and expire during on-demand owner refresh; the separate WebUI TCP-snapshot cache is released as soon as its observer becomes dormant;
+- flow maps compact after bounded deletions, relay connection maps compact geometrically while a burst drains even if one socket remains open, and the bounded HTTP map resets after draining;
+- condition-detail admission and query maps are bounded; their 15-second admission map is discarded after the bucket is persisted, while overflow keeps rule totals without retaining arbitrary labels;
+- a dormant Direct observer waits on the monitor wake channel rather than periodically polling UI state;
 - the flow cleanup timer is armed only while pending flow records exist;
 - forced heap release is conditional and infrequent rather than an unconditional periodic GC;
 - configuration changes that require a routing restart are activated before being committed to disk and roll back to the previous running configuration if activation fails.
@@ -250,6 +271,7 @@ It controls:
 - historical active-connections view;
 - proxy activity graph window;
 - rule activity window;
+- rule condition-activity window;
 - segment pruning horizon.
 
 The default is 7 minutes.

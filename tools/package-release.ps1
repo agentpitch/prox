@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.43-rc.1",
+    [string]$Version = "v0.43-rc.2",
     [switch]$SkipChecks,
     [switch]$AllowDirty,
     [switch]$DownloadWinDivertArchive,
@@ -162,7 +162,7 @@ function Assert-PitchProxWorkingTreeEOL {
 }
 
 if ($Version -notmatch '^(?:v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?|dev-[0-9a-f]{7,40})$') {
-    throw "Version must look like v0.43, v0.43-rc.1, or dev-1a2b3c4"
+    throw "Version must look like v0.43, v0.43-rc.2, or dev-1a2b3c4"
 }
 if ($SkipChecks -and -not $AllowDirty) {
     throw "-SkipChecks is allowed only together with -AllowDirty for a disposable diagnostic build."
@@ -199,7 +199,7 @@ try {
         Invoke-PitchProxNative -FilePath "node" -Arguments @("--test", "internal\webui\rules_ui_test.js") -FailureMessage "WebUI unit tests failed"
         Invoke-PitchProxNative -FilePath "go" -Arguments @("mod", "download") -FailureMessage "Go module download failed"
         Invoke-PitchProxNative -FilePath "go" -Arguments @("mod", "verify") -FailureMessage "Go module verification failed"
-        Invoke-PitchProxNative -FilePath "go" -Arguments @("test", "-mod=readonly", "-count=1", "./...") -FailureMessage "Go tests failed"
+        Invoke-PitchProxNative -FilePath "go" -Arguments @("test", "-mod=readonly", "-count=1", "-cover", "./...") -FailureMessage "Go tests failed"
         Invoke-PitchProxNative -FilePath "go" -Arguments @("vet", "-mod=readonly", "./...") -FailureMessage "go vet failed"
         Invoke-PitchProxNative -FilePath "git" -Arguments @("diff", "--check") -FailureMessage "git diff --check failed"
         Invoke-PitchProxNative -FilePath "git" -Arguments @("show", "--check", "--format=", "HEAD") -FailureMessage "committed whitespace check failed"

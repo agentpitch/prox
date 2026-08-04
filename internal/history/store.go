@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agentpitch/prox/internal/config"
 )
@@ -22,45 +23,51 @@ import (
 type Store struct {
 	root string
 
-	mu                 sync.Mutex
-	flushMu            sync.Mutex
-	pendingLogs        []LogRecord
-	pendingConnections []ConnectionRecord
-	pendingDropped     []DroppedRecord
-	pendingTraffic     map[int64]TrafficSample
-	pendingRule        map[string]rulePending
-	retention          atomic.Int64
-	droppedMaxBytes    atomic.Int64
-	droppedSeq         atomic.Uint64
-	droppedLimitDirty  atomic.Bool
-	lastPrune          time.Time
-	wake               chan struct{}
-	retry              chan struct{}
-	flushNow           chan struct{}
-	stop               chan struct{}
-	closeOnce          sync.Once
-	closeErr           error
-	lastError          string
-	lastErrorAt        time.Time
-	recoveredTailBytes int64
-	skippedLines       atomic.Int64
-	discardedPending   atomic.Int64
-	wg                 sync.WaitGroup
+	mu                      sync.Mutex
+	flushMu                 sync.Mutex
+	pendingLogs             []LogRecord
+	pendingConnections      []ConnectionRecord
+	pendingDropped          []DroppedRecord
+	pendingTraffic          map[int64]TrafficSample
+	pendingRule             map[string]rulePending
+	pendingConditionBuckets int
+	conditionAdmissionAt    int64
+	conditionAdmissionKeys  map[string]struct{}
+	retention               atomic.Int64
+	droppedMaxBytes         atomic.Int64
+	droppedSeq              atomic.Uint64
+	droppedLimitDirty       atomic.Bool
+	lastPrune               time.Time
+	wake                    chan struct{}
+	retry                   chan struct{}
+	flushNow                chan struct{}
+	stop                    chan struct{}
+	closeOnce               sync.Once
+	closeErr                error
+	lastError               string
+	lastErrorAt             time.Time
+	recoveredTailBytes      int64
+	skippedLines            atomic.Int64
+	discardedPending        atomic.Int64
+	conditionOverflowHits   atomic.Int64
+	wg                      sync.WaitGroup
 }
 
 type DiagnosticStats struct {
-	PendingLogs           int       `json:"pending_logs"`
-	PendingConnections    int       `json:"pending_connections"`
-	PendingDropped        int       `json:"pending_dropped"`
-	PendingTrafficBuckets int       `json:"pending_traffic_buckets"`
-	PendingRuleBuckets    int       `json:"pending_rule_buckets"`
-	RetentionSeconds      int64     `json:"retention_seconds"`
-	DroppedMaxBytes       int64     `json:"dropped_max_bytes"`
-	RecoveredTailBytes    int64     `json:"recovered_tail_bytes"`
-	SkippedLines          int64     `json:"skipped_lines"`
-	DiscardedPending      int64     `json:"discarded_pending"`
-	LastError             string    `json:"last_error,omitempty"`
-	LastErrorAt           time.Time `json:"last_error_at,omitempty"`
+	PendingLogs             int       `json:"pending_logs"`
+	PendingConnections      int       `json:"pending_connections"`
+	PendingDropped          int       `json:"pending_dropped"`
+	PendingTrafficBuckets   int       `json:"pending_traffic_buckets"`
+	PendingRuleBuckets      int       `json:"pending_rule_buckets"`
+	PendingConditionBuckets int       `json:"pending_condition_buckets"`
+	RetentionSeconds        int64     `json:"retention_seconds"`
+	DroppedMaxBytes         int64     `json:"dropped_max_bytes"`
+	RecoveredTailBytes      int64     `json:"recovered_tail_bytes"`
+	SkippedLines            int64     `json:"skipped_lines"`
+	DiscardedPending        int64     `json:"discarded_pending"`
+	ConditionOverflowHits   int64     `json:"condition_overflow_hits"`
+	LastError               string    `json:"last_error,omitempty"`
+	LastErrorAt             time.Time `json:"last_error_at,omitempty"`
 }
 
 type rulePending struct {
@@ -87,6 +94,12 @@ type noveltyAggregate struct {
 	HasOpen     bool
 }
 
+type ruleConditionKey struct {
+	Application string
+	Host        string
+	Port        string
+}
+
 type SnapshotOptions struct {
 	IncludeLogs          bool
 	TrafficBucketSeconds int
@@ -101,6 +114,8 @@ const (
 	maxPendingDropped           = 1024
 	maxPendingTrafficBuckets    = 2048
 	maxPendingRuleBuckets       = 4096
+	maxPendingConditionBuckets  = 1024
+	maxConditionAdmissions      = 256
 	maxInitialConnectionQuery   = 2048
 	connectionQueryPruneTrigger = maxInitialConnectionQuery * 2
 	maxNewConnectionQuery       = 512
@@ -110,6 +125,14 @@ const (
 	maxDroppedQueryLimit        = 500
 	segmentLayout               = "2006010215"
 	ruleActivityWriteBucket     = 15 * time.Second
+	maxConditionQueryGroups     = 1024
+	maxConditionDimensionGroups = 512
+	maxConditionLabelBytes      = 512
+)
+
+const (
+	RuleConditionSourceIntercepted    = "intercepted"
+	RuleConditionSourceDirectObserver = "direct_observer"
 )
 
 func Open(path string, retention time.Duration) (*Store, error) {
@@ -183,18 +206,20 @@ func (s *Store) DiagnosticStats() DiagnosticStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return DiagnosticStats{
-		PendingLogs:           len(s.pendingLogs),
-		PendingConnections:    len(s.pendingConnections),
-		PendingDropped:        len(s.pendingDropped),
-		PendingTrafficBuckets: len(s.pendingTraffic),
-		PendingRuleBuckets:    len(s.pendingRule),
-		RetentionSeconds:      int64(time.Duration(s.retention.Load()) / time.Second),
-		DroppedMaxBytes:       s.droppedMaxBytes.Load(),
-		RecoveredTailBytes:    s.recoveredTailBytes,
-		SkippedLines:          s.skippedLines.Load(),
-		DiscardedPending:      s.discardedPending.Load(),
-		LastError:             s.lastError,
-		LastErrorAt:           s.lastErrorAt,
+		PendingLogs:             len(s.pendingLogs),
+		PendingConnections:      len(s.pendingConnections),
+		PendingDropped:          len(s.pendingDropped),
+		PendingTrafficBuckets:   len(s.pendingTraffic),
+		PendingRuleBuckets:      len(s.pendingRule),
+		PendingConditionBuckets: s.pendingConditionBuckets,
+		RetentionSeconds:        int64(time.Duration(s.retention.Load()) / time.Second),
+		DroppedMaxBytes:         s.droppedMaxBytes.Load(),
+		RecoveredTailBytes:      s.recoveredTailBytes,
+		SkippedLines:            s.skippedLines.Load(),
+		DiscardedPending:        s.discardedPending.Load(),
+		ConditionOverflowHits:   s.conditionOverflowHits.Load(),
+		LastError:               s.lastError,
+		LastErrorAt:             s.lastErrorAt,
 	}
 }
 
@@ -298,15 +323,155 @@ func (s *Store) AddTraffic(ts time.Time, upBytes, downBytes int64) {
 }
 
 func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action config.RuleAction, conns, upBytes, downBytes int64) {
-	if strings.TrimSpace(ruleID) == "" && strings.TrimSpace(ruleName) == "" {
+	s.addRuleActivity(ts, RuleActivity{
+		RuleID:      ruleID,
+		RuleName:    ruleName,
+		Action:      action,
+		Connections: conns,
+		UpBytes:     upBytes,
+		DownBytes:   downBytes,
+	})
+}
+
+// AddRuleConditionHit records one observed TCP connection attributed to the
+// first matching alternative in each rule dimension. Labels are bounded before
+// entering the pending map so malformed or unusually large configurations
+// cannot make telemetry keys grow without limit.
+func (s *Store) AddRuleConditionHit(ts time.Time, ruleID, ruleName string, action config.RuleAction, application, host, port, source string) {
+	source = strings.TrimSpace(source)
+	switch source {
+	case RuleConditionSourceIntercepted, RuleConditionSourceDirectObserver:
+	default:
 		return
 	}
+	var labelOverflow bool
+	application, labelOverflow = boundedConditionLabel(application)
+	host, hostOverflow := boundedConditionLabel(host)
+	port, portOverflow := boundedConditionLabel(port)
+	if labelOverflow || hostOverflow || portOverflow || application == "" || host == "" || port == "" {
+		s.conditionOverflowHits.Add(1)
+		s.addRuleConditionActivity(ts, RuleActivity{
+			RuleID:            ruleID,
+			RuleName:          ruleName,
+			Action:            action,
+			Connections:       1,
+			ConditionSource:   source,
+			ConditionOverflow: true,
+		})
+		return
+	}
+	s.addRuleConditionActivity(ts, RuleActivity{
+		RuleID:               ruleID,
+		RuleName:             ruleName,
+		Action:               action,
+		Connections:          1,
+		ConditionApplication: application,
+		ConditionHost:        host,
+		ConditionPort:        port,
+		ConditionSource:      source,
+	})
+}
+
+func (s *Store) addRuleConditionActivity(ts time.Time, activity RuleActivity) {
+	activity.RuleID = strings.TrimSpace(activity.RuleID)
+	if activity.RuleID == "" && strings.TrimSpace(activity.RuleName) == "" {
+		return
+	}
+	if activity.Connections <= 0 {
+		return
+	}
+	eventTime := ts.UTC().Truncate(time.Second)
+	bucket := eventTime.Truncate(ruleActivityWriteBucket)
+	detailKey := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityPendingIdentity(activity))
+
+	s.mu.Lock()
+	wasEmpty := s.pendingEmptyLocked()
+	item, exists := s.pendingRule[detailKey]
+	if exists {
+		s.pendingRule[detailKey] = mergeRulePending(item, true, eventTime, activity)
+		s.mu.Unlock()
+		if wasEmpty {
+			s.wakeFlush()
+		}
+		return
+	}
+	if activity.ConditionOverflow {
+		if len(s.pendingRule) >= maxPendingRuleBuckets {
+			s.discardedPending.Add(activity.Connections)
+			s.mu.Unlock()
+			return
+		}
+		s.pendingRule[detailKey] = mergeRulePending(rulePending{}, false, eventTime, activity)
+		s.mu.Unlock()
+		if wasEmpty {
+			s.wakeFlush()
+		}
+		return
+	}
+	bucketUnix := bucket.Unix()
+	if s.conditionAdmissionAt == 0 || bucketUnix > s.conditionAdmissionAt {
+		s.conditionAdmissionAt = bucketUnix
+		s.conditionAdmissionKeys = make(map[string]struct{}, 16)
+	}
+	admitDetailed := bucketUnix == s.conditionAdmissionAt && s.conditionAdmissionKeys != nil
+	if admitDetailed {
+		if _, admitted := s.conditionAdmissionKeys[detailKey]; !admitted {
+			if len(s.conditionAdmissionKeys) >= maxConditionAdmissions {
+				admitDetailed = false
+			} else {
+				s.conditionAdmissionKeys[detailKey] = struct{}{}
+			}
+		}
+	}
+	if admitDetailed && s.pendingConditionBuckets < maxPendingConditionBuckets && len(s.pendingRule) < maxPendingRuleBuckets {
+		s.pendingRule[detailKey] = mergeRulePending(rulePending{}, false, eventTime, activity)
+		s.pendingConditionBuckets++
+		s.mu.Unlock()
+		if wasEmpty {
+			s.wakeFlush()
+		}
+		return
+	}
+
+	// Preserve the rule-level connection count even when the detailed tuple
+	// cardinality reaches its stricter cap. The overflow record remains
+	// source-aware so the detail endpoint can report incomplete attribution.
+	overflow := RuleActivity{
+		RuleID:            activity.RuleID,
+		RuleName:          activity.RuleName,
+		Action:            activity.Action,
+		Connections:       activity.Connections,
+		ConditionSource:   activity.ConditionSource,
+		ConditionOverflow: true,
+	}
+	overflowKey := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityPendingIdentity(overflow))
+	overflowItem, overflowExists := s.pendingRule[overflowKey]
+	if !overflowExists && len(s.pendingRule) >= maxPendingRuleBuckets {
+		s.discardedPending.Add(activity.Connections)
+		s.mu.Unlock()
+		return
+	}
+	s.pendingRule[overflowKey] = mergeRulePending(overflowItem, overflowExists, eventTime, overflow)
+	s.conditionOverflowHits.Add(activity.Connections)
+	s.mu.Unlock()
+	if wasEmpty {
+		s.wakeFlush()
+	}
+}
+
+func (s *Store) addRuleActivity(ts time.Time, activity RuleActivity) {
+	ruleID := strings.TrimSpace(activity.RuleID)
+	ruleName := activity.RuleName
+	if ruleID == "" && strings.TrimSpace(ruleName) == "" {
+		return
+	}
+	conns, upBytes, downBytes := activity.Connections, activity.UpBytes, activity.DownBytes
 	if conns == 0 && upBytes == 0 && downBytes == 0 {
 		return
 	}
 	eventTime := ts.UTC().Truncate(time.Second)
 	bucket := eventTime.Truncate(ruleActivityWriteBucket)
-	key := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityIdentity(ruleID, ruleName, action))
+	key := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityPendingIdentity(activity))
 	s.mu.Lock()
 	wasEmpty := s.pendingEmptyLocked()
 	item, exists := s.pendingRule[key]
@@ -315,24 +480,64 @@ func (s *Store) AddRuleActivity(ts time.Time, ruleID, ruleName string, action co
 		s.mu.Unlock()
 		return
 	}
+	activity.RuleID = ruleID
+	s.pendingRule[key] = mergeRulePending(item, exists, eventTime, activity)
+	s.mu.Unlock()
+	if wasEmpty {
+		s.wakeFlush()
+	}
+}
+
+func mergeRulePending(item rulePending, exists bool, eventTime time.Time, activity RuleActivity) rulePending {
 	// Keep the latest real event time as the aggregate timestamp. Using the
 	// bucket start would drop valid events from the first partial bucket of an
 	// exact query window. Counts remain deliberately quantized to 15 seconds,
 	// so at most the older part of one boundary aggregate can be included.
 	if !exists || eventTime.Unix() >= item.Ts {
 		item.Ts = eventTime.Unix()
-		item.Item.RuleID = strings.TrimSpace(ruleID)
-		item.Item.RuleName = ruleName
-		item.Item.Action = action
+		item.Item.RuleID = activity.RuleID
+		item.Item.RuleName = activity.RuleName
+		item.Item.Action = activity.Action
+		item.Item.ConditionApplication = activity.ConditionApplication
+		item.Item.ConditionHost = activity.ConditionHost
+		item.Item.ConditionPort = activity.ConditionPort
+		item.Item.ConditionSource = activity.ConditionSource
+		item.Item.ConditionOverflow = activity.ConditionOverflow
 	}
-	item.Item.Connections += conns
-	item.Item.UpBytes += upBytes
-	item.Item.DownBytes += downBytes
-	s.pendingRule[key] = item
-	s.mu.Unlock()
-	if wasEmpty {
-		s.wakeFlush()
+	item.Item.Connections += activity.Connections
+	item.Item.UpBytes += activity.UpBytes
+	item.Item.DownBytes += activity.DownBytes
+	return item
+}
+
+func ruleActivityPendingIdentity(item RuleActivity) string {
+	overflow := "0"
+	if item.ConditionOverflow {
+		overflow = "1"
 	}
+	return strings.Join([]string{
+		ruleActivityIdentity(item.RuleID, item.RuleName, item.Action),
+		item.ConditionApplication,
+		item.ConditionHost,
+		item.ConditionPort,
+		item.ConditionSource,
+		overflow,
+	}, "\x1f")
+}
+
+func boundedConditionLabel(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if !utf8.ValidString(value) {
+		return "", true
+	}
+	if len(value) <= maxConditionLabelBytes {
+		return value, false
+	}
+	value = value[:maxConditionLabelBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value, true
 }
 
 func ruleActivityIdentity(ruleID, ruleName string, action config.RuleAction) string {
@@ -564,10 +769,20 @@ func (s *Store) DeleteDroppedConnections(ids []string) error {
 	return s.enforceDroppedLimit()
 }
 
+// Flush persists ordinary history and every completed condition bucket. The
+// active 15-second condition bucket intentionally remains pending so repeated
+// WebUI snapshots cannot amplify one aggregate into multiple JSONL records;
+// Close uses flushAll to persist that final partial bucket.
 func (s *Store) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	return s.flushLocked()
+}
+
+func (s *Store) flushAll() error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	return s.flushLockedMode(true)
 }
 
 type flushBatch struct {
@@ -580,25 +795,66 @@ type flushBatch struct {
 }
 
 func (s *Store) flushLocked() error {
+	return s.flushLockedMode(false)
+}
+
+func (s *Store) flushLockedMode(forceConditions bool) error {
 	s.mu.Lock()
+	currentConditionBucket := time.Now().UTC().Truncate(ruleActivityWriteBucket)
+	if forceConditions {
+		s.conditionAdmissionAt = 0
+		s.conditionAdmissionKeys = nil
+	} else if s.conditionAdmissionAt != 0 && s.conditionAdmissionAt != currentConditionBucket.Unix() {
+		// Retain the monotonic bucket high-water mark so a late event cannot
+		// reopen an already persisted bucket, but release all per-key memory.
+		s.conditionAdmissionKeys = nil
+	}
+	retainedRuleCount := 0
+	retainedConditionBuckets := 0
+	if !forceConditions {
+		for _, item := range s.pendingRule {
+			if !ruleActivityIsConditionTelemetry(item.Item) || !time.Unix(item.Ts, 0).UTC().Truncate(ruleActivityWriteBucket).Equal(currentConditionBucket) {
+				continue
+			}
+			retainedRuleCount++
+			if ruleActivityHasCondition(item.Item) {
+				retainedConditionBuckets++
+			}
+		}
+	}
 	batch := flushBatch{
-		logs:       s.pendingLogs,
-		conns:      s.pendingConnections,
-		dropped:    s.pendingDropped,
-		traffic:    s.pendingTraffic,
-		rules:      s.pendingRule,
-		limitDirty: s.droppedLimitDirty.Swap(false),
+		logs:    s.pendingLogs,
+		conns:   s.pendingConnections,
+		dropped: s.pendingDropped,
+		traffic: s.pendingTraffic,
 	}
 	shouldPrune := time.Since(s.lastPrune) >= pruneInterval
-	if batch.empty() && !shouldPrune {
+	hasFlushableRules := len(s.pendingRule) > retainedRuleCount
+	if len(batch.logs) == 0 && len(batch.conns) == 0 && len(batch.dropped) == 0 && len(batch.traffic) == 0 &&
+		!hasFlushableRules && !s.droppedLimitDirty.Load() && !shouldPrune {
 		s.mu.Unlock()
 		return nil
 	}
+	retainedRules := make(map[string]rulePending, retainedRuleCount)
+	if retainedRuleCount == 0 {
+		batch.rules = s.pendingRule
+	} else {
+		batch.rules = make(map[string]rulePending, len(s.pendingRule)-retainedRuleCount)
+		for key, item := range s.pendingRule {
+			if ruleActivityIsConditionTelemetry(item.Item) && time.Unix(item.Ts, 0).UTC().Truncate(ruleActivityWriteBucket).Equal(currentConditionBucket) {
+				retainedRules[key] = item
+			} else {
+				batch.rules[key] = item
+			}
+		}
+	}
+	batch.limitDirty = s.droppedLimitDirty.Swap(false)
 	s.pendingLogs = nil
 	s.pendingConnections = nil
 	s.pendingDropped = nil
 	s.pendingTraffic = map[int64]TrafficSample{}
-	s.pendingRule = map[string]rulePending{}
+	s.pendingRule = retainedRules
+	s.pendingConditionBuckets = retainedConditionBuckets
 	s.mu.Unlock()
 
 	if err := s.appendLogs(batch.logs); err != nil {
@@ -696,7 +952,7 @@ func (s *Store) loop() {
 		select {
 		case <-s.stop:
 			stopTimer()
-			err := s.Flush()
+			err := s.flushAll()
 			s.mu.Lock()
 			s.closeErr = err
 			s.mu.Unlock()
@@ -735,11 +991,6 @@ func (s *Store) wakeRetry() {
 	case s.retry <- struct{}{}:
 	default:
 	}
-}
-
-func (b flushBatch) empty() bool {
-	return len(b.logs) == 0 && len(b.conns) == 0 && len(b.dropped) == 0 &&
-		len(b.traffic) == 0 && len(b.rules) == 0 && !b.limitDirty
 }
 
 func (s *Store) pendingEmptyLocked() bool {
@@ -785,23 +1036,27 @@ func (s *Store) failFlush(batch flushBatch, err error) error {
 		s.pendingTraffic[key] = current
 	}
 	for key, item := range batch.rules {
-		current, exists := s.pendingRule[key]
-		if !exists && len(s.pendingRule) >= maxPendingRuleBuckets {
-			s.discardedPending.Add(1)
+		detailed := ruleActivityHasCondition(item.Item)
+		_, exists := s.pendingRule[key]
+		if detailed && !exists && s.pendingConditionBuckets >= maxPendingConditionBuckets {
+			if s.mergeConditionOverflowForRetryLocked(item) {
+				s.conditionOverflowHits.Add(item.Item.Connections)
+			} else {
+				s.discardedPending.Add(max(1, item.Item.Connections))
+			}
 			continue
 		}
-		if current.Ts == 0 {
-			current.Ts = item.Ts
+		if !s.mergeRulePendingForRetryLocked(key, item) {
+			if detailed && s.mergeConditionOverflowForRetryLocked(item) {
+				s.conditionOverflowHits.Add(item.Item.Connections)
+			} else {
+				s.discardedPending.Add(max(1, item.Item.Connections))
+			}
+			continue
 		}
-		if current.Item.RuleID == "" {
-			current.Item.RuleID = item.Item.RuleID
-			current.Item.RuleName = item.Item.RuleName
-			current.Item.Action = item.Item.Action
+		if detailed && !exists {
+			s.pendingConditionBuckets++
 		}
-		current.Item.Connections += item.Item.Connections
-		current.Item.UpBytes += item.Item.UpBytes
-		current.Item.DownBytes += item.Item.DownBytes
-		s.pendingRule[key] = current
 	}
 	if batch.limitDirty {
 		s.droppedLimitDirty.Store(true)
@@ -811,6 +1066,37 @@ func (s *Store) failFlush(batch flushBatch, err error) error {
 	s.mu.Unlock()
 	s.wakeRetry()
 	return err
+}
+
+func (s *Store) mergeRulePendingForRetryLocked(key string, item rulePending) bool {
+	current, exists := s.pendingRule[key]
+	if !exists && len(s.pendingRule) >= maxPendingRuleBuckets {
+		return false
+	}
+	s.pendingRule[key] = mergeRulePending(current, exists, time.Unix(item.Ts, 0).UTC(), item.Item)
+	return true
+}
+
+func (s *Store) mergeConditionOverflowForRetryLocked(item rulePending) bool {
+	overflow := RuleActivity{
+		RuleID:            item.Item.RuleID,
+		RuleName:          item.Item.RuleName,
+		Action:            item.Item.Action,
+		Connections:       item.Item.Connections,
+		ConditionSource:   item.Item.ConditionSource,
+		ConditionOverflow: true,
+	}
+	eventTime := time.Unix(item.Ts, 0).UTC()
+	key := fmt.Sprintf("%d\x1f%s", eventTime.Truncate(ruleActivityWriteBucket).Unix(), ruleActivityPendingIdentity(overflow))
+	return s.mergeRulePendingForRetryLocked(key, rulePending{Ts: item.Ts, Item: overflow})
+}
+
+func ruleActivityHasCondition(item RuleActivity) bool {
+	return item.ConditionApplication != "" && item.ConditionHost != "" && item.ConditionPort != "" && !item.ConditionOverflow
+}
+
+func ruleActivityIsConditionTelemetry(item RuleActivity) bool {
+	return item.ConditionOverflow || ruleActivityHasCondition(item)
 }
 
 func prependBounded[T any](older, newer []T, limit int) ([]T, int) {
@@ -1624,29 +1910,46 @@ func (s *Store) queryTraffic(cutoff time.Time, bucketSeconds int) ([]TrafficSamp
 }
 
 func (s *Store) queryRuleStats(cutoff time.Time) ([]RuleActivity, error) {
-	files, err := s.segmentFiles("rules", cutoff)
+	files, pending, err := s.snapshotRuleTimelineSources(cutoff)
 	if err != nil {
 		return nil, err
 	}
 	agg := map[string]RuleActivity{}
-	for _, file := range files {
-		if err := readSegmentFile(file, func(item timedRuleActivity) {
-			if item.Time.UTC().Before(cutoff) {
-				return
-			}
-			if item.Connections == 0 && item.UpBytes == 0 && item.DownBytes == 0 {
-				return
-			}
-			key := ruleActivityIdentity(item.RuleID, item.RuleName, item.Action)
-			current := agg[key]
+	metadataAt := map[string]time.Time{}
+	add := func(item timedRuleActivity) {
+		if item.Time.UTC().Before(cutoff) {
+			return
+		}
+		if item.Connections == 0 && item.UpBytes == 0 && item.DownBytes == 0 {
+			return
+		}
+		key := ruleActivityIdentity(item.RuleID, item.RuleName, item.Action)
+		current := agg[key]
+		if latest, exists := metadataAt[key]; !exists || item.Time.After(latest) {
 			current.RuleID = strings.TrimSpace(item.RuleID)
 			current.RuleName = item.RuleName
 			current.Action = item.Action
-			current.Connections += item.Connections
-			current.UpBytes += item.UpBytes
-			current.DownBytes += item.DownBytes
-			agg[key] = current
-		}, s.noteSkippedLine); err != nil {
+			metadataAt[key] = item.Time
+		}
+		current.Connections += item.Connections
+		current.UpBytes += item.UpBytes
+		current.DownBytes += item.DownBytes
+		agg[key] = current
+	}
+	for _, item := range pending {
+		add(item)
+	}
+	for _, file := range files {
+		_, err := scanLinesReverseUntil(file.path, file.size, func(line []byte) bool {
+			var item timedRuleActivity
+			if err := json.Unmarshal(line, &item); err != nil {
+				s.noteSkippedLine()
+				return true
+			}
+			add(item)
+			return true
+		})
+		if err != nil {
 			return nil, fmt.Errorf("query rule stats: %w", err)
 		}
 	}
@@ -1799,6 +2102,220 @@ func (s *Store) RuleActivityTimeline(ruleIDs []string, window time.Duration, poi
 		}
 	}
 	return out, nil
+}
+
+// RuleConditionActivity returns a top-N view of observed condition tuples for
+// one stable rule ID. It reuses the retained rule segment stream and keeps at
+// most maxConditionQueryGroups aggregates in memory, independent of history
+// size or application uptime.
+func (s *Store) RuleConditionActivity(ruleID string, window time.Duration, limit int) (RuleConditionActivityResult, error) {
+	ruleID = strings.TrimSpace(ruleID)
+	if window < time.Minute {
+		window = time.Minute
+	}
+	if window > time.Hour {
+		window = time.Hour
+	}
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	generatedAt := time.Now().UTC().Truncate(time.Second)
+	cutoff := generatedAt.Add(-window)
+	out := RuleConditionActivityResult{
+		GeneratedAt:   generatedAt,
+		RuleID:        ruleID,
+		WindowMinutes: int(window / time.Minute),
+		Conditions:    []RuleConditionActivity{},
+		Dimensions: RuleConditionDimensions{
+			Applications: RuleConditionDimension{Values: []RuleConditionDimensionValue{}},
+			Hosts:        RuleConditionDimension{Values: []RuleConditionDimensionValue{}},
+			Ports:        RuleConditionDimension{Values: []RuleConditionDimensionValue{}},
+		},
+	}
+	if ruleID == "" {
+		return out, nil
+	}
+
+	files, pending, err := s.snapshotRuleTimelineSources(cutoff)
+	if err != nil {
+		return RuleConditionActivityResult{}, err
+	}
+	agg := make(map[ruleConditionKey]RuleConditionActivity, min(maxConditionQueryGroups, limit*4))
+	applicationAgg := make(map[string]RuleConditionDimensionValue)
+	hostAgg := make(map[string]RuleConditionDimensionValue)
+	portAgg := make(map[string]RuleConditionDimensionValue)
+	add := func(item timedRuleActivity) {
+		itemTime := item.Time.UTC()
+		if itemTime.Before(cutoff) || itemTime.After(generatedAt) || strings.TrimSpace(item.RuleID) != ruleID {
+			return
+		}
+		if item.Connections <= 0 {
+			return
+		}
+		if item.ConditionSource != RuleConditionSourceIntercepted && item.ConditionSource != RuleConditionSourceDirectObserver {
+			return
+		}
+		hits := item.Connections
+		if item.ConditionOverflow {
+			out.TotalHits += hits
+			out.UnattributedHits += hits
+			out.Truncated = true
+			addRuleConditionSource(&out.SourceHits, item.ConditionSource, hits)
+			addRuleConditionDimensionOverflow(&out.Dimensions.Applications, hits)
+			addRuleConditionDimensionOverflow(&out.Dimensions.Hosts, hits)
+			addRuleConditionDimensionOverflow(&out.Dimensions.Ports, hits)
+			return
+		}
+		if item.ConditionApplication == "" || item.ConditionHost == "" || item.ConditionPort == "" {
+			return
+		}
+		out.TotalHits += hits
+		addRuleConditionSource(&out.SourceHits, item.ConditionSource, hits)
+		addRuleConditionDimension(&out.Dimensions.Applications, applicationAgg, item.ConditionApplication, item.ConditionSource, itemTime, hits)
+		addRuleConditionDimension(&out.Dimensions.Hosts, hostAgg, item.ConditionHost, item.ConditionSource, itemTime, hits)
+		addRuleConditionDimension(&out.Dimensions.Ports, portAgg, item.ConditionPort, item.ConditionSource, itemTime, hits)
+		key := ruleConditionKey{Application: item.ConditionApplication, Host: item.ConditionHost, Port: item.ConditionPort}
+		current, exists := agg[key]
+		if !exists {
+			if len(agg) >= maxConditionQueryGroups {
+				out.Truncated = true
+				return
+			}
+			current = RuleConditionActivity{
+				Application: item.ConditionApplication,
+				Host:        item.ConditionHost,
+				Port:        item.ConditionPort,
+			}
+		}
+		current.Hits += hits
+		addRuleConditionSource(&current.Sources, item.ConditionSource, hits)
+		if itemTime.After(current.LastSeen) {
+			current.LastSeen = itemTime
+		}
+		agg[key] = current
+	}
+
+	for _, item := range pending {
+		add(item)
+	}
+	stopOlderFiles := false
+	for i := len(files) - 1; i >= 0 && !stopOlderFiles; i-- {
+		file := files[i]
+		_, err := scanLinesReverseUntil(file.path, file.size, func(line []byte) bool {
+			var item timedRuleActivity
+			if err := json.Unmarshal(line, &item); err != nil {
+				s.noteSkippedLine()
+				return true
+			}
+			itemTime := item.Time.UTC()
+			if itemTime.Before(cutoff) {
+				if ruleActivityBucketBeforeCutoff(itemTime, cutoff) {
+					stopOlderFiles = true
+					return false
+				}
+				return true
+			}
+			add(item)
+			return true
+		})
+		if err != nil {
+			return RuleConditionActivityResult{}, fmt.Errorf("query rule condition activity: %w", err)
+		}
+	}
+
+	conditions := make([]RuleConditionActivity, 0, len(agg))
+	for _, item := range agg {
+		conditions = append(conditions, item)
+	}
+	sort.Slice(conditions, func(i, j int) bool {
+		if conditions[i].Hits != conditions[j].Hits {
+			return conditions[i].Hits > conditions[j].Hits
+		}
+		if !conditions[i].LastSeen.Equal(conditions[j].LastSeen) {
+			return conditions[i].LastSeen.After(conditions[j].LastSeen)
+		}
+		if conditions[i].Application != conditions[j].Application {
+			return conditions[i].Application < conditions[j].Application
+		}
+		if conditions[i].Host != conditions[j].Host {
+			return conditions[i].Host < conditions[j].Host
+		}
+		return conditions[i].Port < conditions[j].Port
+	})
+	if len(conditions) > limit {
+		conditions = conditions[:limit]
+		out.Truncated = true
+	}
+	var returnedHits int64
+	for i := range conditions {
+		returnedHits += conditions[i].Hits
+		if out.TotalHits > 0 {
+			conditions[i].Share = float64(conditions[i].Hits) / float64(out.TotalHits)
+		}
+	}
+	out.OtherHits = out.TotalHits - returnedHits
+	out.Conditions = conditions
+	finalizeRuleConditionDimension(&out.Dimensions.Applications, applicationAgg)
+	finalizeRuleConditionDimension(&out.Dimensions.Hosts, hostAgg)
+	finalizeRuleConditionDimension(&out.Dimensions.Ports, portAgg)
+	return out, nil
+}
+
+func addRuleConditionDimension(dimension *RuleConditionDimension, agg map[string]RuleConditionDimensionValue, value, source string, seenAt time.Time, hits int64) {
+	dimension.TotalHits += hits
+	current, exists := agg[value]
+	if !exists {
+		if len(agg) >= maxConditionDimensionGroups {
+			dimension.OtherHits += hits
+			dimension.Truncated = true
+			return
+		}
+		current.Value = value
+	}
+	current.Hits += hits
+	addRuleConditionSource(&current.Sources, source, hits)
+	if seenAt.After(current.LastSeen) {
+		current.LastSeen = seenAt
+	}
+	agg[value] = current
+}
+
+func addRuleConditionDimensionOverflow(dimension *RuleConditionDimension, hits int64) {
+	dimension.TotalHits += hits
+	dimension.OtherHits += hits
+	dimension.Truncated = true
+}
+
+func finalizeRuleConditionDimension(dimension *RuleConditionDimension, agg map[string]RuleConditionDimensionValue) {
+	dimension.Values = make([]RuleConditionDimensionValue, 0, len(agg))
+	for _, item := range agg {
+		if dimension.TotalHits > 0 {
+			item.Share = float64(item.Hits) / float64(dimension.TotalHits)
+		}
+		dimension.Values = append(dimension.Values, item)
+	}
+	sort.Slice(dimension.Values, func(i, j int) bool {
+		if dimension.Values[i].Hits != dimension.Values[j].Hits {
+			return dimension.Values[i].Hits > dimension.Values[j].Hits
+		}
+		if !dimension.Values[i].LastSeen.Equal(dimension.Values[j].LastSeen) {
+			return dimension.Values[i].LastSeen.After(dimension.Values[j].LastSeen)
+		}
+		return dimension.Values[i].Value < dimension.Values[j].Value
+	})
+}
+
+func addRuleConditionSource(counts *RuleConditionSources, source string, hits int64) {
+	switch source {
+	case RuleConditionSourceIntercepted:
+		counts.Intercepted += hits
+	case RuleConditionSourceDirectObserver:
+		counts.DirectObserver += hits
+	}
 }
 
 func ruleActivityBucketBeforeCutoff(itemTime, cutoff time.Time) bool {

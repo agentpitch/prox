@@ -18,7 +18,9 @@ This archive contains the current optimized baseline with segment-backed history
 - SQLite and `modernc` were removed from the runtime path.
 - history recovery, retry and pending-memory behavior are bounded for long-running disk-error scenarios;
 - process-path caches validate PID reuse with process creation time;
-- flow/connection maps release high-water capacity after draining;
+- flow/connection maps geometrically release high-water capacity while bursts drain, even if a long-lived connection remains;
+- the WebUI-only PID/path snapshot cache is released when the Direct observer becomes dormant;
+- per-condition history is coalesced once per 15-second bucket with a 256-key admission budget, so frequent WebUI snapshots cannot amplify JSONL writes;
 - IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
 - runtime config activation rolls back if a required listener/interception restart fails.
 
@@ -28,7 +30,7 @@ A publishable v0.43 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.2
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is
@@ -44,7 +46,7 @@ node --test internal/webui/rules_ui_test.js
 go1.26.5 windows/amd64, GOAMD64=v1, CGO_ENABLED=0
 GOWORK=off, GOENV=off, default GOEXPERIMENT/GOFIPS140, exact repository go.mod
 go mod download + verify with GOFLAGS=-mod=readonly
-go test -mod=readonly -count=1 ./...
+go test -mod=readonly -count=1 -cover ./...
 go vet -mod=readonly ./...
 git diff --check and git show --check HEAD
 physical working-tree EOLs match .gitattributes
@@ -109,6 +111,7 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 - rule matching works for `Direct / Proxy / Chain / Block`;
 - proxy activity, connection history, and logs continue to work after long uptime;
 - hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
+- WebUI auto-pauses after one hour without browser requests, control/tray polling and a long-lived SSE do not prevent it, the loaded page reports that routing continues, and **Управление** in the tray enables it again;
 - idle memory is materially lower than older builds because the binary no longer links `net/http`/TLS or SQLite.
 
 ## Audit verification on 2026-07-28

@@ -9,7 +9,7 @@ The API is intended for localhost use only.
 Response:
 
 ```json
-{"ok": true, "version": "v0.43-rc.1"}
+{"ok": true, "version": "v0.43-rc.2"}
 ```
 
 `version` is injected at build time. Unversioned developer builds report
@@ -115,6 +115,110 @@ exactly after outer whitespace is trimmed.
 Direct-connection byte counts may be unavailable because direct traffic does
 not necessarily traverse the relay.
 
+## `GET /api/rules/condition-activity`
+
+Returns a bounded, lazy detail view for one exact stable rule ID. It shows
+which authored `Applications + Target hosts + Ports` alternatives actually
+matched observed TCP connections. It does not expand the rule into a Cartesian
+product and does not keep a permanent in-memory telemetry cache.
+
+Query parameters:
+
+- exactly one `id=<rule-id>`; the opaque ID is matched case-sensitively after
+  trimming only its outer whitespace;
+- `window_minutes`, default 15, range 1–60 and clamped to configured retention;
+- `limit`, default 20, range 1–100, limiting returned condition tuples.
+
+Example response (abbreviated):
+
+```json
+{
+  "generated_at": "2026-08-04T12:00:00Z",
+  "rule_id": "browser",
+  "window_minutes": 15,
+  "total_hits": 10,
+  "other_hits": 0,
+  "unattributed_hits": 0,
+  "truncated": false,
+  "source_hits": {"intercepted": 9, "direct_observer": 1},
+  "conditions": [
+    {
+      "application": "chrome.exe",
+      "host": "*.example.com",
+      "port": "443",
+      "hits": 10,
+      "share": 1,
+      "last_seen": "2026-08-04T11:59:48Z",
+      "sources": {"intercepted": 9, "direct_observer": 1}
+    }
+  ],
+  "dimensions": {
+    "applications": {
+      "total_hits": 10,
+      "other_hits": 0,
+      "truncated": false,
+      "values": [
+        {
+          "value": "chrome.exe",
+          "hits": 10,
+          "share": 1,
+          "last_seen": "2026-08-04T11:59:48Z",
+          "sources": {"intercepted": 9, "direct_observer": 1}
+        }
+      ]
+    },
+    "hosts": {"total_hits": 10, "other_hits": 0, "truncated": false, "values": [{"value": "*.example.com", "hits": 10, "share": 1, "last_seen": "2026-08-04T11:59:48Z", "sources": {"intercepted": 9, "direct_observer": 1}}]},
+    "ports": {"total_hits": 10, "other_hits": 0, "truncated": false, "values": [{"value": "443", "hits": 10, "share": 1, "last_seen": "2026-08-04T11:59:48Z", "sources": {"intercepted": 9, "direct_observer": 1}}]}
+  },
+  "accuracy": {
+    "unit": "tcp_connection",
+    "attribution": "first_matching_alternative",
+    "intercepted_complete": true,
+    "direct_complete": false,
+    "boundary_seconds": 15,
+    "notice": "..."
+  }
+}
+```
+
+Semantics and limits:
+
+- one `hit` is one newly observed TCP connection, not one HTTP request;
+- if alternatives overlap, the first matching alternative in that dimension
+  receives the hit. Case-insensitive application/host labels are canonicalized
+  to lowercase (application `/` becomes `\\`); quotes and outer whitespace are
+  removed. Unrestricted applications keep `*` versus `Any`, while an empty
+  unrestricted field is reported as `Any`;
+- `share` always uses `total_hits` as its denominator; `other_hits` is the
+  observed count omitted from the returned top tuples. `unattributed_hits` is
+  the subset whose detailed label was deliberately collapsed under overload;
+- collection admits at most 256 distinct detailed keys per 15-second write
+  bucket inside the existing 1,024-detail/4,096-rule pending bounds. Repeated
+  hits for an admitted tuple stay aggregated in memory until that bucket
+  closes, so WebUI snapshots cannot multiply JSONL records. Further hits and
+  labels that are invalid UTF-8 or exceed 512 bytes are folded into a
+  source-aware overflow aggregate, preserving the ordinary rule connection
+  total while marking detail as truncated;
+- the tuple query also keeps at most 1,024 transient groups and returns at most
+  `limit`; each marginal dimension keeps at most 512 transient values;
+- marginal `dimensions` are calculated independently of tuple top-N. The UI
+  can merge them with the current raw rule tokens without constructing a
+  potentially enormous Cartesian product;
+- when a dimension has `truncated=false`, an authored token absent from
+  `values` has zero *observed* hits in the requested window. With
+  `truncated=true`, absence means unknown and must not be presented as zero;
+- intercepted/routed connections have exact tuple attribution when
+  `unattributed_hits` is zero. Direct traffic
+  is sampled by the connection observer only while it is active and a
+  long-lived socket can be observed again after an observer pause, so zero
+  direct hits do not prove that a condition is unused;
+- legacy rule-activity records without condition labels are excluded from
+  `total_hits`, and byte-only activity does not affect condition shares;
+- one tuple/source produces at most one persisted record per 15-second write
+  bucket during normal operation. The small admission map is released when the
+  bucket closes. As with the rule timeline, a query boundary can include the
+  older part of one boundary aggregate.
+
 ## `GET /api/tray`
 
 Returns a lightweight proxied-traffic view for the tray.
@@ -140,6 +244,8 @@ Used for real-time log delivery while the UI is actively open.
 Event types emitted by the backend:
 
 - `log`
+- `webui_status` - a transient state notification sent immediately before an
+  automatic or manual WebUI pause; it is not written to history.
 
 ## `POST /api/ui/visibility`
 
@@ -155,6 +261,34 @@ Behavior:
 
 - `active=true` marks the UI as actively viewed;
 - `active=false` allows the backend to cool down sooner when the tab is hidden or closing.
+
+## WebUI idle control
+
+`GET /api/control/webui/status` remains available even while the WebUI is
+disabled. Its response distinguishes an idle WebUI pause from a proxy-service
+pause:
+
+```json
+{
+  "enabled": false,
+  "paused": false,
+  "auto_paused": true,
+  "disabled_reason": "idle",
+  "disabled_at": "2026-08-04T12:00:00Z",
+  "idle_timeout_seconds": 3600
+}
+```
+
+While enabled, `idle_deadline_at` contains the current deadline and
+`disabled_at`/`disabled_reason` are omitted. `POST /api/control/webui/enable`
+enables the UI and establishes a fresh one-hour deadline;
+`POST /api/control/webui/disable` disables it with reason `manual`.
+
+The one-hour transition disables only WebUI data/static routes and closes live
+UI subscriptions. Runtime routing, WinDivert, proxy tunnels and connection
+history continue normally. Health, tray and control endpoints remain
+available. A browser navigation to a disabled WebUI receives a small standalone
+HTTP 503 explanation page instead of loading the full application.
 
 ## `POST /api/proxy-test`
 
@@ -201,9 +335,14 @@ Service mode:
 
 ## UI activity semantics
 
-Only `/api/snapshot` and `/api/events` automatically count as evidence of an
-actively viewed UI. An explicit `/api/ui/visibility` request with
-`active=true` also marks it active; `active=false` starts the cooldown. Other
-API calls do not extend the active period. This prevents tray polling, rule
-sparklines, health checks, or control requests from accidentally keeping
-verbose log capture enabled.
+Verbose-log activity and the one-hour WebUI idle timer are separate mechanisms.
+`/api/snapshot`, `/api/events` and explicit visibility continue to control the
+short verbose-log window.
+
+The idle timer is extended by static WebUI navigation or an application request
+marked with `X-PitchProx-WebUI: 1`. EventSource uses `?_ui=1` because browser
+EventSource cannot attach that header. Opening SSE counts once; keeping the
+connection open or receiving server pings does not. `active=false`, health,
+tray, service-control and WebUI-control traffic never extends the deadline.
+One shared last-request timestamp means activity from any open tab extends the
+deadline, while hiding a different tab cannot shorten it.

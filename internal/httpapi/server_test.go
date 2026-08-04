@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -218,6 +219,229 @@ func TestShouldMarkUIActiveOnlyForLiveEndpoints(t *testing.T) {
 	}
 }
 
+func TestBrowserWebUIActivityClassification(t *testing.T) {
+	markedHeaders := map[string]string{"x-pitchprox-webui": "1"}
+	tests := []struct {
+		name string
+		req  request
+		want bool
+	}{
+		{name: "static document", req: request{Method: "GET", Path: "/"}, want: true},
+		{name: "static asset", req: request{Method: "GET", Path: "/app.js"}, want: true},
+		{name: "unmarked API client", req: request{Method: "GET", Path: "/api/config"}, want: false},
+		{name: "marked WebUI API", req: request{Method: "GET", Path: "/api/config", Headers: markedHeaders}, want: true},
+		{name: "opened WebUI SSE", req: request{Method: "GET", Path: "/api/events", Query: url.Values{"_ui": {"1"}}}, want: true},
+		{name: "control never counts", req: request{Method: "GET", Path: "/api/control/webui/status", Headers: markedHeaders}, want: false},
+		{name: "tray never counts", req: request{Method: "GET", Path: "/api/tray", Headers: markedHeaders}, want: false},
+		{name: "health never counts", req: request{Method: "GET", Path: "/api/health", Headers: markedHeaders}, want: false},
+		{name: "visible tab", req: request{Method: "POST", Path: "/api/ui/visibility", Headers: markedHeaders, Body: []byte(`{"active":true}`)}, want: true},
+		{name: "hidden tab", req: request{Method: "POST", Path: "/api/ui/visibility", Headers: markedHeaders, Body: []byte(`{"active":false}`)}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isBrowserWebUIActivity(test.req); got != test.want {
+				t.Fatalf("isBrowserWebUIActivity() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestWebUIActivityFromAnyTabExtendsOneGlobalDeadline(t *testing.T) {
+	runtime := newFakeRuntime(t, freeHTTPAddr(t))
+	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.webUIIdleTimeout = time.Hour
+	srv.webUILastBrowserRequest = time.Now().Add(-30 * time.Minute)
+	srv.startWebUIIdleTimer()
+	t.Cleanup(srv.stopWebUIIdleTimer)
+	srv.webUIMu.RLock()
+	initialTimer := srv.webUIIdleTimer
+	srv.webUIMu.RUnlock()
+
+	visible := request{Method: "POST", Path: "/api/ui/visibility", Headers: map[string]string{"x-pitchprox-webui": "1"}, Body: []byte(`{"active":true}`)}
+	if !srv.admitWebUIRequest(visible) {
+		t.Fatal("visible browser tab was not admitted")
+	}
+	first := srv.webUIStatus()
+	if first.IdleDeadlineAt == nil {
+		t.Fatal("visible browser tab did not establish an idle deadline")
+	}
+
+	hidden := visible
+	hidden.Body = []byte(`{"active":false}`)
+	if !srv.admitWebUIRequest(hidden) {
+		t.Fatal("hidden browser tab request was not admitted")
+	}
+	afterHidden := srv.webUIStatus()
+	if afterHidden.IdleDeadlineAt == nil || !afterHidden.IdleDeadlineAt.Equal(*first.IdleDeadlineAt) {
+		t.Fatalf("hidden tab changed the shared deadline: before=%v after=%v", first.IdleDeadlineAt, afterHidden.IdleDeadlineAt)
+	}
+
+	time.Sleep(time.Millisecond)
+	secondTab := request{Method: "GET", Path: "/api/config", Headers: map[string]string{"x-pitchprox-webui": "1"}}
+	if !srv.admitWebUIRequest(secondTab) {
+		t.Fatal("second browser tab was not admitted")
+	}
+	afterSecond := srv.webUIStatus()
+	if afterSecond.IdleDeadlineAt == nil || !afterSecond.IdleDeadlineAt.After(*first.IdleDeadlineAt) {
+		t.Fatalf("second tab did not extend the shared deadline: before=%v after=%v", first.IdleDeadlineAt, afterSecond.IdleDeadlineAt)
+	}
+	srv.webUIMu.RLock()
+	afterRequestsTimer := srv.webUIIdleTimer
+	srv.webUIMu.RUnlock()
+	if initialTimer == nil || afterRequestsTimer != initialTimer {
+		t.Fatal("ordinary browser requests churned the one-shot idle timer")
+	}
+}
+
+func TestWebUIIdleTimerPausesOnlyUIAndNotifiesLongSSESubscriber(t *testing.T) {
+	runtime := newFakeRuntime(t, freeHTTPAddr(t))
+	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.webUIIdleTimeout = 40 * time.Millisecond
+	_, events, cancel := runtime.mon.Subscribe()
+	defer cancel()
+	srv.startWebUIIdleTimer()
+	t.Cleanup(srv.stopWebUIIdleTimer)
+
+	deadline := time.After(2 * time.Second)
+	var paused webUIStatusDTO
+	for events != nil {
+		select {
+		case payload, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			var envelope struct {
+				Type string          `json:"type"`
+				Data json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(payload, &envelope); err != nil {
+				t.Fatalf("decode transient event: %v", err)
+			}
+			if envelope.Type == "webui_status" {
+				if err := json.Unmarshal(envelope.Data, &paused); err != nil {
+					t.Fatalf("decode WebUI status event: %v", err)
+				}
+			}
+		case <-deadline:
+			t.Fatal("WebUI idle timer did not close the long-lived subscriber")
+		}
+	}
+
+	if srv.WebUIEnabled() {
+		t.Fatal("WebUI remained enabled after browser-idle timeout")
+	}
+	if !paused.AutoPaused || paused.DisabledReason != webUIDisabledIdle || paused.Paused {
+		t.Fatalf("unexpected idle status event: %+v", paused)
+	}
+	if subscribers := runtime.mon.DiagnosticStats().Subscribers; subscribers != 0 {
+		t.Fatalf("idle pause left %d live subscribers", subscribers)
+	}
+	if got := runtime.CurrentConfig().Rules[0].ID; got != "default" {
+		t.Fatalf("idle pause unexpectedly changed runtime config: %q", got)
+	}
+}
+
+func TestServerCloseWaitsForAndInvalidatesFiringWebUIIdleTimer(t *testing.T) {
+	runtime := newFakeRuntime(t, freeHTTPAddr(t))
+	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	srv.webUIIdleTimeout = time.Millisecond
+	srv.webUIIdleCallbackHook = func() func() {
+		close(callbackEntered)
+		<-releaseCallback
+		return nil
+	}
+	_, events, cancel := runtime.mon.Subscribe()
+	defer cancel()
+	srv.startWebUIIdleTimer()
+
+	select {
+	case <-callbackEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle callback did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before firing idle callback exited: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseCallback)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after idle callback exited")
+	}
+	if !srv.WebUIEnabled() {
+		t.Fatal("stale idle callback disabled WebUI during Close")
+	}
+	select {
+	case payload := <-events:
+		t.Fatalf("stale idle callback published after Close began: %s", payload)
+	default:
+	}
+}
+
+func TestFiringIdleTimerCannotUndoManualDisableThenEnable(t *testing.T) {
+	runtime := newFakeRuntime(t, freeHTTPAddr(t))
+	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	callbackDone := make(chan struct{})
+	srv.webUIIdleTimeout = time.Millisecond
+	srv.webUIIdleCallbackHook = func() func() {
+		close(callbackEntered)
+		<-releaseCallback
+		return func() { close(callbackDone) }
+	}
+	srv.startWebUIIdleTimer()
+
+	select {
+	case <-callbackEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle callback did not start")
+	}
+	srv.SetWebUIEnabled(false)
+	srv.webUIMu.Lock()
+	srv.webUIIdleTimeout = time.Hour
+	srv.webUIIdleCallbackHook = nil
+	srv.webUIMu.Unlock()
+	srv.SetWebUIEnabled(true)
+	close(releaseCallback)
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale idle callback did not exit")
+	}
+	t.Cleanup(srv.stopWebUIIdleTimer)
+
+	status := srv.webUIStatus()
+	if !status.Enabled || status.AutoPaused || status.DisabledReason != "" || status.IdleDeadlineAt == nil {
+		t.Fatalf("stale idle callback undid the manual re-enable: %+v", status)
+	}
+	if until := time.Until(*status.IdleDeadlineAt); until < 59*time.Minute {
+		t.Fatalf("manual re-enable did not establish a fresh one-hour deadline: %v", until)
+	}
+}
+
 func TestDisableWebUICannotLeaveLateEventSubscriber(t *testing.T) {
 	runtime := newFakeRuntime(t, freeHTTPAddr(t))
 	srv, err := New(runtime.cfg.HTTP.Listen, runtime, nil)
@@ -322,6 +546,77 @@ func TestRuleActivityEndpointReturnsOnlyRequestedBoundedSeries(t *testing.T) {
 	}
 }
 
+func TestRuleConditionActivityEndpointReturnsBoundedObservedTuples(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	runtime := newFakeRuntime(t, addr)
+	runtime.mon.AddRuleConditionConnection("Rule-ID", "Rule", config.ActionProxy, monitor.RuleConditionMatch{
+		Application: "chrome.exe", Host: "*.example.com", Port: "443", Source: monitor.RuleConditionSourceIntercepted,
+	})
+	runtime.mon.AddRuleConditionConnection("Rule-ID", "Rule", config.ActionProxy, monitor.RuleConditionMatch{
+		Application: "chrome.exe", Host: "*.example.com", Port: "443", Source: monitor.RuleConditionSourceDirectObserver,
+	})
+	runtime.mon.AddRuleConditionConnection("rule-id", "Other exact ID", config.ActionProxy, monitor.RuleConditionMatch{
+		Application: "other.exe", Host: "Any", Port: "Any", Source: monitor.RuleConditionSourceIntercepted,
+	})
+
+	srv, err := New(addr, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/api/rules/condition-activity?id=Rule-ID&window_minutes=5&limit=10")
+	if err != nil {
+		t.Fatalf("GET condition activity: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET condition activity status = %d, want 200", resp.StatusCode)
+	}
+	var result monitor.RuleConditionActivity
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode condition activity: %v", err)
+	}
+	if result.RuleID != "Rule-ID" || result.TotalHits != 2 || len(result.Conditions) != 1 {
+		t.Fatalf("condition result = %+v", result)
+	}
+	condition := result.Conditions[0]
+	if condition.Application != "chrome.exe" || condition.Host != "*.example.com" || condition.Port != "443" || condition.Hits != 2 || condition.Share != 1 {
+		t.Fatalf("condition = %+v", condition)
+	}
+	if result.SourceHits.Intercepted != 1 || result.SourceHits.DirectObserver != 1 || result.Accuracy.DirectComplete {
+		t.Fatalf("accuracy/source metadata = %+v / %+v", result.SourceHits, result.Accuracy)
+	}
+	if apps := result.Dimensions.Applications; apps.TotalHits != 2 || apps.Truncated || len(apps.Values) != 1 || apps.Values[0].Hits != 2 {
+		t.Fatalf("application dimension = %+v", apps)
+	}
+
+	for _, path := range []string{
+		"/api/rules/condition-activity",
+		"/api/rules/condition-activity?id=a&id=b",
+		"/api/rules/condition-activity?id=Rule-ID&limit=101",
+		"/api/rules/condition-activity?id=Rule-ID&window_minutes=0",
+	} {
+		resp, err := client.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET invalid condition activity: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET %s status = %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {
 	addr := freeHTTPAddr(t)
 	srv, err := New(addr, newFakeRuntime(t, addr), nil)
@@ -351,6 +646,63 @@ func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {
 	}
 	if status := httpStatus(t, client, "http://"+addr+"/api/control/service/status"); status != http.StatusOK {
 		t.Fatalf("GET service status = %d, want 200", status)
+	}
+}
+
+func TestControlRequestsDoNotPreventAutomaticWebUIPause(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	runtime := newFakeRuntime(t, addr)
+	srv, err := New(addr, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.webUIIdleTimeout = 80 * time.Millisecond
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(2 * time.Second)
+	var status webUIStatusDTO
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("http://" + addr + "/api/control/webui/status")
+		if err != nil {
+			t.Fatalf("GET WebUI status: %v", err)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("decode WebUI status: %v", err)
+		}
+		_ = resp.Body.Close()
+		if !status.Enabled {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status.Enabled || !status.AutoPaused || status.DisabledReason != webUIDisabledIdle {
+		t.Fatalf("control polling kept WebUI alive or returned wrong status: %+v", status)
+	}
+	if status.Paused {
+		t.Fatal("automatic WebUI pause was reported as a proxy-service pause")
+	}
+
+	resp, err := client.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET disabled WebUI page: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read disabled WebUI page: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "автоматически приостановлен") || !strings.Contains(string(body), "Проксирование продолжает работать") {
+		t.Fatalf("unexpected disabled WebUI page status=%d body=%q", resp.StatusCode, body)
 	}
 }
 

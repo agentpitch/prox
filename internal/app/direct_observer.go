@@ -16,6 +16,7 @@ type directObserverMonitor interface {
 	UIWake() <-chan struct{}
 	UpsertConnection(monitor.Connection)
 	AddRuleConnection(string, string, config.RuleAction)
+	AddRuleConditionConnection(string, string, config.RuleAction, monitor.RuleConditionMatch)
 	AddLog(string, string, ...interface{})
 }
 
@@ -24,8 +25,9 @@ type directObserver struct {
 	Flows           *proxy.FlowTable
 	ActiveInterval  time.Duration
 	DormantInterval time.Duration
-	Decide          func(win.TCPConnection) (monitor.Connection, bool)
+	Decide          func(win.TCPConnection) (monitor.Connection, monitor.RuleConditionMatch, bool)
 	List            func() ([]win.TCPConnection, error)
+	ReleaseDormant  func()
 }
 
 func (o *directObserver) Start(ctx context.Context) {
@@ -45,11 +47,23 @@ func (o *directObserver) Start(ctx context.Context) {
 		list = win.ListTCPConnections
 	}
 	seen := map[string]monitor.Connection{}
+	dormantReleased := false
+	releaseDormant := func() {
+		if dormantReleased {
+			return
+		}
+		if o.ReleaseDormant != nil {
+			o.ReleaseDormant()
+		}
+		dormantReleased = true
+	}
+	defer releaseDormant()
 	timer := time.NewTimer(time.Hour)
 	stopAndDrainTimer(timer)
 	defer timer.Stop()
 	for {
 		if o.Monitor.UIActive() {
+			dormantReleased = false
 			seen = o.scan(list, seen)
 			if !waitObserverTimer(ctx, timer, nil, activeInterval) {
 				o.finalizeAll(seen)
@@ -61,6 +75,7 @@ func (o *directObserver) Start(ctx context.Context) {
 			o.finalizeAll(seen)
 			seen = map[string]monitor.Connection{}
 		}
+		releaseDormant()
 		wake := o.Monitor.UIWake()
 		if wake == nil {
 			if !waitObserverTimer(ctx, timer, nil, dormantInterval) {
@@ -68,9 +83,23 @@ func (o *directObserver) Start(ctx context.Context) {
 			}
 			continue
 		}
-		if !waitObserverTimer(ctx, timer, wake, dormantInterval) {
+		// The production monitor uses a buffered wake channel and signals every
+		// transition that can make the observer useful. Waiting on that signal
+		// avoids waking an otherwise idle service every few seconds. Keep the
+		// timer above only as a compatibility fallback for monitors without a
+		// wake channel.
+		if !waitObserverWake(ctx, wake) {
 			return
 		}
+	}
+}
+
+func waitObserverWake(ctx context.Context, wake <-chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
 	}
 }
 
@@ -121,7 +150,7 @@ func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map
 		if o.isIntercepted(item.LocalIP, item.LocalPort) {
 			continue
 		}
-		c, ok := o.Decide(item)
+		c, ruleMatch, ok := o.Decide(item)
 		if !ok {
 			continue
 		}
@@ -130,7 +159,7 @@ func (o *directObserver) scan(list func() ([]win.TCPConnection, error), seen map
 			c.BytesUp = prev.BytesUp
 			c.BytesDown = prev.BytesDown
 		} else {
-			o.Monitor.AddRuleConnection(c.RuleID, c.RuleName, c.Action)
+			o.Monitor.AddRuleConditionConnection(c.RuleID, c.RuleName, c.Action, ruleMatch)
 		}
 		c.State = "open"
 		o.Monitor.UpsertConnection(c)

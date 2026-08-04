@@ -35,6 +35,18 @@ type Connection struct {
 	Count         int64             `json:"count,omitempty"`
 }
 
+const (
+	RuleConditionSourceIntercepted    = history.RuleConditionSourceIntercepted
+	RuleConditionSourceDirectObserver = history.RuleConditionSourceDirectObserver
+)
+
+type RuleConditionMatch struct {
+	Application string
+	Host        string
+	Port        string
+	Source      string
+}
+
 type LogEntry struct {
 	Time         time.Time         `json:"time"`
 	Level        string            `json:"level"`
@@ -94,6 +106,29 @@ type RuleActivityTimeline struct {
 	Series        []RuleActivitySeries `json:"series"`
 }
 
+type RuleConditionAccuracy struct {
+	Unit                string `json:"unit"`
+	Attribution         string `json:"attribution"`
+	InterceptedComplete bool   `json:"intercepted_complete"`
+	DirectComplete      bool   `json:"direct_complete"`
+	BoundarySeconds     int    `json:"boundary_seconds"`
+	Notice              string `json:"notice"`
+}
+
+type RuleConditionActivity struct {
+	GeneratedAt      time.Time                       `json:"generated_at"`
+	RuleID           string                          `json:"rule_id"`
+	WindowMinutes    int                             `json:"window_minutes"`
+	TotalHits        int64                           `json:"total_hits"`
+	OtherHits        int64                           `json:"other_hits"`
+	UnattributedHits int64                           `json:"unattributed_hits"`
+	Truncated        bool                            `json:"truncated"`
+	SourceHits       history.RuleConditionSources    `json:"source_hits"`
+	Conditions       []history.RuleConditionActivity `json:"conditions"`
+	Dimensions       history.RuleConditionDimensions `json:"dimensions"`
+	Accuracy         RuleConditionAccuracy           `json:"accuracy"`
+}
+
 type Snapshot struct {
 	Connections          []Connection    `json:"connections"`
 	NewConnections       []Connection    `json:"new_connections"`
@@ -146,16 +181,17 @@ type DiagnosticStats struct {
 }
 
 const (
-	uiVerboseWindow          = 90 * time.Second
-	defaultRetention         = 7 * time.Minute
-	maxRetention             = 24 * time.Hour
-	newConnectionRecent      = time.Minute
-	snapshotTrafficMaxPoints = 120
-	trayKeepWindow           = 2 * time.Minute
-	openingMaxAge            = 2 * time.Minute
-	mapCompactDeletes        = 256
-	pruneActiveEvery         = 15 * time.Second
-	pruneTrafficEvery        = 15 * time.Second
+	uiVerboseWindow              = 90 * time.Second
+	defaultRetention             = 7 * time.Minute
+	maxRetention                 = 24 * time.Hour
+	newConnectionRecent          = time.Minute
+	snapshotTrafficMaxPoints     = 120
+	trayKeepWindow               = 2 * time.Minute
+	openingMaxAge                = 2 * time.Minute
+	mapCompactDeletes            = 256
+	pruneActiveEvery             = 15 * time.Second
+	pruneTrafficEvery            = 15 * time.Second
+	ruleConditionBoundarySeconds = 15
 )
 
 func NewBus(historyPath string) (*Bus, error) {
@@ -263,6 +299,51 @@ func (b *Bus) RuleActivityTimeline(ruleIDs []string, window time.Duration, point
 		}
 	}
 	return out, nil
+}
+
+func (b *Bus) RuleConditionActivity(ruleID string, window time.Duration, limit int) (RuleConditionActivity, error) {
+	accuracy := RuleConditionAccuracy{
+		Unit:                "tcp_connection",
+		Attribution:         "first_matching_alternative",
+		InterceptedComplete: true,
+		DirectComplete:      false,
+		BoundarySeconds:     ruleConditionBoundarySeconds,
+		Notice:              "Перехваченные соединения имеют точную атрибуцию, кроме явно указанного числа неатрибутированных срабатываний; DIRECT учитывается выборочно только во время работы наблюдателя WebUI и может повторно учесть долгоживущее соединение после паузы. Одно срабатывание — новое наблюдаемое TCP-соединение, а не отдельный HTTP-запрос. Если сводка измерения не усечена, отсутствующий вариант имеет 0 наблюдавшихся срабатываний в выбранном окне; если усечена, его значение неизвестно.",
+	}
+	if b == nil || b.history == nil {
+		return RuleConditionActivity{
+			GeneratedAt:   time.Now().UTC(),
+			RuleID:        strings.TrimSpace(ruleID),
+			WindowMinutes: max(1, int(window/time.Minute)),
+			Conditions:    []history.RuleConditionActivity{},
+			Dimensions: history.RuleConditionDimensions{
+				Applications: history.RuleConditionDimension{Values: []history.RuleConditionDimensionValue{}},
+				Hosts:        history.RuleConditionDimension{Values: []history.RuleConditionDimensionValue{}},
+				Ports:        history.RuleConditionDimension{Values: []history.RuleConditionDimensionValue{}},
+			},
+			Accuracy: accuracy,
+		}, nil
+	}
+	data, err := b.history.RuleConditionActivity(ruleID, window, limit)
+	if err != nil {
+		return RuleConditionActivity{}, err
+	}
+	if data.UnattributedHits > 0 {
+		accuracy.InterceptedComplete = false
+	}
+	return RuleConditionActivity{
+		GeneratedAt:      data.GeneratedAt,
+		RuleID:           data.RuleID,
+		WindowMinutes:    data.WindowMinutes,
+		TotalHits:        data.TotalHits,
+		OtherHits:        data.OtherHits,
+		UnattributedHits: data.UnattributedHits,
+		Truncated:        data.Truncated,
+		SourceHits:       data.SourceHits,
+		Conditions:       data.Conditions,
+		Dimensions:       data.Dimensions,
+		Accuracy:         accuracy,
+	}, nil
 }
 
 func (b *Bus) MarkUIActive() {
@@ -447,6 +528,19 @@ func (b *Bus) publishLog(entry LogEntry) {
 	b.mu.Unlock()
 }
 
+// PublishTransientEvent broadcasts control-plane state to the currently open
+// WebUI subscribers without persisting it in history. It is intentionally
+// bounded by the existing per-subscriber queues, just like live log events.
+func (b *Bus) PublishTransientEvent(eventType string, data interface{}) {
+	if b == nil || strings.TrimSpace(eventType) == "" {
+		return
+	}
+	payload := b.mustJSON(Event{Type: eventType, Data: data})
+	b.mu.Lock()
+	b.broadcastLocked(payload)
+	b.mu.Unlock()
+}
+
 func (b *Bus) shouldCaptureLog(level string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -487,6 +581,23 @@ func (b *Bus) AddRuleConnection(ruleID, ruleName string, action config.RuleActio
 	if b.history != nil {
 		b.history.AddRuleActivity(time.Now().UTC(), ruleID, ruleName, action, 1, 0, 0)
 	}
+}
+
+func (b *Bus) AddRuleConditionConnection(ruleID, ruleName string, action config.RuleAction, match RuleConditionMatch) {
+	if !match.Valid() {
+		b.AddRuleConnection(ruleID, ruleName, action)
+		return
+	}
+	if b.history != nil {
+		b.history.AddRuleConditionHit(time.Now().UTC(), ruleID, ruleName, action, match.Application, match.Host, match.Port, match.Source)
+	}
+}
+
+func (m RuleConditionMatch) Valid() bool {
+	if m.Application == "" || m.Host == "" || m.Port == "" {
+		return false
+	}
+	return m.Source == RuleConditionSourceIntercepted || m.Source == RuleConditionSourceDirectObserver
 }
 
 func (b *Bus) AddRuleTraffic(ruleID, ruleName string, action config.RuleAction, upBytes, downBytes int64) {
@@ -561,7 +672,14 @@ func (b *Bus) SnapshotWithOptions(options SnapshotOptions) Snapshot {
 	}
 	ruleStats := make([]RuleActivity, 0, len(data.RuleStats))
 	for _, item := range data.RuleStats {
-		ruleStats = append(ruleStats, RuleActivity(item))
+		ruleStats = append(ruleStats, RuleActivity{
+			RuleID:      item.RuleID,
+			RuleName:    item.RuleName,
+			Action:      item.Action,
+			Connections: item.Connections,
+			UpBytes:     item.UpBytes,
+			DownBytes:   item.DownBytes,
+		})
 	}
 	return Snapshot{
 		Connections:          sortConnections(conns),

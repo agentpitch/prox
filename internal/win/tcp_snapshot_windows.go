@@ -38,6 +38,17 @@ func NewTCPSnapshotter() *TCPSnapshotter {
 	return &TCPSnapshotter{exeByPID: map[uint32]exeCacheEntry{}}
 }
 
+// Clear releases process metadata retained for WebUI-only TCP snapshots. The
+// interception engine has its own owner cache and is intentionally unaffected.
+func (s *TCPSnapshotter) Clear() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.exeByPID = nil
+	s.mu.Unlock()
+}
+
 func (s *TCPSnapshotter) ListTCPConnections() ([]TCPConnection, error) {
 	if s == nil {
 		s = defaultTCPSnapshotter

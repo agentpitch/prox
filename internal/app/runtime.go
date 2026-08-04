@@ -44,6 +44,7 @@ type Runtime struct {
 	diagnosticsCancel  context.CancelFunc
 	diagnosticsOnce    sync.Once
 	listTCPConnections func() ([]win.TCPConnection, error)
+	tcpSnapshotter     *win.TCPSnapshotter
 }
 
 func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
@@ -71,6 +72,7 @@ func NewRuntime(configPath string, historyPath string) (*Runtime, error) {
 		engine:              eng,
 		computerName:        computerName,
 		interceptionEnabled: !eng.AllEnabledActionsDirect(),
+		tcpSnapshotter:      win.NewTCPSnapshotter(),
 	}, nil
 }
 
@@ -249,13 +251,23 @@ func (r *Runtime) startTransitionLocked(ctx context.Context) (err error) {
 	r.mu.RLock()
 	interceptionEnabled := r.interceptionEnabled
 	r.mu.RUnlock()
+	tcpSnapshotter := r.tcpSnapshotter
+	if tcpSnapshotter == nil {
+		tcpSnapshotter = win.NewTCPSnapshotter()
+		r.tcpSnapshotter = tcpSnapshotter
+	}
+	listTCPConnections := r.listTCPConnections
+	if listTCPConnections == nil {
+		listTCPConnections = tcpSnapshotter.ListTCPConnections
+	}
 	r.directObserver = &directObserver{
 		Monitor:         r.monitor,
 		Flows:           flows,
 		ActiveInterval:  10 * time.Second,
 		DormantInterval: 5 * time.Second,
 		Decide:          r.directConnectionView,
-		List:            r.listTCPConnections,
+		List:            listTCPConnections,
+		ReleaseDormant:  tcpSnapshotter.Clear,
 	}
 	r.runWG.Add(2)
 	go func(observer *directObserver) {
@@ -457,6 +469,12 @@ func (r *Runtime) route(flow proxy.Flow, sniff proxy.SniffResult) (proxy.RouteRe
 		ProxyID:  dec.ProxyID,
 		ChainID:  dec.ChainID,
 		Hostname: sniff.Hostname,
+		RuleMatch: monitor.RuleConditionMatch{
+			Application: dec.Match.Application,
+			Host:        dec.Match.Host,
+			Port:        dec.Match.Port,
+			Source:      monitor.RuleConditionSourceIntercepted,
+		},
 	}, cfg, nil
 }
 
@@ -481,7 +499,7 @@ func (r *Runtime) planFlow(flow proxy.Flow) windivert.PlanDecision {
 	}
 }
 
-func (r *Runtime) directConnectionView(item win.TCPConnection) (monitor.Connection, bool) {
+func (r *Runtime) directConnectionView(item win.TCPConnection) (monitor.Connection, monitor.RuleConditionMatch, bool) {
 	r.mu.RLock()
 	eng := r.engine
 	interceptionEnabled := r.interceptionEnabled
@@ -494,13 +512,13 @@ func (r *Runtime) directConnectionView(item win.TCPConnection) (monitor.Connecti
 		TargetPort: item.RemotePort,
 	})
 	if interceptionEnabled && (!pre.Definitive || pre.Action != config.ActionDirect) {
-		return monitor.Connection{}, false
+		return monitor.Connection{}, monitor.RuleConditionMatch{}, false
 	}
 	action := pre.Action
 	if action == "" {
 		action = config.ActionDirect
 	}
-	return monitor.Connection{
+	connection := monitor.Connection{
 		ID:           monitor.ConnID(item.PID, item.LocalIP, item.LocalPort, item.RemoteIP, item.RemotePort),
 		PID:          item.PID,
 		ExePath:      item.ExePath,
@@ -514,5 +532,15 @@ func (r *Runtime) directConnectionView(item win.TCPConnection) (monitor.Connecti
 		State:        "open",
 		CreatedAt:    item.SeenAt,
 		Count:        1,
-	}, true
+	}
+	var ruleMatch monitor.RuleConditionMatch
+	if pre.MatchDefinitive && pre.Matched && pre.Match.Application != "" && pre.Match.Host != "" && pre.Match.Port != "" {
+		ruleMatch = monitor.RuleConditionMatch{
+			Application: pre.Match.Application,
+			Host:        pre.Match.Host,
+			Port:        pre.Match.Port,
+			Source:      monitor.RuleConditionSourceDirectObserver,
+		}
+	}
+	return connection, ruleMatch, true
 }

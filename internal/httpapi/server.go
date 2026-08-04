@@ -53,8 +53,18 @@ type Server struct {
 	closed    bool
 	wg        sync.WaitGroup
 
-	webUIMu      sync.RWMutex
-	webUIEnabled bool
+	webUITransitionMu       sync.Mutex
+	webUIMu                 sync.RWMutex
+	webUIEnabled            bool
+	webUIDisabledReason     string
+	webUIDisabledAt         time.Time
+	webUILastBrowserRequest time.Time
+	webUIIdleTimeout        time.Duration
+	webUIIdleTimer          *time.Timer
+	webUIIdleGeneration     uint64
+	webUIIdleClosed         bool
+	webUIIdleWG             sync.WaitGroup
+	webUIIdleCallbackHook   func() func()
 }
 
 type proxyTestRequest struct {
@@ -74,6 +84,16 @@ type uiVisibilityRequest struct {
 	Active bool `json:"active"`
 }
 
+type webUIStatusDTO struct {
+	Enabled            bool       `json:"enabled"`
+	Paused             bool       `json:"paused"`
+	AutoPaused         bool       `json:"auto_paused"`
+	DisabledReason     string     `json:"disabled_reason,omitempty"`
+	DisabledAt         *time.Time `json:"disabled_at,omitempty"`
+	IdleTimeoutSeconds int64      `json:"idle_timeout_seconds"`
+	IdleDeadlineAt     *time.Time `json:"idle_deadline_at,omitempty"`
+}
+
 type droppedDeleteRequest struct {
 	IDs []string `json:"ids"`
 }
@@ -82,6 +102,10 @@ const (
 	maxHTTPConnections = 64
 	maxHTTPHeaders     = 100
 	maxHTTPHeaderBytes = 32 << 10
+	webUIIdleTimeout   = time.Hour
+
+	webUIDisabledManual = "manual"
+	webUIDisabledIdle   = "idle"
 )
 
 type droppedConnectionDTO struct {
@@ -123,13 +147,15 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		Runtime:      rt,
-		StopFunc:     stopFunc,
-		addr:         addr,
-		staticFS:     sub,
-		conns:        map[net.Conn]struct{}{},
-		closeCh:      make(chan struct{}),
-		webUIEnabled: true,
+		Runtime:                 rt,
+		StopFunc:                stopFunc,
+		addr:                    addr,
+		staticFS:                sub,
+		conns:                   map[net.Conn]struct{}{},
+		closeCh:                 make(chan struct{}),
+		webUIEnabled:            true,
+		webUILastBrowserRequest: time.Now(),
+		webUIIdleTimeout:        webUIIdleTimeout,
 	}, nil
 }
 
@@ -168,6 +194,7 @@ func (s *Server) Listen() error {
 	}
 	s.listener = ln
 	s.mu.Unlock()
+	s.startWebUIIdleTimer()
 	return nil
 }
 
@@ -206,6 +233,7 @@ func (s *Server) Serve() error {
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.shutdownWebUIIdleTimer()
 		s.mu.Lock()
 		s.closed = true
 		close(s.closeCh)
@@ -265,8 +293,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		writeText(conn, 400, err.Error())
 		return
 	}
-	if !s.WebUIEnabled() && !isWebUIControlPath(req.Path) {
-		writeText(conn, 503, "WebUI disabled")
+	if !isWebUIControlPath(req.Path) && !s.admitWebUIRequest(req) {
+		if !strings.HasPrefix(req.Path, "/api/") && req.Method == "GET" {
+			s.handleDisabledWebUIPage(conn)
+		} else {
+			writeText(conn, 503, "WebUI disabled")
+		}
 		return
 	}
 	if shouldMarkUIActive(req.Path) {
@@ -281,6 +313,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleSnapshot(conn, req)
 	case "/api/rules/activity":
 		s.handleRuleActivity(conn, req)
+	case "/api/rules/condition-activity":
+		s.handleRuleConditionActivity(conn, req)
 	case "/api/dropped":
 		s.handleDropped(conn, req)
 	case "/api/tray":
@@ -328,11 +362,35 @@ func (s *Server) WebUIEnabled() bool {
 }
 
 func (s *Server) SetWebUIEnabled(enabled bool) {
+	reason := ""
+	if !enabled {
+		reason = webUIDisabledManual
+	}
+	s.setWebUIEnabled(enabled, reason)
+}
+
+func (s *Server) setWebUIEnabled(enabled bool, reason string) {
+	s.webUITransitionMu.Lock()
+	defer s.webUITransitionMu.Unlock()
+	now := time.Now()
 	s.webUIMu.Lock()
 	changed := s.webUIEnabled != enabled
 	s.webUIEnabled = enabled
+	if enabled {
+		s.webUIDisabledReason = ""
+		s.webUIDisabledAt = time.Time{}
+		s.webUILastBrowserRequest = now
+		s.startWebUIIdleTimerLocked(now)
+	} else if changed {
+		s.webUIDisabledReason = reason
+		s.webUIDisabledAt = now.UTC()
+		s.stopWebUIIdleTimerLocked()
+	}
+	status := s.webUIStatusLocked()
 	s.webUIMu.Unlock()
-	if !enabled {
+	status.Paused = s.ServicePaused()
+	if !enabled && changed {
+		s.Runtime.Monitor().PublishTransientEvent("webui_status", status)
 		s.Runtime.Monitor().DisableUI()
 		util.ReleaseIdleMemory()
 	}
@@ -345,8 +403,159 @@ func (s *Server) SetWebUIEnabled(enabled bool) {
 	}
 }
 
+func (s *Server) webUIStatus() webUIStatusDTO {
+	s.webUIMu.RLock()
+	status := s.webUIStatusLocked()
+	s.webUIMu.RUnlock()
+	status.Paused = s.ServicePaused()
+	return status
+}
+
+func (s *Server) webUIStatusLocked() webUIStatusDTO {
+	status := webUIStatusDTO{
+		Enabled:            s.webUIEnabled,
+		AutoPaused:         !s.webUIEnabled && s.webUIDisabledReason == webUIDisabledIdle,
+		DisabledReason:     s.webUIDisabledReason,
+		IdleTimeoutSeconds: int64(s.webUIIdleTimeout / time.Second),
+	}
+	if !s.webUIDisabledAt.IsZero() {
+		disabledAt := s.webUIDisabledAt.UTC()
+		status.DisabledAt = &disabledAt
+	}
+	if s.webUIEnabled && s.webUIIdleTimeout > 0 && !s.webUILastBrowserRequest.IsZero() {
+		deadline := s.webUILastBrowserRequest.Add(s.webUIIdleTimeout).UTC()
+		status.IdleDeadlineAt = &deadline
+	}
+	return status
+}
+
+// admitWebUIRequest performs the enabled check and activity update under one
+// lock. This prevents the idle timer from disabling the UI between those two
+// operations while keeping control/tray traffic entirely outside the timer.
+func (s *Server) admitWebUIRequest(req request) bool {
+	s.webUIMu.Lock()
+	defer s.webUIMu.Unlock()
+	if !s.webUIEnabled {
+		return false
+	}
+	if isBrowserWebUIActivity(req) {
+		s.webUILastBrowserRequest = time.Now()
+	}
+	return true
+}
+
+func (s *Server) startWebUIIdleTimer() {
+	now := time.Now()
+	s.webUIMu.Lock()
+	if s.webUIEnabled {
+		s.webUILastBrowserRequest = now
+		s.startWebUIIdleTimerLocked(now)
+	}
+	s.webUIMu.Unlock()
+}
+
+// Browser requests only update the timestamp. The timer is deliberately not
+// reset for every request: it wakes at the old deadline, observes the newer
+// timestamp and reschedules itself once. Thus an active UI does not generate
+// timer churn or a polling goroutine.
+func (s *Server) startWebUIIdleTimerLocked(now time.Time) {
+	if !s.webUIEnabled || s.webUIIdleClosed || s.webUIIdleTimeout <= 0 || s.webUIIdleTimer != nil {
+		return
+	}
+	deadline := s.webUILastBrowserRequest.Add(s.webUIIdleTimeout)
+	delay := deadline.Sub(now)
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	s.webUIIdleGeneration++
+	generation := s.webUIIdleGeneration
+	hook := s.webUIIdleCallbackHook
+	s.webUIIdleWG.Add(1)
+	s.webUIIdleTimer = time.AfterFunc(delay, func() {
+		defer s.webUIIdleWG.Done()
+		if hook != nil {
+			if doneHook := hook(); doneHook != nil {
+				defer doneHook()
+			}
+		}
+		s.handleWebUIIdleTimeout(generation)
+	})
+}
+
+func (s *Server) stopWebUIIdleTimer() {
+	s.webUIMu.Lock()
+	s.stopWebUIIdleTimerLocked()
+	s.webUIMu.Unlock()
+	s.webUIIdleWG.Wait()
+}
+
+func (s *Server) stopWebUIIdleTimerLocked() {
+	s.webUIIdleGeneration++
+	if s.webUIIdleTimer != nil {
+		if s.webUIIdleTimer.Stop() {
+			s.webUIIdleWG.Done()
+		}
+		s.webUIIdleTimer = nil
+	}
+}
+
+func (s *Server) shutdownWebUIIdleTimer() {
+	s.webUIMu.Lock()
+	s.webUIIdleClosed = true
+	s.stopWebUIIdleTimerLocked()
+	s.webUIMu.Unlock()
+	s.webUIIdleWG.Wait()
+}
+
+func (s *Server) handleWebUIIdleTimeout(generation uint64) {
+	s.webUITransitionMu.Lock()
+	defer s.webUITransitionMu.Unlock()
+	now := time.Now()
+	s.webUIMu.Lock()
+	if generation != s.webUIIdleGeneration || s.webUIIdleClosed {
+		s.webUIMu.Unlock()
+		return
+	}
+	s.webUIIdleTimer = nil
+	if !s.webUIEnabled || s.webUIIdleTimeout <= 0 {
+		s.webUIMu.Unlock()
+		return
+	}
+	if now.Before(s.webUILastBrowserRequest.Add(s.webUIIdleTimeout)) {
+		s.startWebUIIdleTimerLocked(now)
+		s.webUIMu.Unlock()
+		return
+	}
+	s.webUIEnabled = false
+	s.webUIDisabledReason = webUIDisabledIdle
+	s.webUIDisabledAt = now.UTC()
+	status := s.webUIStatusLocked()
+	s.webUIMu.Unlock()
+
+	status.Paused = s.ServicePaused()
+	s.Runtime.Monitor().AddLog("info", "WebUI automatically paused after %s without browser requests; proxy runtime remains active", s.webUIIdleTimeout)
+	s.Runtime.Monitor().PublishTransientEvent("webui_status", status)
+	s.Runtime.Monitor().DisableUI()
+	util.ReleaseIdleMemory()
+}
+
+func (s *Server) handleDisabledWebUIPage(conn net.Conn) {
+	status := s.webUIStatus()
+	title := "WebUI отключён"
+	detail := "Интерфейс управления отключён. Проксирование продолжает работать."
+	if status.Paused {
+		title = "Сервис приостановлен"
+		detail = "Сервис и WebUI приостановлены пользователем."
+	} else if status.AutoPaused {
+		title = "WebUI приостановлен"
+		detail = "В течение часа не было обращений из браузера, поэтому WebUI был автоматически приостановлен. Проксирование продолжает работать."
+	}
+	body := []byte("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + title + " — pitchProx</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f8fc;color:#16233a;font:16px system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:560px;margin:24px;padding:32px;border:1px solid #dce5f2;border-radius:18px;background:#fff;box-shadow:0 16px 44px #183d7514}h1{margin:0 0 12px;font-size:26px}p{line-height:1.55;color:#52627a}.brand{color:#086cf0;font-weight:750}.hint{margin-top:22px;padding:14px 16px;border-radius:12px;background:#edf5ff;color:#24466f}</style></head><body><main class=\"card\"><div class=\"brand\">pitchProx</div><h1>" + title + "</h1><p>" + detail + "</p><p class=\"hint\">Чтобы снова открыть интерфейс, выберите «Управление» в меню значка pitchProx в системном трее.</p></main></body></html>")
+	writeBytes(conn, 503, "text/html; charset=utf-8", body)
+}
+
 func (s *Server) handleWebUIStatus(conn net.Conn) {
-	writeJSON(conn, 200, map[string]bool{"enabled": s.WebUIEnabled(), "paused": s.ServicePaused()})
+	writeJSON(conn, 200, s.webUIStatus())
 }
 
 func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
@@ -361,7 +570,7 @@ func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
 		}
 	}
 	s.SetWebUIEnabled(true)
-	writeJSON(conn, 200, map[string]bool{"enabled": true, "paused": s.ServicePaused()})
+	writeJSON(conn, 200, s.webUIStatus())
 }
 
 func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
@@ -370,7 +579,7 @@ func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
 		return
 	}
 	s.SetWebUIEnabled(false)
-	writeJSON(conn, 200, map[string]bool{"enabled": false})
+	writeJSON(conn, 200, s.webUIStatus())
 }
 
 func (s *Server) ServicePaused() bool {
@@ -495,6 +704,38 @@ func (s *Server) handleRuleActivity(conn net.Conn, req request) {
 		windowMinutes = retention
 	}
 	data, err := s.Runtime.Monitor().RuleActivityTimeline(ids, time.Duration(windowMinutes)*time.Minute, points)
+	if err != nil {
+		writeText(conn, 500, err.Error())
+		return
+	}
+	writeJSON(conn, 200, data)
+}
+
+func (s *Server) handleRuleConditionActivity(conn net.Conn, req request) {
+	if req.Method != "GET" {
+		writeEmpty(conn, 405)
+		return
+	}
+	rawIDs := req.Query["id"]
+	if len(rawIDs) != 1 || strings.TrimSpace(rawIDs[0]) == "" {
+		writeText(conn, 400, "exactly one non-empty rule id is required")
+		return
+	}
+	ruleID := strings.TrimSpace(rawIDs[0])
+	windowMinutes, err := parseNonNegativeInt(req.Query.Get("window_minutes"), 15)
+	if err != nil || windowMinutes < 1 || windowMinutes > 60 {
+		writeText(conn, 400, "window_minutes must be in 1..60")
+		return
+	}
+	limit, err := parseNonNegativeInt(req.Query.Get("limit"), 20)
+	if err != nil || limit < 1 || limit > 100 {
+		writeText(conn, 400, "limit must be in 1..100")
+		return
+	}
+	if retention := s.Runtime.CurrentConfig().RetentionMinutes; retention > 0 && windowMinutes > retention {
+		windowMinutes = retention
+	}
+	data, err := s.Runtime.Monitor().RuleConditionActivity(ruleID, time.Duration(windowMinutes)*time.Minute, limit)
 	if err != nil {
 		writeText(conn, 500, err.Error())
 		return
@@ -925,9 +1166,29 @@ func statusText(code int) string {
 		return "Conflict"
 	case 500:
 		return "Internal Server Error"
+	case 503:
+		return "Service Unavailable"
 	default:
 		return "Status"
 	}
+}
+
+func isBrowserWebUIActivity(req request) bool {
+	if !strings.HasPrefix(req.Path, "/api/") {
+		return req.Method == "GET"
+	}
+	if isWebUIControlPath(req.Path) {
+		return false
+	}
+	marked := strings.TrimSpace(req.Headers["x-pitchprox-webui"]) == "1" || req.Query.Get("_ui") == "1"
+	if !marked {
+		return false
+	}
+	if req.Path != "/api/ui/visibility" {
+		return true
+	}
+	var payload uiVisibilityRequest
+	return json.Unmarshal(req.Body, &payload) == nil && payload.Active
 }
 
 func shouldMarkUIActive(path string) bool {

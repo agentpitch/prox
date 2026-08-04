@@ -75,12 +75,17 @@ type TrafficTotals struct {
 }
 
 type RuleActivity struct {
-	RuleID      string
-	RuleName    string
-	Action      config.RuleAction
-	Connections int64
-	UpBytes     int64
-	DownBytes   int64
+	RuleID               string
+	RuleName             string
+	Action               config.RuleAction
+	Connections          int64
+	UpBytes              int64
+	DownBytes            int64
+	ConditionApplication string `json:"condition_application,omitempty"`
+	ConditionHost        string `json:"condition_host,omitempty"`
+	ConditionPort        string `json:"condition_port,omitempty"`
+	ConditionSource      string `json:"condition_source,omitempty"`
+	ConditionOverflow    bool   `json:"condition_overflow,omitempty"`
 }
 
 type RuleActivityBucket struct {
@@ -106,6 +111,55 @@ type RuleActivityTimeline struct {
 	BucketSeconds float64
 	Points        int
 	Series        []RuleActivitySeries
+}
+
+type RuleConditionSources struct {
+	Intercepted    int64 `json:"intercepted"`
+	DirectObserver int64 `json:"direct_observer"`
+}
+
+type RuleConditionActivity struct {
+	Application string               `json:"application"`
+	Host        string               `json:"host"`
+	Port        string               `json:"port"`
+	Hits        int64                `json:"hits"`
+	Share       float64              `json:"share"`
+	LastSeen    time.Time            `json:"last_seen"`
+	Sources     RuleConditionSources `json:"sources"`
+}
+
+type RuleConditionDimensionValue struct {
+	Value    string               `json:"value"`
+	Hits     int64                `json:"hits"`
+	Share    float64              `json:"share"`
+	LastSeen time.Time            `json:"last_seen"`
+	Sources  RuleConditionSources `json:"sources"`
+}
+
+type RuleConditionDimension struct {
+	TotalHits int64                         `json:"total_hits"`
+	OtherHits int64                         `json:"other_hits"`
+	Truncated bool                          `json:"truncated"`
+	Values    []RuleConditionDimensionValue `json:"values"`
+}
+
+type RuleConditionDimensions struct {
+	Applications RuleConditionDimension `json:"applications"`
+	Hosts        RuleConditionDimension `json:"hosts"`
+	Ports        RuleConditionDimension `json:"ports"`
+}
+
+type RuleConditionActivityResult struct {
+	GeneratedAt      time.Time               `json:"generated_at"`
+	RuleID           string                  `json:"rule_id"`
+	WindowMinutes    int                     `json:"window_minutes"`
+	TotalHits        int64                   `json:"total_hits"`
+	OtherHits        int64                   `json:"other_hits"`
+	UnattributedHits int64                   `json:"unattributed_hits"`
+	Truncated        bool                    `json:"truncated"`
+	SourceHits       RuleConditionSources    `json:"source_hits"`
+	Conditions       []RuleConditionActivity `json:"conditions"`
+	Dimensions       RuleConditionDimensions `json:"dimensions"`
 }
 
 type SnapshotData struct {

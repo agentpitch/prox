@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.43-rc.3",
+    [string]$Version = "v0.43-rc.4",
     [switch]$SkipChecks,
     [switch]$AllowDirty,
     [switch]$DownloadWinDivertArchive,
@@ -162,7 +162,7 @@ function Assert-PitchProxWorkingTreeEOL {
 }
 
 if ($Version -notmatch '^(?:v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?|dev-[0-9a-f]{7,40})$') {
-    throw "Version must look like v0.43, v0.43-rc.3, or dev-1a2b3c4"
+    throw "Version must look like v0.43, v0.43-rc.4, or dev-1a2b3c4"
 }
 if ($SkipChecks -and -not $AllowDirty) {
     throw "-SkipChecks is allowed only together with -AllowDirty for a disposable diagnostic build."

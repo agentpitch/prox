@@ -22,10 +22,10 @@ elevates its permission to `contents: write`; normal builds remain read-only.
 From a committed clean working tree on Windows:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.3
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.4
 ```
 
-Review the files under `build\candidates\v0.43-rc.3\`. This path is separate
+Review the files under `build\candidates\v0.43-rc.4\`. This path is separate
 from `build\pitchProx.exe`, so packaging does not overwrite or stop an already
 running main application. The local script verifies and reuses the existing
 root `WinDivert.dll` and `WinDivert64.sys`; it neither downloads a duplicate nor

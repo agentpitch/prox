@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.3
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.4
 ```
 
-The candidate is written to `build\candidates\v0.43-rc.3\`; it does not replace
+The candidate is written to `build\candidates\v0.43-rc.4\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, verifies the existing root
 `WinDivert.dll`/`WinDivert64.sys` and the tracked upstream license by exact

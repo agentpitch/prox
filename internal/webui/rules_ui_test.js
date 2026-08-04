@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const rulesUI = require('./dist/rules-ui.js');
 
 function rule(overrides = {}) {
@@ -19,6 +21,13 @@ function rule(overrides = {}) {
     ...overrides,
   };
 }
+
+test('rules search uses one explicit clear control', () => {
+  const markup = fs.readFileSync(path.join(__dirname, 'dist', 'index.html'), 'utf8');
+  assert.match(markup, /<input id="ruleSearch" type="text"/);
+  assert.doesNotMatch(markup, /<input id="ruleSearch" type="search"/);
+  assert.equal((markup.match(/id="clearRuleSearchBtn"/g) || []).length, 1);
+});
 
 test('splitValues preserves delimiters inside quoted values', () => {
   assert.deepEqual(

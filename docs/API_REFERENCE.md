@@ -9,7 +9,7 @@ The API is intended for localhost use only.
 Response:
 
 ```json
-{"ok": true, "version": "v0.43-rc.3"}
+{"ok": true, "version": "v0.43-rc.4"}
 ```
 
 `version` is injected at build time. Unversioned developer builds report

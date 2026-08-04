@@ -16,6 +16,12 @@
 - New route-style Windows, tray, and WebUI application icon.
 - Syntax warnings, stable-ID validation, dirty-editor protection, and advisory similar-rule detection.
 - Versioned rules-only import/export without proxy credentials.
+- Import and Export now open clipboard-first JSON dialogs for fast transfer
+  between machines. File loading and downloading remain available as separate
+  left-side actions and use the same bounded structural validation and preview
+  flow. Saving remains atomic, unfinished file reads cannot overwrite pasted
+  text, and the complete configuration is checked against the service body
+  limit before transfer.
 - Real demand-only rule activity sparklines with strict ID, window, and point bounds.
 - Lazy bounded per-rule breakdown of observed Application + Host + Port tuples,
   including marginal coverage for identifying alternatives with no observed use.

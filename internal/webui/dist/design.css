@@ -713,11 +713,36 @@ button:disabled:hover { background: var(--surface); border-color: var(--border-s
 .update-badge.current { background: var(--blue-soft); color: var(--blue-dark); }
 .update-badge.warning { background: var(--amber-soft); color: #76591d; }
 .update-empty { padding: 12px; color: var(--ink-muted); font-size: 11px; text-align: center; }
-.import-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.import-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
 .import-stat { padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .import-stat strong { display: block; color: var(--ink); font-size: 18px; }
 .import-stat span { color: var(--ink-muted); font-size: 10px; }
+.import-stat-warning { border-color: #f2d8a8; background: var(--amber-soft); }
+.import-stat-warning strong { color: var(--amber); }
 .import-issues { max-height: 150px; overflow: auto; }
+.import-apply-status { min-height: 17px; color: var(--ink-muted); font-size: 10px; line-height: 1.45; }
+.import-apply-status.status-warning { color: var(--amber); }
+.import-apply-status.status-error { color: var(--red); }
+.rules-transfer { display: flex; flex-direction: column; gap: 9px; }
+.rules-transfer > label { color: var(--ink); font-size: 12px; font-weight: 700; }
+.rules-transfer-summary { display: flex; align-items: baseline; gap: 7px; color: var(--ink-muted); font-size: 11px; }
+.rules-transfer-summary strong { color: var(--ink); font-size: 13px; }
+.rules-transfer-textarea {
+  width: 100%;
+  height: clamp(260px, 48vh, 520px);
+  min-height: 260px !important;
+  resize: vertical;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rules-transfer-textarea[readonly] { background: var(--surface-soft); }
+.rules-transfer-status { min-height: 17px; color: var(--ink-muted); font-size: 10px; line-height: 1.45; }
+.rules-transfer-status.status-success { color: var(--green); }
+.rules-transfer-status.status-error { color: var(--red); }
 
 .toast-region {
   position: fixed;
@@ -862,6 +887,7 @@ body.sidebar-collapsed .collapse-sidebar span:first-child { transform: rotate(18
   .condition-coverage-grid { grid-template-columns: 1fr; }
   .update-section-head, .update-release-row { align-items: stretch; flex-direction: column; }
   .update-section-head button, .update-release-row > button { width: 100%; }
+  .rules-transfer-textarea { height: 42vh; min-height: 210px !important; }
   .editor-dialog { width: calc(100vw - 16px); }
   .editor-dialog, .editor-shell { max-height: calc(100dvh - 16px); }
   .editor-body { min-height: 0; max-height: none; flex: 1 1 auto; padding: 14px; }

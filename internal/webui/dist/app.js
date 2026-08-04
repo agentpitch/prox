@@ -113,6 +113,7 @@ let ui = {
   initialized: false,
   configLoadGeneration: 0,
   configSaveGeneration: 0,
+  lastSaveError: '',
   configLoadRequest: null,
   configReloadOnResume: false,
   visibilityRequest: null,
@@ -126,6 +127,8 @@ const SNAPSHOT_POLL_MS = 15000;
 const RULE_ACTIVITY_POLL_MS = 60000;
 const MAX_UI_LOG_ENTRIES = 1000;
 const MAX_UI_LOG_BUFFER = 1100;
+// Must match the HTTP request-body limit in internal/httpapi/server.go.
+const MAX_CONFIG_BODY_BYTES = 8 * 1024 * 1024;
 
 function retentionMinutesFor(source = state) {
   const n = Number(source?.retention_minutes || snapshot?.retention_minutes || 7);
@@ -1004,9 +1007,14 @@ async function persistState(nextState, successMessage = 'Сохранено') {
   ui.configSaveGeneration = saveGeneration;
   cancelConfigLoadRequest();
   ui.saving = true;
+  ui.lastSaveError = '';
   updateStatusLine();
   try {
-    const saved = await api('/api/config', { method: 'PUT', body: JSON.stringify(collectConfig(nextState)) });
+    const body = JSON.stringify(collectConfig(nextState));
+    if (rulesUI.utf8ByteLength(body, MAX_CONFIG_BODY_BYTES) > MAX_CONFIG_BODY_BYTES) {
+      throw new Error('Полная конфигурация превышает допустимый размер 8 МБ. Уменьшите импортируемый набор или удалите лишние правила.');
+    }
+    const saved = await api('/api/config', { method: 'PUT', body });
     if (saveGeneration !== ui.configSaveGeneration) return false;
     state = restoreTransientState(saved, transient);
     pruneRuleSelection();
@@ -1024,15 +1032,18 @@ async function persistState(nextState, successMessage = 'Сохранено') {
       });
       ui.editorDirty = editorWasDirty;
       if (reloaded) {
+        ui.lastSaveError = 'Конфигурация уже изменилась; проверьте актуальные данные и повторите сохранение.';
         flashStatus(editorOpen
           ? 'Конфигурация уже изменилась. Загружена актуальная версия; редактор оставлен открытым — проверьте данные и повторите сохранение.'
           : 'Конфигурация уже изменилась. Загружена актуальная версия; повторите действие после проверки.', 'warn', 10000);
       } else {
+        ui.lastSaveError = 'Возник конфликт конфигурации, а актуальную версию загрузить не удалось.';
         flashStatus(editorOpen
           ? 'Конфликт конфигурации. Не удалось загрузить актуальную версию; редактор оставлен открытым. Обновите страницу перед повторной попыткой.'
           : 'Конфликт конфигурации. Не удалось загрузить актуальную версию; обновите страницу перед повторной попыткой.', 'error', 10000);
       }
     } else {
+      ui.lastSaveError = e?.message || 'неизвестная ошибка сохранения';
       flashStatus(`Ошибка сохранения: ${e.message}`, 'error', 6000);
     }
     return false;
@@ -1706,26 +1717,96 @@ async function deleteSelectedRules() {
   renderRules();
 }
 
-function exportRules() {
+function rulesForExport() {
   const selected = ui.rules.selected;
-  const rules = selected.size
+  return selected.size
     ? (state.rules || []).filter((rule) => selected.has(ruleIDKey(rule.id)))
     : (state.rules || []);
+}
+
+function downloadRulesExport(text) {
+  let url = '';
+  let link = null;
+  try {
+    const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+    url = URL.createObjectURL(blob);
+    link = document.createElement('a');
+    link.href = url;
+    link.download = `pitchprox-rules-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    return true;
+  } catch (error) {
+    console.error(error);
+    return false;
+  } finally {
+    link?.remove();
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+function setRulesTransferStatus(message, tone = '') {
+  const status = $('ed_rules_transfer_status');
+  if (!status) return;
+  status.textContent = message || '';
+  status.className = `rules-transfer-status${tone ? ` status-${tone}` : ''}`;
+}
+
+function openRulesExportDialog() {
+  const rules = rulesForExport();
   if (!rules.length) {
     showToast('Нет правил для экспорта', 'warn');
     return;
   }
-  const payload = rulesUI.makeExportPayload(rules);
-  const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `pitchprox-rules-${new Date().toISOString().slice(0, 10)}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
-  showToast(`Экспортировано: ${rules.length}`);
+  const text = rulesUI.stringifyExportPayload(rules);
+  const scope = ui.rules.selected.size ? 'выбранных' : 'всех';
+  openEditor({
+    title: 'Экспорт правил',
+    hint: 'Скопируйте JSON и вставьте его в окно импорта pitchProx на другой машине. Прокси-профили и пароли не экспортируются.',
+    bodyHTML: `
+      <div class="rules-transfer">
+        <div class="rules-transfer-summary"><strong>${escapeHtml(ruleCountText(rules.length))}</strong><span>${escapeHtml(scope)} · формат pitchprox.rules v${escapeHtml(rulesUI.EXPORT_VERSION)}</span></div>
+        <label for="ed_rules_export_text">JSON для переноса</label>
+        <textarea id="ed_rules_export_text" class="rules-transfer-textarea" readonly spellcheck="false" aria-describedby="ed_rules_transfer_status"></textarea>
+        <div id="ed_rules_transfer_status" class="rules-transfer-status" role="status" aria-live="polite">Нажмите «Копировать всё» или выделите текст вручную с помощью Ctrl+A и Ctrl+C.</div>
+      </div>
+    `,
+    extraActionsHTML: '<button id="ed_rules_export_file" type="button">⇩ Скачать JSON-файл</button>',
+    saveLabel: 'Копировать всё',
+    cancelLabel: 'Закрыть',
+    onOpen: (editorSession) => {
+      const textarea = $('ed_rules_export_text');
+      const downloadButton = $('ed_rules_export_file');
+      if (textarea) textarea.value = text;
+      if (downloadButton) downloadButton.onclick = () => {
+        const started = downloadRulesExport(text);
+        setRulesTransferStatus(
+          started ? `Скачивание JSON-файла начато: ${ruleCountText(rules.length)}.` : 'Не удалось начать скачивание JSON-файла.',
+          started ? 'success' : 'error',
+        );
+      };
+      const focusFrame = requestAnimationFrame(() => {
+        if (editorSession === ui.editorSession) $('editorSaveBtn')?.focus({ preventScroll: true });
+      });
+      return () => {
+        cancelAnimationFrame(focusFrame);
+        if (downloadButton) downloadButton.onclick = null;
+        if (textarea) textarea.value = '';
+      };
+    },
+    onSave: async (editorSession) => {
+      const textarea = $('ed_rules_export_text');
+      const copied = await copyText(textarea?.value || text, textarea);
+      if (copied) {
+        setRulesTransferStatus(`Скопировано в буфер обмена: ${ruleCountText(rules.length)}.`, 'success');
+        requestAnimationFrame(() => {
+          if (editorSession === ui.editorSession && $('editorDialog')?.open) $('editorSaveBtn')?.focus({ preventScroll: true });
+        });
+      } else {
+        setRulesTransferStatus('Браузер не разрешил автоматическое копирование. Выделите текст вручную: Ctrl+A, затем Ctrl+C.', 'error');
+      }
+    },
+  });
 }
 
 function unresolvedImportedRule(rule) {
@@ -1743,8 +1824,9 @@ function unresolvedImportedRule(rule) {
 function openRulesImportPreview(parsed) {
   const rules = parsed.rules || [];
   const errors = parsed.errors || [];
+  const invalidCount = Math.max(0, Number(parsed.invalidCount || 0));
   if (!rules.length) {
-    flashStatus(errors[0] || 'В файле нет подходящих правил', 'error', 6000);
+    flashStatus(errors[0] || 'В данных нет подходящих правил', 'error', 6000);
     return;
   }
   const currentIDs = new Set((state.rules || []).map((rule) => ruleIDKey(rule.id)));
@@ -1756,10 +1838,11 @@ function openRulesImportPreview(parsed) {
   const possibleDuplicates = rules.filter((rule) => existingCriteria.has(rulesUI.ruleCriteriaFingerprint(rule))).length;
   openEditor({
     title: 'Импорт правил',
-    hint: 'Предпросмотр rules-only файла. Прокси-пароли и остальные настройки не импортируются.',
+    hint: 'Предпросмотр набора правил. Прокси-пароли и остальные настройки не импортируются.',
     bodyHTML: `
       <div class="import-summary">
-        <div class="import-stat"><strong>${rules.length}</strong><span>валидных правил</span></div>
+        <div class="import-stat"><strong>${rules.length}</strong><span>структурно корректных</span></div>
+        ${invalidCount ? `<div class="import-stat import-stat-warning"><strong>${invalidCount}</strong><span>структурно повреждённых пропущено</span></div>` : ''}
         <div class="import-stat"><strong>${conflicts}</strong><span>конфликтов ID</span></div>
         <div class="import-stat"><strong>${possibleDuplicates}</strong><span>точных совпадений</span></div>
         <div class="import-stat"><strong>${unresolved.length}</strong><span>недоступных маршрутов</span></div>
@@ -1771,11 +1854,18 @@ function openRulesImportPreview(parsed) {
           <option value="copy">Создать копии с новым ID</option>
         </select></label>
         <label class="editor-check"><input id="ed_import_disable_unresolved" type="checkbox" checked><span>Отключить правила с отсутствующим или выключенным маршрутом</span></label>
-        <div class="hint">Новые правила сохраняют взаимный порядок и вставляются перед правилом Default, если оно существует.</div>
+        <div class="hint">Новые правила сохраняют взаимный порядок и вставляются перед правилом Default, если оно существует. Финальная проверка синтаксиса выполняется сервисом атомарно: при ошибке конфигурация не изменится.</div>
       </div>
+      <div id="ed_import_apply_status" class="import-apply-status" role="alert" aria-live="assertive"></div>
       ${(errors.length || unresolved.length) ? `<div class="analysis-box import-issues"><strong>Предупреждения</strong><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}${unresolvedPreview.map((rule) => `<li>${escapeHtml(rule.name || rule.id)}: маршрут ${escapeHtml(rule.proxy_id || rule.chain_id || 'не указан')} недоступен</li>`).join('')}${hiddenUnresolved ? `<li>Ещё недоступных маршрутов скрыто: ${hiddenUnresolved}</li>` : ''}</ul></div>` : ''}
     `,
+    saveLabel: invalidCount ? `Импортировать корректные (${rules.length})` : `Импортировать (${rules.length})`,
     onSave: async (editorSession) => {
+      const applyStatus = $('ed_import_apply_status');
+      if (applyStatus) {
+        applyStatus.textContent = '';
+        applyStatus.className = 'import-apply-status';
+      }
       const strategy = $('ed_import_strategy')?.value || 'skip';
       const disableUnresolved = !!$('ed_import_disable_unresolved')?.checked;
       const imported = rules.map((rule) => {
@@ -1784,10 +1874,23 @@ function openRulesImportPreview(parsed) {
         return copy;
       });
       const merged = rulesUI.mergeImportedRules(state.rules || [], imported, strategy);
+      const existingRuleCount = (state.rules || []).length;
+      const resultRuleLimit = Math.max(rulesUI.MAX_IMPORT_RULES, existingRuleCount);
+      if (merged.rules.length > resultRuleLimit) {
+        if (applyStatus) {
+          applyStatus.textContent = existingRuleCount > rulesUI.MAX_IMPORT_RULES
+            ? `Импорт увеличил бы число правил с ${existingRuleCount} до ${merged.rules.length}. Для существующей конфигурации свыше ${rulesUI.MAX_IMPORT_RULES} правил разрешены замена или пропуск без дальнейшего роста.`
+            : `После импорта получилось бы ${merged.rules.length} правил; допустимый максимум — ${rulesUI.MAX_IMPORT_RULES}. Выберите другую стратегию или удалите лишние правила.`;
+          applyStatus.className = 'import-apply-status status-error';
+        }
+        return;
+      }
       const changed = merged.summary.added + merged.summary.replaced + merged.summary.copied;
       if (!changed) {
-        showToast('Новых изменений для импорта нет', 'warn');
-        closeEditor(true, editorSession);
+        if (applyStatus) {
+          applyStatus.textContent = 'При выбранной стратегии новых изменений для импорта нет. Можно выбрать замену или создание копий.';
+          applyStatus.className = 'import-apply-status status-warning';
+        }
         return;
       }
       const ok = await applyStateChange((next) => {
@@ -1796,23 +1899,103 @@ function openRulesImportPreview(parsed) {
       if (ok) {
         ui.rules.selected = new Set();
         closeEditor(true, editorSession);
+      } else if (applyStatus) {
+        applyStatus.textContent = ui.lastSaveError
+          ? `Импорт не применён: ${ui.lastSaveError}`
+          : 'Импорт не применён. Конфигурация могла измениться или сохранение завершилось ошибкой; проверьте данные и повторите попытку.';
+        applyStatus.className = 'import-apply-status status-error';
       }
     },
   });
 }
 
-async function handleRulesImportFile(file) {
-  if (!file) return;
-  if (file.size > 5 * 1024 * 1024) {
-    flashStatus('Файл импорта превышает 5 МБ', 'error', 6000);
-    return;
-  }
-  try {
-    const parsed = rulesUI.parseImportPayload(await file.text());
-    openRulesImportPreview(parsed);
-  } catch (e) {
-    flashStatus(`Не удалось прочитать импорт: ${e.message}`, 'error', 6000);
-  }
+function openRulesImportDialog() {
+  openEditor({
+    title: 'Импорт правил',
+    hint: 'Вставьте JSON из буфера обмена. Можно также загрузить прежний JSON-файл кнопкой слева.',
+    bodyHTML: `
+      <div class="rules-transfer">
+        <label for="ed_rules_import_text">JSON с правилами</label>
+        <textarea id="ed_rules_import_text" class="rules-transfer-textarea" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Вставьте сюда содержимое pitchprox.rules…" aria-describedby="ed_rules_transfer_status"></textarea>
+        <div id="ed_rules_transfer_status" class="rules-transfer-status" role="status" aria-live="polite">Поддерживается экспорт pitchProx, полный конфиг с массивом rules или массив правил. Максимум 5 МБ и ${escapeHtml(rulesUI.MAX_IMPORT_RULES)} правил.</div>
+      </div>
+    `,
+    extraActionsHTML: '<input id="ed_rules_import_file" type="file" accept="application/json,.json" hidden><button id="ed_rules_import_file_btn" type="button">⇧ Загрузить JSON-файл</button>',
+    saveLabel: 'Проверить правила',
+    cancelLabel: 'Отмена',
+    onOpen: (editorSession) => {
+      const textarea = $('ed_rules_import_text');
+      const fileInput = $('ed_rules_import_file');
+      const fileButton = $('ed_rules_import_file_btn');
+      let fileReadGeneration = 0;
+      const dirtyMessage = 'Текст изменён. Нажмите «Проверить правила», чтобы увидеть конфликты и предупреждения.';
+      if (textarea) {
+        textarea.oninput = () => {
+          fileReadGeneration += 1;
+          if ($('ed_rules_transfer_status')?.textContent !== dirtyMessage) setRulesTransferStatus(dirtyMessage);
+        };
+      }
+      if (fileButton && fileInput) fileButton.onclick = () => fileInput.click();
+      if (fileInput) fileInput.onchange = async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        const generation = ++fileReadGeneration;
+        if (file.size > rulesUI.MAX_IMPORT_BYTES) {
+          setRulesTransferStatus('Файл импорта превышает 5 МБ.', 'error');
+          return;
+        }
+        try {
+          const text = await file.text();
+          if (generation !== fileReadGeneration || editorSession !== ui.editorSession || !$('editorDialog')?.open || !textarea) return;
+          textarea.value = text;
+          ui.editorDirty = true;
+          setRulesTransferStatus(`Загружен файл «${file.name}» (${formatBytes(file.size)}). Проверьте правила.`, 'success');
+          textarea.focus({ preventScroll: true });
+        } catch (error) {
+          if (generation === fileReadGeneration && editorSession === ui.editorSession) {
+            setRulesTransferStatus(`Не удалось прочитать файл: ${error.message}`, 'error');
+          }
+        }
+      };
+      const focusFrame = requestAnimationFrame(() => {
+        if (editorSession === ui.editorSession && textarea) textarea.focus({ preventScroll: true });
+      });
+      return () => {
+        cancelAnimationFrame(focusFrame);
+        fileReadGeneration += 1;
+        if (textarea) {
+          textarea.oninput = null;
+          textarea.value = '';
+        }
+        if (fileButton) fileButton.onclick = null;
+        if (fileInput) {
+          fileInput.onchange = null;
+          fileInput.value = '';
+        }
+      };
+    },
+    onSave: async (editorSession) => {
+      const text = $('ed_rules_import_text')?.value || '';
+      if (!/\S/.test(text)) {
+        setRulesTransferStatus('Вставьте JSON с правилами или загрузите JSON-файл.', 'error');
+        return;
+      }
+      let parsed;
+      try {
+        parsed = rulesUI.parseImportPayload(text);
+      } catch (error) {
+        setRulesTransferStatus(`Не удалось разобрать JSON: ${error.message}`, 'error');
+        return;
+      }
+      if (!parsed.rules.length) {
+        setRulesTransferStatus(parsed.errors[0] || 'В данных нет подходящих правил.', 'error');
+        return;
+      }
+      if (!closeEditor(true, editorSession)) return;
+      openRulesImportPreview(parsed);
+    },
+  });
 }
 
 function handleRulesTableClick(event) {
@@ -1940,14 +2123,8 @@ function setupRulesUI() {
   $('bulkEnableBtn').onclick = () => void applyBulkRuleEnabled(true);
   $('bulkDisableBtn').onclick = () => void applyBulkRuleEnabled(false);
   $('bulkDeleteBtn').onclick = () => void deleteSelectedRules();
-  $('exportRulesBtn').onclick = exportRules;
-  $('importRulesBtn').onclick = () => $('rulesImportFile').click();
-  $('rulesImportFile').onchange = async () => {
-    const input = $('rulesImportFile');
-    const file = input.files?.[0];
-    input.value = '';
-    await handleRulesImportFile(file);
-  };
+  $('exportRulesBtn').onclick = openRulesExportDialog;
+  $('importRulesBtn').onclick = openRulesImportDialog;
   document.querySelectorAll('[data-rule-column]').forEach((checkbox) => {
     checkbox.onchange = () => {
       const column = checkbox.getAttribute('data-rule-column');
@@ -2124,6 +2301,8 @@ function setEditorBusy(session, busy) {
     ui.editorSavingSession = session;
     dialog.setAttribute('aria-busy', 'true');
     controls.forEach((control) => {
+      // Read-only transfer text remains selectable for the clipboard fallback.
+      if (control.matches('textarea[readonly]')) return;
       control.dataset.editorBusyWasDisabled = control.disabled ? '1' : '0';
       control.disabled = true;
     });
@@ -2155,7 +2334,7 @@ async function runEditorTask(session, task) {
   }
 }
 
-function openEditor({ title, hint, bodyHTML, onSave, extraActionsHTML = '', onOpen = null }) {
+function openEditor({ title, hint, bodyHTML, onSave, extraActionsHTML = '', onOpen = null, saveLabel = 'Применить', cancelLabel = 'Отмена' }) {
   const dialog = $('editorDialog');
   if (ui.saving || ui.editorSavingSession) {
     showToast('Дождитесь завершения текущего сохранения', 'warn');
@@ -2169,6 +2348,8 @@ function openEditor({ title, hint, bodyHTML, onSave, extraActionsHTML = '', onOp
   $('editorHint').textContent = hint || '';
   $('editorBody').innerHTML = bodyHTML;
   $('editorExtraActions').innerHTML = extraActionsHTML || '';
+  $('editorSaveBtn').textContent = saveLabel;
+  $('editorCancelBtn').textContent = cancelLabel;
   ui.editorSave = onSave;
   ui.editorDirty = false;
   dialog.showModal();
@@ -3536,7 +3717,7 @@ function connectionRowClass(c) {
   return classes.join(' ');
 }
 
-async function copyText(text) {
+async function copyText(text, fallbackTextarea = null) {
   const value = String(text ?? '');
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -3544,19 +3725,25 @@ async function copyText(text) {
       return true;
     }
   } catch {}
-  const ta = document.createElement('textarea');
-  ta.value = value;
-  ta.style.position = 'fixed';
-  ta.style.opacity = '0';
-  document.body.appendChild(ta);
+  const suppliedTextarea = fallbackTextarea instanceof HTMLTextAreaElement ? fallbackTextarea : null;
+  const ta = suppliedTextarea || document.createElement('textarea');
+  if (!suppliedTextarea) {
+    ta.value = value;
+    ta.tabIndex = -1;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    const openDialog = $('editorDialog')?.open ? $('editorDialog') : null;
+    (openDialog || document.body).appendChild(ta);
+  }
+  ta.focus({ preventScroll: true });
   ta.select();
   try {
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    return true;
+    const copied = document.execCommand('copy');
+    return copied;
   } catch {
-    document.body.removeChild(ta);
     return false;
+  } finally {
+    if (!suppliedTextarea) ta.remove();
   }
 }
 

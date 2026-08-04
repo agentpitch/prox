@@ -29,6 +29,39 @@ test('rules search uses one explicit clear control', () => {
   assert.equal((markup.match(/id="clearRuleSearchBtn"/g) || []).length, 1);
 });
 
+test('rules import and export open clipboard dialogs while retaining file operations', () => {
+  const markup = fs.readFileSync(path.join(__dirname, 'dist', 'index.html'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const exportStart = source.indexOf('function openRulesExportDialog()');
+  const exportEnd = source.indexOf('\nfunction unresolvedImportedRule(', exportStart);
+  const importStart = source.indexOf('function openRulesImportDialog()');
+  const importEnd = source.indexOf('\nfunction handleRulesTableClick(', importStart);
+  const exportSource = source.slice(exportStart, exportEnd);
+  const importSource = source.slice(importStart, importEnd);
+
+  assert.match(markup, /id="importRulesBtn"/);
+  assert.match(markup, /id="exportRulesBtn"/);
+  assert.match(source, /\$\('exportRulesBtn'\)\.onclick = openRulesExportDialog/);
+  assert.match(source, /\$\('importRulesBtn'\)\.onclick = openRulesImportDialog/);
+  assert.match(exportSource, /id="ed_rules_export_text"[^>]*readonly/);
+  assert.match(exportSource, /saveLabel: 'Копировать всё'/);
+  assert.match(exportSource, /id="ed_rules_export_file"/);
+  assert.match(source, /URL\.revokeObjectURL/);
+  assert.match(exportSource, /\$\('editorSaveBtn'\)\?\.focus/);
+  assert.match(source, /\(openDialog \|\| document\.body\)\.appendChild\(ta\)/);
+  assert.match(source, /control\.matches\('textarea\[readonly\]'\)/);
+  assert.match(importSource, /id="ed_rules_import_text"/);
+  assert.match(importSource, /saveLabel: 'Проверить правила'/);
+  assert.match(importSource, /id="ed_rules_import_file"[^>]*type="file"/);
+  assert.match(importSource, /fileInput\.value = ''/);
+  assert.match(importSource, /fileReadGeneration/);
+  assert.match(importSource, /textarea\.oninput = \(\) => \{\s*fileReadGeneration \+= 1;/);
+  assert.match(importSource, /rulesUI\.parseImportPayload\(text\)/);
+  assert.match(source, /Math\.max\(rulesUI\.MAX_IMPORT_RULES, existingRuleCount\)/);
+  assert.match(source, /rulesUI\.utf8ByteLength\(body, MAX_CONFIG_BODY_BYTES\)/);
+  assert.ok(exportStart >= 0 && exportEnd > exportStart && importStart >= 0 && importEnd > importStart);
+});
+
 test('existing rule editor opens condition activity before editable fields', () => {
   const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
   const editorStart = source.indexOf('function openRuleEditor(');
@@ -398,6 +431,32 @@ test('versioned import preserves raw multi-value strings', () => {
   assert.equal(parsed.rules[0].target_ports, '443; 8000-8010');
 });
 
+test('clipboard export text round-trips Unicode and raw multi-value syntax', () => {
+  const source = rule({
+    name: 'Рабочее правило',
+    notes: 'Перенос между машинами через буфер обмена',
+    applications: 'chrome.exe; "C:\\Some App\\app.exe"',
+    target_hosts: '*.пример.рф; api.example.com',
+    target_ports: '443; 8000-8010',
+  });
+  const text = rulesUI.stringifyExportPayload([source], '2026-08-04T12:00:00.000Z');
+  assert.equal(text.endsWith('\n'), true);
+  const parsed = rulesUI.parseImportPayload(text);
+  assert.deepEqual(parsed.errors, []);
+  assert.deepEqual(parsed.rules, [source]);
+  assert.deepEqual(rulesUI.parseImportPayload(`\uFEFF${text}`).rules, [source]);
+});
+
+test('text import enforces the same five-megabyte bound as file import', () => {
+  assert.equal(rulesUI.MAX_IMPORT_BYTES, 5 * 1024 * 1024);
+  assert.equal(rulesUI.utf8ByteLength('a😀я'), 7);
+  assert.equal(rulesUI.utf8ByteLength('😀😀', 3), 4);
+  assert.throws(
+    () => rulesUI.parseImportPayload(' '.repeat(rulesUI.MAX_IMPORT_BYTES + 1)),
+    /превышает 5 МБ/,
+  );
+});
+
 test('import canonicalizes route references like the backend', () => {
   const proxyRule = rulesUI.parseImportPayload([rule({ proxy_id: ' office ', chain_id: 'stale-chain' })]).rules[0];
   assert.equal(proxyRule.proxy_id, 'office');
@@ -429,6 +488,7 @@ test('import bounds the number of rules and reported errors', () => {
   const parsed = rulesUI.parseImportPayload(Array.from({ length: rulesUI.MAX_IMPORT_ERRORS + 5 }, () => null));
   assert.equal(parsed.rules.length, 0);
   assert.equal(parsed.errors.length, rulesUI.MAX_IMPORT_ERRORS + 1);
+  assert.equal(parsed.invalidCount, rulesUI.MAX_IMPORT_ERRORS + 5);
   assert.match(parsed.errors.at(-1), /Ещё ошибок скрыто: 5/);
 });
 

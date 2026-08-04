@@ -32,7 +32,7 @@ A publishable v0.43 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.5 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.6 -DownloadWinDivertArchive
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is
@@ -120,6 +120,12 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 - tray icon appears and opens WebUI on double click;
 - `pitchProx.config.json` and `pitchProx.history\` appear next to the executable;
 - rule matching works for `Direct / Proxy / Chain / Block`;
+- clipboard export of all or selected rules round-trips through the import
+  textarea and preview; the left-side file download/load actions produce the
+  same JSON and validation result;
+- typing or pasting while a file read is pending cannot be overwritten by that
+  stale read, and a complete config above the 8 MiB service limit is rejected
+  client-side without a partial save;
 - proxy activity, connection history, and logs continue to work after long uptime;
 - hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
 - WebUI auto-pauses after one hour without browser requests, control/tray polling and a long-lived SSE do not prevent it, the loaded page reports that routing continues, and **Управление** in the tray enables it again;

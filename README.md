@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.5 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.6 -DownloadWinDivertArchive
 ```
 
-The candidate is written to `build\candidates\v0.43-rc.5\`; it does not replace
+The candidate is written to `build\candidates\v0.43-rc.6\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, then obtains and verifies the pinned
 official WinDivert archive for a release-grade updater manifest. If a network
@@ -148,7 +148,8 @@ The WebUI opens on the Rules page and provides:
 - sidebar navigation for Monitoring, Rules, Proxies, Chains, Dropped connections, and the event log;
 - local rule search across names, comments, every application/host/port value, actions, proxies, and chains;
 - filters, pagination, one consistently compact table, configurable columns, and atomic bulk operations;
-- versioned rules-only import/export that never includes proxy credentials;
+- clipboard-first versioned rules-only import/export with JSON textareas,
+  retained file load/download actions, bounded preview, and no proxy credentials;
 - demand-only bounded per-rule activity charts;
 - lazy Application + Host + Port condition coverage without expanding a rule
   into a potentially huge Cartesian product; details are coalesced into bounded

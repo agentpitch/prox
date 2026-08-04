@@ -9,7 +9,7 @@ The API is intended for localhost use only.
 Response:
 
 ```json
-{"ok": true, "version": "v0.43-rc.5", "pid": 1234}
+{"ok": true, "version": "v0.43-rc.6", "pid": 1234}
 ```
 
 `version` is injected at build time. Unversioned developer builds report
@@ -309,7 +309,7 @@ most the five latest non-draft published releases:
 
 ```json
 {
-  "current_version": "v0.43-rc.5",
+  "current_version": "v0.43-rc.6",
   "latest_version": "v0.43",
   "update_available": true,
   "comparison_known": true,

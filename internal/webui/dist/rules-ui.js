@@ -11,6 +11,7 @@
   const EXPORT_VERSION = 1;
   const MAX_IMPORT_RULES = 2000;
   const MAX_IMPORT_ERRORS = 100;
+  const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
 
   function splitValues(raw) {
     const out = [];
@@ -517,9 +518,38 @@
     return { rule };
   }
 
+  function utf8ByteLength(value, stopAfter = Number.POSITIVE_INFINITY) {
+    const text = String(value ?? '');
+    let bytes = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      if (code <= 0x7f) bytes += 1;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length) {
+        const next = text.charCodeAt(index + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
+          index += 1;
+        } else {
+          bytes += 3;
+        }
+      } else {
+        bytes += 3;
+      }
+      if (bytes > stopAfter) return bytes;
+    }
+    return bytes;
+  }
+
   function parseImportPayload(payload) {
     let source = payload;
-    if (typeof source === 'string') source = JSON.parse(source);
+    if (typeof source === 'string') {
+      if (utf8ByteLength(source, MAX_IMPORT_BYTES) > MAX_IMPORT_BYTES) {
+        throw new Error('Набор правил превышает 5 МБ');
+      }
+      if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
+      source = JSON.parse(source);
+    }
     let values;
     if (Array.isArray(source)) {
       values = source;
@@ -530,16 +560,18 @@
       }
       values = source.rules;
     } else {
-      throw new Error('Файл не содержит массив rules');
+      throw new Error('Данные не содержат массив rules');
     }
     if (values.length > MAX_IMPORT_RULES) {
-      throw new Error(`Файл содержит ${values.length} правил; максимум ${MAX_IMPORT_RULES}`);
+      throw new Error(`Набор содержит ${values.length} правил; максимум ${MAX_IMPORT_RULES}`);
     }
     const rules = [];
     const errors = [];
+    let invalidCount = 0;
     let omittedErrors = 0;
     const seen = new Set();
     const addError = (message) => {
+      invalidCount += 1;
       if (errors.length < MAX_IMPORT_ERRORS) errors.push(message);
       else omittedErrors += 1;
     };
@@ -558,7 +590,7 @@
       rules.push(result.rule);
     });
     if (omittedErrors > 0) errors.push(`Ещё ошибок скрыто: ${omittedErrors}`);
-    return { rules, errors };
+    return { rules, errors, invalidCount };
   }
 
   function makeExportPayload(rules, exportedAt) {
@@ -568,6 +600,10 @@
       exported_at: exportedAt || new Date().toISOString(),
       rules: (Array.isArray(rules) ? rules : []).map(cloneRule),
     };
+  }
+
+  function stringifyExportPayload(rules, exportedAt) {
+    return `${JSON.stringify(makeExportPayload(rules, exportedAt), null, 2)}\n`;
   }
 
   function nextImportedID(base, used) {
@@ -628,6 +664,8 @@
     EXPORT_VERSION,
     MAX_IMPORT_RULES,
     MAX_IMPORT_ERRORS,
+    MAX_IMPORT_BYTES,
+    utf8ByteLength,
     splitValues,
     hasUnclosedQuote,
     compareReleaseVersions,
@@ -647,6 +685,7 @@
     mergeLogEntries,
     parseImportPayload,
     makeExportPayload,
+    stringifyExportPayload,
     mergeImportedRules,
   });
 }));

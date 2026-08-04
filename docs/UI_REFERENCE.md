@@ -131,6 +131,13 @@ For each marginal dimension, an absent token is shown as zero observed hits only
 
 Import and export are client-side rules-only operations. They never export proxy profiles, usernames, or passwords.
 
+Both toolbar buttons open a transfer dialog instead of immediately opening or downloading a file:
+
+- **Export** shows the complete versioned JSON in a read-only textarea. The primary action copies the entire payload to the clipboard; the left footer action downloads the same bytes as `pitchprox-rules-YYYY-MM-DD.json`.
+- **Import** focuses an empty textarea for `Ctrl+V`. The left footer action loads a `.json` file into the same textarea, and **Check rules** sends either source through the same bounded parser and existing preview.
+
+The preview is still mandatory before configuration changes. It reports structurally correct and skipped structurally damaged records, ID conflicts, exact matches, and unresolved routes. Backend compilation then performs the final criteria-syntax check atomically, so a rejected set does not partially change the configuration. A partially damaged set uses an explicit **Import correct** action. New configurations cannot grow beyond 2,000 rules; a legacy configuration already above that limit may still replace or skip rules as long as the operation does not increase its count. Clipboard text and files share the 5 MiB input limit, accept an optional UTF-8 BOM, and preserve raw multi-application, multi-host, and multi-port strings. Before saving, the client also checks the complete UTF-8 config body against the backend's 8 MiB request limit.
+
 Format:
 
 ```json
@@ -229,7 +236,8 @@ The routed UI must remain quiet when configuration pages are open:
 - rules use one delegated table listener rather than handlers per row;
 - rule selection and activity maps are replaced/pruned, not appended indefinitely;
 - export Blob URLs are revoked;
-- import file inputs are cleared immediately after reading;
+- import file inputs are cleared immediately after selection; competing file reads use a generation token, and manual textarea input invalidates an unfinished read so pasted text cannot be overwritten;
+- transfer textarea values and handlers are cleared when the dialog closes, and no clipboard payload is stored or cached;
 - no application-icon cache is introduced;
 - pending route callbacks, bounded toasts, config reads, editor condition reads, and view-specific animation frames are cancelled or released on their lifecycle boundary.
 - update discovery has no timer or startup request; its five-item result,

@@ -10,6 +10,9 @@
 - Multi-selection and atomic bulk enable, disable, and delete.
 - Multiline rule comments using the existing compatible `notes` field.
 - Redesigned editor that preserves raw multi-app, multi-host, and multi-port syntax.
+- Existing-rule editors now open with **Фактические срабатывания условий**
+  expanded at the top, while the enabled control remains on one line with the
+  name.
 - New route-style Windows, tray, and WebUI application icon.
 - Syntax warnings, stable-ID validation, dirty-editor protection, and advisory similar-rule detection.
 - Versioned rules-only import/export without proxy credentials.
@@ -26,15 +29,27 @@
 - Build version is reported by the API and injected into release binaries.
 - Long-running resource hardening from the post-v0.41 work is included: bounded history recovery/retries, PID creation-time validation, released high-water buffers, stricter protocol parsing, and transactional runtime-config activation.
 - WebUI-only process metadata is released on dormancy, and connection maps compact geometrically after traffic bursts even when a long-lived connection remains.
+- Settings now performs an explicit on-demand GitHub Releases check, reports
+  stable update availability, and shows the five latest published versions.
+  Any compatible listed version can be selected, including a confirmed
+  downgrade; there is no background release polling.
+- Windows updates use a verified short-lived helper, exact process/service
+  identity, atomic executable replacement, three matching health checks, and a
+  verified rollback/restart of the old executable if the selected build fails.
+  Fixed transaction paths, bounded retries, and startup reconciliation prevent
+  abandoned downloads or helper files from accumulating across long runs.
 
 ## Release integrity
 
 - Windows target is fixed to `amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`, and Go `1.26.5`.
 - Source builds use read-only module mode and must report the intended commit with `vcs.modified=false`.
-- The WinDivert 2.2.2 DLL, driver, tracked verbatim license, and official CI archive are pinned by SHA-256; local packaging reuses the verified root runtime without duplicate extraction.
+- The WinDivert 2.2.2 DLL, driver, tracked verbatim license, and official archive are pinned by SHA-256; release-grade local and CI packaging downloads and verifies that archive, while diagnostic local packaging may reuse the verified root runtime.
 - The full ZIP includes WinDivert, Go, and `golang.org/x/sys` licenses and third-party notices.
 - `pitchProx-build-manifest.json` records the source commit, toolchain, target, dependency hashes, and executable hash.
 - `pitchProx-windows-amd64.sha256` covers the standalone executable, ZIP, and manifest and is verified before a tag release is published.
+- The updater cross-checks GitHub asset digests, the checksum file, executable
+  hash, clean build manifest, target architecture, and installed WinDivert
+  hashes before the running process can be stopped.
 
 ## Compatibility
 
@@ -43,6 +58,9 @@
 - Existing rule strings and comments remain compatible.
 - History stays in the existing bounded JSONL store; no SQLite dependency was added.
 - WinDivert remains version `2.2.2`.
+- Pre-manifest versions can be selected only when their complete ZIP proves an
+  exact WinDivert runtime match. After such a legacy downgrade the old build has
+  no built-in updater, which the confirmation dialog states explicitly.
 
 ## Installation note
 

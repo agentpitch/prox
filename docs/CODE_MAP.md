@@ -46,6 +46,17 @@ This file maps concepts to source files.
 - `internal/webui/dist/app.js` - client-side rendering, editors, filters, charts, visibility-aware live mode, and bucket-aware traffic rendering.
 - `internal/webui/embed.go` - embeds static assets into the Go binary.
 
+## Application updater
+
+- `internal/updater/client.go` - bounded GitHub Releases client, exact asset and
+  manifest/checksum verification, legacy-runtime compatibility gate, and
+  streamed executable staging.
+- `internal/updater/manager.go` - single-flight install state, fixed transaction
+  paths, cross-process lock ownership, persisted reconciliation, and cleanup.
+- `internal/updater/handoff_windows.go` - exact-process/service handoff,
+  permission barrier, atomic Windows replacement, health confirmation, and
+  verified rollback.
+
 ## Windows integration
 
 - `internal/windivert/divert_windows.go` - WinDivert DLL bindings.

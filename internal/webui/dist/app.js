@@ -85,11 +85,14 @@ let ui = {
   logsInitialized: false,
   logRenderFrame: null,
   editorSave: null,
+  editorCleanup: null,
   editorSession: 0,
   editorSavingSession: 0,
   editorAnalysisTimer: null,
   editorConditionRequest: null,
   editorConditionGeneration: 0,
+  updatePendingVersion: '',
+  updatePendingLegacy: false,
   saving: false,
   statusMessage: '',
   statusTone: 'muted',
@@ -2172,7 +2175,10 @@ function openEditor({ title, hint, bodyHTML, onSave, extraActionsHTML = '', onOp
   const body = $('editorBody');
   body.oninput = (event) => { if (!event.target.closest('[data-editor-transient]')) ui.editorDirty = true; };
   body.onchange = (event) => { if (!event.target.closest('[data-editor-transient]')) ui.editorDirty = true; };
-  if (typeof onOpen === 'function') onOpen(session);
+  if (typeof onOpen === 'function') {
+    const cleanup = onOpen(session);
+    if (session === ui.editorSession && typeof cleanup === 'function') ui.editorCleanup = cleanup;
+  }
   return session;
 }
 
@@ -2187,6 +2193,11 @@ function closeEditor(force = false, expectedSession = null) {
   if (ui.editorSavingSession === ui.editorSession) setEditorBusy(ui.editorSession, false);
   clearRuleEditorAnalysisTimer();
   cancelRuleConditionActivity();
+  const cleanup = ui.editorCleanup;
+  ui.editorCleanup = null;
+  if (typeof cleanup === 'function') {
+    try { cleanup(); } catch (error) { console.error(error); }
+  }
   if (dialog.open) dialog.close();
   const body = $('editorBody');
   const extra = $('editorExtraActions');
@@ -2233,7 +2244,420 @@ function openSettingsEditor() {
           <span class="hint">Один и тот же интервал используется для истории соединений, графика трафика и статистики правил. Вкладка «Новые» сравнивает последнюю минуту с этим окном; окно должно быть больше минуты.</span>
         </label>
       </div>
+      <section class="editor-section update-section" data-editor-transient aria-labelledby="ed_update_title">
+        <div class="update-section-head">
+          <div>
+            <div id="ed_update_title" class="editor-section-title">Обновление приложения</div>
+            <span class="hint">Проверка выполняется только по запросу. Установка не изменяет поля конфигурации.</span>
+          </div>
+          <button id="ed_update_check" type="button">Проверить обновления</button>
+        </div>
+        <div id="ed_update_summary" class="update-summary" role="status" aria-live="polite">
+          <strong>Текущая версия: ${escapeHtml(ui.version || 'dev')}</strong>
+          <span>Проверка обновлений ещё не выполнялась.</span>
+        </div>
+        <div id="ed_update_releases" class="update-release-list" aria-live="polite"></div>
+        <div id="ed_update_install_status" class="update-install-status" role="status" aria-live="polite" hidden>
+          <strong id="ed_update_phase">Подготовка обновления</strong>
+          <span id="ed_update_message"></span>
+          <progress id="ed_update_progress" max="1" value="0" hidden></progress>
+          <span id="ed_update_bytes" class="hint"></span>
+        </div>
+      </section>
     `,
+    onOpen: (editorSession) => {
+      const lifecycle = {
+        disposed: false,
+        generation: 0,
+        checking: false,
+        syncingStatus: false,
+        installing: false,
+        currentVersion: String(ui.version || 'dev'),
+        targetVersion: String(ui.updatePendingVersion || ''),
+        releases: [],
+        releasesRequest: null,
+        installRequest: null,
+        statusRequest: null,
+        statusTimer: null,
+        statusFailures: 0,
+        statusWasAvailable: false,
+        legacyInstall: !!ui.updatePendingLegacy,
+        reloadAfterInstall: !!ui.updatePendingVersion,
+      };
+      const checkButton = $('ed_update_check');
+      const summary = $('ed_update_summary');
+      const releaseList = $('ed_update_releases');
+      const installStatus = $('ed_update_install_status');
+      const phaseNode = $('ed_update_phase');
+      const messageNode = $('ed_update_message');
+      const progress = $('ed_update_progress');
+      const bytesNode = $('ed_update_bytes');
+      const isActive = () => !lifecycle.disposed && editorSession === ui.editorSession && $('editorDialog')?.open;
+
+      const syncUpdateControls = () => {
+        if (!isActive()) return;
+        if (checkButton) checkButton.disabled = lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing;
+        releaseList?.querySelectorAll('[data-update-version]').forEach((button) => {
+          button.disabled = lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing || button.dataset.installable !== '1';
+        });
+      };
+
+      const versionsEqual = (left, right) => {
+        const a = String(left || '').trim();
+        const b = String(right || '').trim();
+        return !!a && !!b && rulesUI.compareReleaseVersions(a, b) === 0;
+      };
+
+      const adoptRunningVersion = (version) => {
+        const runningVersion = String(version || '').trim();
+        if (!runningVersion) return;
+        ui.version = runningVersion;
+        lifecycle.currentVersion = runningVersion;
+        const versionNode = $('appVersion');
+        if (versionNode) versionNode.textContent = `Версия ${runningVersion}`;
+        if (lifecycle.releases.length) renderReleases();
+      };
+
+      const publishedText = (raw) => {
+        if (!raw) return 'Дата не указана';
+        const date = new Date(raw);
+        if (Number.isNaN(date.getTime())) return String(raw);
+        return date.toLocaleDateString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric' });
+      };
+
+      const renderReleases = () => {
+        if (!releaseList) return;
+        if (!lifecycle.releases.length) {
+          releaseList.innerHTML = '<div class="update-empty">Опубликованных релизов не найдено.</div>';
+          return;
+        }
+        releaseList.innerHTML = `<ul>${lifecycle.releases.map((release) => {
+          const version = String(release.version || '').trim();
+          const relation = rulesUI.compareReleaseVersions(version, lifecycle.currentVersion);
+          const isCurrent = relation === 0;
+          const isDowngrade = relation < 0;
+          const installable = !!release.installable && !!version && !isCurrent;
+          const title = String(release.name || '').trim();
+          const verification = String(release.verification || '').trim();
+          const reason = String(release.reason || '').trim();
+          const detail = [
+            release.prerelease ? 'Предварительный релиз' : 'Стабильный релиз',
+            publishedText(release.published_at),
+            verification ? `Проверка: ${verification}` : '',
+          ].filter(Boolean).join(' · ');
+          const badges = `${isCurrent ? '<span class="update-badge current">Текущая</span>' : ''}${isDowngrade ? '<span class="update-badge warning">Старая версия</span>' : ''}${release.prerelease ? '<span class="update-badge">Pre-release</span>' : ''}`;
+          const buttonText = isCurrent ? 'Установлена' : (installable ? 'Установить' : 'Недоступно');
+          return `<li class="update-release-row">
+            <div class="update-release-main">
+              <div class="update-release-title"><strong>${escapeHtml(version || title || 'Без версии')}</strong>${title && title !== version ? `<span>${escapeHtml(title)}</span>` : ''}${badges}</div>
+              <span class="hint">${escapeHtml(detail)}</span>
+              ${reason ? `<span class="update-release-reason">${escapeHtml(reason)}</span>` : ''}
+            </div>
+            <button type="button" data-update-version="${escapeHtml(version)}" data-installable="${installable ? '1' : '0'}" data-downgrade="${isDowngrade ? '1' : '0'}" aria-label="Установить версию ${escapeHtml(version)}" ${installable ? '' : 'disabled'}>${buttonText}</button>
+          </li>`;
+        }).join('')}</ul>`;
+        syncUpdateControls();
+      };
+
+      const renderInstallStatus = (status) => {
+        if (!installStatus || !phaseNode || !messageNode || !progress || !bytesNode) return;
+        const phase = String(status?.phase || 'starting');
+        const version = String(status?.version || '').trim();
+        const error = String(status?.error || '').trim();
+        const phaseLabels = {
+          checking: 'Проверка обновления',
+          starting: 'Подготовка обновления',
+          downloading: 'Скачивание обновления',
+          verifying: 'Проверка файла',
+          replacing: 'Замена приложения',
+          restarting: 'Перезапуск приложения',
+          completed: 'Обновление завершено',
+          failed: 'Ошибка обновления',
+        };
+        installStatus.hidden = false;
+        installStatus.classList.toggle('error', !!error || phase === 'failed');
+        phaseNode.textContent = `${phaseLabels[phase] || 'Установка обновления'}${version ? ` · ${version}` : ''}`;
+        messageNode.textContent = error || String(status?.message || 'Ожидание состояния установщика…');
+        const downloaded = Math.max(0, Number(status?.downloaded_bytes) || 0);
+        const total = Math.max(0, Number(status?.total_bytes) || 0);
+        progress.hidden = total <= 0;
+        progress.max = Math.max(1, total);
+        progress.value = Math.min(downloaded, progress.max);
+        const updatedAt = String(status?.updated_at || '').trim();
+        bytesNode.textContent = total > 0
+          ? `${formatBytes(downloaded)} из ${formatBytes(total)}`
+          : (updatedAt ? `Состояние на ${formatDateTime(updatedAt)}` : '');
+      };
+
+      const clearPendingInstall = (version) => {
+        if (!ui.updatePendingVersion || !version || versionsEqual(ui.updatePendingVersion, version)) {
+          ui.updatePendingVersion = '';
+          ui.updatePendingLegacy = false;
+        }
+      };
+
+      const completeConfirmedInstall = (status, health, { allowVersionless = false, notify = true } = {}) => {
+        const expectedVersion = String(status?.version || lifecycle.targetVersion || '').trim();
+        const runningVersion = String(health?.version || '').trim();
+        const pageVersion = String(lifecycle.currentVersion || '').trim();
+        if (!health?.ok) throw new Error('Запущенное приложение не подтвердило готовность');
+        if (expectedVersion && runningVersion && !versionsEqual(expectedVersion, runningVersion)) {
+          throw new Error(`Ожидалась версия ${expectedVersion}, но запущена ${runningVersion}`);
+        }
+        if (expectedVersion && !runningVersion && !allowVersionless) {
+          throw new Error('Запущенное приложение не сообщило свою версию');
+        }
+        const confirmedVersion = runningVersion || expectedVersion;
+        if (confirmedVersion && pageVersion && !versionsEqual(confirmedVersion, pageVersion)) {
+          lifecycle.reloadAfterInstall = true;
+        }
+        if (runningVersion) adoptRunningVersion(runningVersion);
+        lifecycle.installing = false;
+        lifecycle.statusFailures = 0;
+        renderInstallStatus({ ...status, phase: 'completed', busy: false, version: expectedVersion || runningVersion });
+        clearPendingInstall(expectedVersion || runningVersion);
+        syncUpdateControls();
+        if (notify) showToast('Обновление установлено');
+        if (lifecycle.reloadAfterInstall && isActive()) window.location.reload();
+      };
+
+      const scheduleStatusPoll = (delay = 900) => {
+        if (!isActive() || !lifecycle.installing) return;
+        if (lifecycle.statusTimer != null) clearTimeout(lifecycle.statusTimer);
+        lifecycle.statusTimer = setTimeout(() => {
+          lifecycle.statusTimer = null;
+          void pollInstallStatus();
+        }, delay);
+      };
+
+      const pollInstallStatus = async () => {
+        if (!isActive() || !lifecycle.installing || lifecycle.statusRequest) return;
+        const controller = new AbortController();
+        lifecycle.statusRequest = controller;
+        try {
+          const status = await api('/api/update/status', { signal: controller.signal });
+          if (!isActive() || lifecycle.statusRequest !== controller) return;
+          lifecycle.statusFailures = 0;
+          lifecycle.statusWasAvailable = true;
+          const statusVersion = String(status?.version || '').trim();
+          if (statusVersion) lifecycle.targetVersion = statusVersion;
+          renderInstallStatus(status);
+          if (status?.busy) {
+            if (statusVersion) lifecycle.reloadAfterInstall = true;
+            scheduleStatusPoll();
+          } else {
+            const phase = String(status?.phase || '');
+            if (!status?.error && phase === 'completed') {
+              renderInstallStatus({ ...status, phase: 'restarting', message: 'Подтверждаем запуск выбранной версии…' });
+              const health = await api('/api/health', { signal: controller.signal });
+              if (!isActive() || lifecycle.statusRequest !== controller) return;
+              completeConfirmedInstall(status, health, { allowVersionless: lifecycle.legacyInstall });
+            } else {
+              lifecycle.installing = false;
+              if (phase === 'failed' || status?.error) clearPendingInstall(statusVersion || lifecycle.targetVersion);
+              syncUpdateControls();
+            }
+          }
+        } catch (error) {
+          if (isAbortError(error) || !isActive()) return;
+          lifecycle.statusFailures += 1;
+          if (lifecycle.legacyInstall || (lifecycle.statusWasAvailable && lifecycle.reloadAfterInstall)) {
+            try {
+              const health = await api('/api/health', { signal: controller.signal });
+              if (!isActive() || lifecycle.statusRequest !== controller) return;
+              if (health?.ok) {
+                completeConfirmedInstall({
+                  phase: 'completed',
+                  version: lifecycle.targetVersion,
+                  message: 'Выбранная старая версия запущена. Встроенный модуль обновления в ней недоступен.',
+                }, health, { allowVersionless: lifecycle.legacyInstall });
+                return;
+              }
+            } catch (healthError) {
+              if (isAbortError(healthError) || !isActive()) return;
+            }
+          }
+          renderInstallStatus({ phase: 'restarting', message: 'Ожидание запуска обновлённого приложения…' });
+          if (lifecycle.statusFailures < 120) {
+            scheduleStatusPoll(1500);
+          } else {
+            lifecycle.installing = false;
+            renderInstallStatus({ phase: 'failed', error: `Не удалось получить состояние установки: ${error.message || error}` });
+            syncUpdateControls();
+          }
+        } finally {
+          if (lifecycle.statusRequest === controller) lifecycle.statusRequest = null;
+        }
+      };
+
+      const installRelease = async (version, isDowngrade) => {
+        if (!isActive() || lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing || !version) return;
+        const release = lifecycle.releases.find((item) => String(item.version || '').trim() === version);
+        if (!release?.installable) return;
+        if (ui.editorDirty) {
+          showToast('Сначала примените или отмените несохранённые изменения настроек');
+          return;
+        }
+        const legacyInstall = String(release.verification || '') === 'legacy';
+        const legacyWarning = legacyInstall
+          ? '\n\nЭто старый формат релиза: после перехода встроенный модуль обновления будет недоступен.'
+          : '';
+        if (isDowngrade && !confirm(`Версия ${version} старше установленной ${lifecycle.currentVersion}. Выполнить переход на старую версию?${legacyWarning}`)) return;
+        lifecycle.installing = true;
+        lifecycle.statusFailures = 0;
+        lifecycle.statusWasAvailable = false;
+        lifecycle.legacyInstall = legacyInstall;
+        lifecycle.targetVersion = version;
+        lifecycle.reloadAfterInstall = true;
+        ui.updatePendingVersion = version;
+        ui.updatePendingLegacy = legacyInstall;
+        syncUpdateControls();
+        renderInstallStatus({ phase: 'starting', version, message: 'Запрашиваем установку выбранной версии…' });
+        const controller = new AbortController();
+        lifecycle.installRequest = controller;
+        try {
+          await api('/api/update/install', {
+            method: 'POST',
+            body: JSON.stringify({ version }),
+            signal: controller.signal,
+          });
+          if (!isActive() || lifecycle.installRequest !== controller) return;
+          lifecycle.installRequest = null;
+          scheduleStatusPoll(0);
+        } catch (error) {
+          if (isAbortError(error) || !isActive()) return;
+          lifecycle.installing = false;
+          if (error?.status) clearPendingInstall(version);
+          renderInstallStatus({ phase: 'failed', version, error: error.message || String(error) });
+          syncUpdateControls();
+        } finally {
+          if (lifecycle.installRequest === controller) lifecycle.installRequest = null;
+        }
+      };
+
+      const checkUpdates = async () => {
+        if (!isActive() || lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing) return;
+        lifecycle.generation += 1;
+        const generation = lifecycle.generation;
+        lifecycle.releasesRequest?.abort();
+        const controller = new AbortController();
+        lifecycle.releasesRequest = controller;
+        lifecycle.checking = true;
+        syncUpdateControls();
+        if (summary) summary.innerHTML = '<strong>Проверяем релизы GitHub…</strong><span>Это может занять несколько секунд.</span>';
+        try {
+          const payload = await api('/api/update/releases', { signal: controller.signal });
+          if (!isActive() || lifecycle.releasesRequest !== controller || generation !== lifecycle.generation) return;
+          lifecycle.currentVersion = String(payload?.current_version || ui.version || 'dev');
+          lifecycle.releases = (Array.isArray(payload?.releases) ? payload.releases : [])
+            .filter((release) => release && typeof release === 'object')
+            .slice(0, 5);
+          const latest = String(payload?.latest_version || '').trim();
+          const availability = payload?.update_available && latest
+            ? `Доступна новая стабильная версия ${latest}.`
+            : 'Новой стабильной версии нет.';
+          if (summary) summary.innerHTML = `<strong>Текущая версия: ${escapeHtml(lifecycle.currentVersion)}</strong><span>${escapeHtml(availability)}</span>`;
+          renderReleases();
+        } catch (error) {
+          if (isAbortError(error) || !isActive() || generation !== lifecycle.generation) return;
+          if (summary) summary.innerHTML = `<strong>Не удалось проверить обновления</strong><span>${escapeHtml(error.message || String(error))}</span>`;
+        } finally {
+          if (lifecycle.releasesRequest === controller) lifecycle.releasesRequest = null;
+          if (generation === lifecycle.generation) lifecycle.checking = false;
+          syncUpdateControls();
+        }
+      };
+
+      const syncInitialUpdateStatus = async () => {
+        if (!isActive() || lifecycle.statusRequest) return;
+        const controller = new AbortController();
+        lifecycle.statusRequest = controller;
+        lifecycle.syncingStatus = true;
+        syncUpdateControls();
+        try {
+          const status = await api('/api/update/status', { signal: controller.signal });
+          if (!isActive() || lifecycle.statusRequest !== controller) return;
+          lifecycle.statusWasAvailable = true;
+          const phase = String(status?.phase || '');
+          const statusVersion = String(status?.version || '').trim();
+          if (statusVersion) lifecycle.targetVersion = statusVersion;
+          if (status?.busy) {
+            lifecycle.installing = true;
+            if (statusVersion) lifecycle.reloadAfterInstall = true;
+            renderInstallStatus(status);
+            scheduleStatusPoll(0);
+          } else if (statusVersion && (phase === 'completed' || phase === 'failed' || status?.error)) {
+            if (phase === 'completed' && !status?.error) {
+              renderInstallStatus({ ...status, phase: 'restarting', message: 'Подтверждаем запущенную версию…' });
+              const health = await api('/api/health', { signal: controller.signal });
+              if (!isActive() || lifecycle.statusRequest !== controller) return;
+              completeConfirmedInstall(status, health, { allowVersionless: lifecycle.legacyInstall, notify: false });
+            } else {
+              renderInstallStatus(status);
+              clearPendingInstall(statusVersion);
+            }
+          }
+        } catch (error) {
+          if (isAbortError(error) || !isActive()) return;
+          if (lifecycle.legacyInstall && lifecycle.targetVersion) {
+            try {
+              const health = await api('/api/health', { signal: controller.signal });
+              if (!isActive() || lifecycle.statusRequest !== controller) return;
+              completeConfirmedInstall({
+                phase: 'completed',
+                version: lifecycle.targetVersion,
+                message: 'Выбранная старая версия запущена. Встроенный модуль обновления в ней недоступен.',
+              }, health, { allowVersionless: true, notify: false });
+              return;
+            } catch (healthError) {
+              if (isAbortError(healthError) || !isActive()) return;
+              console.error(healthError);
+            }
+          } else {
+            console.error(error);
+          }
+          if (lifecycle.reloadAfterInstall) {
+            lifecycle.installing = true;
+            renderInstallStatus({
+              phase: 'restarting',
+              version: lifecycle.targetVersion,
+              message: 'Ожидание запуска обновлённого приложения…',
+            });
+            scheduleStatusPoll(1500);
+          }
+        } finally {
+          if (lifecycle.statusRequest === controller) lifecycle.statusRequest = null;
+          lifecycle.syncingStatus = false;
+          syncUpdateControls();
+        }
+      };
+
+      if (checkButton) checkButton.onclick = () => void checkUpdates();
+      if (releaseList) {
+        releaseList.onclick = (event) => {
+          const button = event.target instanceof Element ? event.target.closest('[data-update-version]') : null;
+          if (!button || button.disabled) return;
+          void installRelease(String(button.dataset.updateVersion || ''), button.dataset.downgrade === '1');
+        };
+      }
+      void syncInitialUpdateStatus();
+
+      return () => {
+        lifecycle.disposed = true;
+        lifecycle.generation += 1;
+        if (lifecycle.statusTimer != null) clearTimeout(lifecycle.statusTimer);
+        lifecycle.statusTimer = null;
+        lifecycle.releasesRequest?.abort();
+        lifecycle.installRequest?.abort();
+        lifecycle.statusRequest?.abort();
+        lifecycle.releasesRequest = null;
+        lifecycle.installRequest = null;
+        lifecycle.statusRequest = null;
+        if (checkButton) checkButton.onclick = null;
+        if (releaseList) releaseList.onclick = null;
+        lifecycle.releases = [];
+      };
+    },
     onSave: async (editorSession) => {
       const ok = await applyStateChange((next) => {
         next.http = next.http || {};
@@ -2357,7 +2781,7 @@ function openRuleEditor(target, options = {}) {
       <button id="editorDeleteRuleBtn" type="button" class="rule-delete-btn">Удалить</button>
     `;
   const conditionActivityHTML = isDraft ? '' : `
-      <details id="ed_condition_activity_details" class="editor-details condition-activity-details" data-editor-transient ${options.focusConditionActivity ? 'open' : ''}>
+      <details id="ed_condition_activity_details" class="editor-details condition-activity-details" data-editor-transient open>
         <summary>Фактические срабатывания условий</summary>
         <div class="condition-activity-panel">
           <div class="condition-activity-head">
@@ -2395,6 +2819,8 @@ function openRuleEditor(target, options = {}) {
       ? 'Составные значения сохраняются в одном правиле и могут разделяться точкой с запятой, запятой или новой строкой.'
       : 'Изменения применяются атомарно ко всей конфигурации после нажатия «Применить».',
     bodyHTML: `
+      ${conditionActivityHTML}
+
       <div class="editor-section">
         <div class="editor-section-title">Назначение правила</div>
         <div class="editor-grid rule-toggle-row">
@@ -2430,8 +2856,6 @@ function openRuleEditor(target, options = {}) {
         <div id="ed_syntax_analysis" class="analysis-box"></div>
         <div id="ed_similar_rules" class="analysis-box"></div>
       </div>
-
-      ${conditionActivityHTML}
 
       <details class="editor-details">
         <summary>Дополнительно: стабильный ID правила</summary>
@@ -2471,7 +2895,7 @@ function openRuleEditor(target, options = {}) {
       if (activityDetails?.open) {
         activityDetails.dataset.loaded = '1';
         refreshConditionActivity();
-        activityDetails.scrollIntoView({ block: 'nearest' });
+        if (options.focusConditionActivity) activityDetails.scrollIntoView({ block: 'nearest' });
       }
       const dupBtn = $('editorDuplicateRuleBtn');
       if (dupBtn) dupBtn.onclick = () => {

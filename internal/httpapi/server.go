@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -21,11 +24,15 @@ import (
 	"github.com/agentpitch/prox/internal/history"
 	"github.com/agentpitch/prox/internal/monitor"
 	"github.com/agentpitch/prox/internal/proxy"
+	"github.com/agentpitch/prox/internal/updater"
 	"github.com/agentpitch/prox/internal/util"
 	embedded "github.com/agentpitch/prox/internal/webui"
 )
 
-var ErrClosed = net.ErrClosed
+var (
+	ErrClosed                    = net.ErrClosed
+	errUpdateInstallBodyTooLarge = errors.New("update install request body is too large")
+)
 
 type Runtime interface {
 	CurrentConfig() config.Config
@@ -34,8 +41,16 @@ type Runtime interface {
 	TestProxy(config.ProxyProfile, string) (proxy.ProxyTestResult, error)
 }
 
+type Updater interface {
+	Check(context.Context) (updater.CheckResult, error)
+	StartInstall(string) (updater.Status, error)
+	Status() updater.Status
+	HealthToken() string
+}
+
 type Server struct {
 	Runtime    Runtime
+	Updater    Updater
 	StopFunc   func()
 	PauseFunc  func() error
 	ResumeFunc func() error
@@ -65,6 +80,22 @@ type Server struct {
 	webUIIdleClosed         bool
 	webUIIdleWG             sync.WaitGroup
 	webUIIdleCallbackHook   func() func()
+	updaterMu               sync.RWMutex
+	updateMutationMu        sync.Mutex
+	shutdownCtx             context.Context
+	shutdownCancel          context.CancelFunc
+}
+
+func (s *Server) SetUpdater(service Updater) {
+	s.updaterMu.Lock()
+	s.Updater = service
+	s.updaterMu.Unlock()
+}
+
+func (s *Server) updater() Updater {
+	s.updaterMu.RLock()
+	defer s.updaterMu.RUnlock()
+	return s.Updater
 }
 
 type proxyTestRequest struct {
@@ -98,11 +129,18 @@ type droppedDeleteRequest struct {
 	IDs []string `json:"ids"`
 }
 
+type updateInstallRequest struct {
+	Version string `json:"version"`
+}
+
 const (
-	maxHTTPConnections = 64
-	maxHTTPHeaders     = 100
-	maxHTTPHeaderBytes = 32 << 10
-	webUIIdleTimeout   = time.Hour
+	maxHTTPConnections        = 64
+	maxHTTPHeaders            = 100
+	maxHTTPHeaderBytes        = 32 << 10
+	maxUpdateInstallBodyBytes = 512
+	maxUpdateVersionBytes     = 128
+	updateCheckTimeout        = 30 * time.Second
+	webUIIdleTimeout          = time.Hour
 
 	webUIDisabledManual = "manual"
 	webUIDisabledIdle   = "idle"
@@ -146,6 +184,7 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &Server{
 		Runtime:                 rt,
 		StopFunc:                stopFunc,
@@ -156,6 +195,8 @@ func New(addr string, rt Runtime, stopFunc func()) (*Server, error) {
 		webUIEnabled:            true,
 		webUILastBrowserRequest: time.Now(),
 		webUIIdleTimeout:        webUIIdleTimeout,
+		shutdownCtx:             shutdownCtx,
+		shutdownCancel:          shutdownCancel,
 	}, nil
 }
 
@@ -233,6 +274,9 @@ func (s *Server) Serve() error {
 func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		if s.shutdownCancel != nil {
+			s.shutdownCancel()
+		}
 		s.shutdownWebUIIdleTimer()
 		s.mu.Lock()
 		s.closed = true
@@ -290,6 +334,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	req, err := readRequest(br)
 	if err != nil {
+		if errors.Is(err, errUpdateInstallBodyTooLarge) {
+			writeText(conn, 413, err.Error())
+			return
+		}
 		writeText(conn, 400, err.Error())
 		return
 	}
@@ -325,6 +373,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleUIVisibility(conn, req)
 	case "/api/proxy-test":
 		s.handleProxyTest(conn, req)
+	case "/api/update/releases":
+		s.handleUpdateReleases(conn, req)
+	case "/api/update/status":
+		s.handleUpdateStatus(conn, req)
+	case "/api/update/install":
+		s.handleUpdateInstall(conn, req)
 	case "/api/control/stop":
 		s.handleControlStop(conn, req)
 	case "/api/control/webui/status":
@@ -349,10 +403,17 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) handleHealth(conn net.Conn) {
-	writeJSON(conn, 200, map[string]interface{}{
+	payload := map[string]interface{}{
 		"ok":      true,
 		"version": buildinfo.CurrentVersion(),
-	})
+		"pid":     os.Getpid(),
+	}
+	if updateService := s.updater(); updateService != nil {
+		if token := strings.TrimSpace(updateService.HealthToken()); token != "" {
+			payload["update_token"] = token
+		}
+	}
+	writeJSON(conn, 200, payload)
 }
 
 func (s *Server) WebUIEnabled() bool {
@@ -644,8 +705,15 @@ func (s *Server) handleConfig(conn net.Conn, req request) {
 			writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
 			return
 		}
+		s.updateMutationMu.Lock()
+		if updateService := s.updater(); updateService != nil && updateService.Status().Busy {
+			s.updateMutationMu.Unlock()
+			writeText(conn, 409, "configuration cannot be changed while an application update is running")
+			return
+		}
 		expectedUpdatedAt := cfg.UpdatedAt
 		if err := s.Runtime.UpdateConfigIfCurrent(cfg, expectedUpdatedAt); err != nil {
+			s.updateMutationMu.Unlock()
 			if errors.Is(err, config.ErrConfigConflict) {
 				writeText(conn, 409, err.Error())
 				return
@@ -653,7 +721,9 @@ func (s *Server) handleConfig(conn net.Conn, req request) {
 			writeText(conn, 400, err.Error())
 			return
 		}
-		writeJSON(conn, 200, s.Runtime.CurrentConfig())
+		current := s.Runtime.CurrentConfig()
+		s.updateMutationMu.Unlock()
+		writeJSON(conn, 200, current)
 	default:
 		writeEmpty(conn, 405)
 	}
@@ -864,6 +934,153 @@ func (s *Server) handleProxyTest(conn net.Conn, req request) {
 	writeJSON(conn, 200, result)
 }
 
+func (s *Server) handleUpdateReleases(conn net.Conn, req request) {
+	if req.Method != "GET" {
+		writeEmpty(conn, 405)
+		return
+	}
+	if !isTrustedWebUIRequest(req) {
+		writeText(conn, 403, "trusted WebUI request required")
+		return
+	}
+	updateService := s.updater()
+	if updateService == nil {
+		writeText(conn, 503, "application updater is not available")
+		return
+	}
+	baseCtx := s.shutdownCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, updateCheckTimeout)
+	defer cancel()
+	result, err := updateService.Check(ctx)
+	if err != nil {
+		writeText(conn, 500, fmt.Sprintf("check updates: %v", err))
+		return
+	}
+	writeJSON(conn, 200, result)
+}
+
+func (s *Server) handleUpdateStatus(conn net.Conn, req request) {
+	if req.Method != "GET" {
+		writeEmpty(conn, 405)
+		return
+	}
+	if !isTrustedWebUIRequest(req) {
+		writeText(conn, 403, "trusted WebUI request required")
+		return
+	}
+	updateService := s.updater()
+	if updateService == nil {
+		writeText(conn, 503, "application updater is not available")
+		return
+	}
+	writeJSON(conn, 200, updateService.Status())
+}
+
+func (s *Server) handleUpdateInstall(conn net.Conn, req request) {
+	if req.Method != "POST" {
+		writeEmpty(conn, 405)
+		return
+	}
+	if !isTrustedWebUIRequest(req) {
+		writeText(conn, 403, "trusted WebUI request required")
+		return
+	}
+	updateService := s.updater()
+	if updateService == nil {
+		writeText(conn, 503, "application updater is not available")
+		return
+	}
+	if len(req.Body) == 0 {
+		writeText(conn, 400, "request body is required")
+		return
+	}
+	if len(req.Body) > maxUpdateInstallBodyBytes {
+		writeText(conn, 413, "request body is too large")
+		return
+	}
+	var payload updateInstallRequest
+	decoder := json.NewDecoder(bytes.NewReader(req.Body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
+		return
+	}
+	payload.Version = strings.TrimSpace(payload.Version)
+	if payload.Version == "" || len(payload.Version) > maxUpdateVersionBytes {
+		writeText(conn, 400, "version must be a non-empty release tag of at most 128 bytes")
+		return
+	}
+	s.updateMutationMu.Lock()
+	status, err := updateService.StartInstall(payload.Version)
+	s.updateMutationMu.Unlock()
+	if err != nil {
+		writeText(conn, 409, err.Error())
+		return
+	}
+	writeJSON(conn, 202, status)
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return errors.New("multiple JSON values are not allowed")
+}
+
+func isTrustedWebUIRequest(req request) bool {
+	if strings.TrimSpace(req.Headers["x-pitchprox-webui"]) != "1" {
+		return false
+	}
+	host := strings.TrimSpace(req.Headers["host"])
+	if host == "" {
+		return false
+	}
+	hostname := host
+	switch {
+	case strings.HasPrefix(host, "["):
+		if strings.HasSuffix(host, "]") {
+			hostname = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+		} else {
+			parsedHost, port, err := net.SplitHostPort(host)
+			if err != nil || !validHTTPHostPort(port) {
+				return false
+			}
+			hostname = parsedHost
+		}
+	case strings.Count(host, ":") == 1:
+		parsedHost, port, err := net.SplitHostPort(host)
+		if err != nil || !validHTTPHostPort(port) {
+			return false
+		}
+		hostname = parsedHost
+	case strings.Count(host, ":") > 1:
+		if net.ParseIP(host) == nil {
+			return false
+		}
+	}
+	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if hostname == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validHTTPHostPort(raw string) bool {
+	port, err := strconv.Atoi(raw)
+	return err == nil && port >= 1 && port <= 65535
+}
+
 func (s *Server) handleControlStop(conn net.Conn, req request) {
 	if req.Method != "POST" {
 		writeEmpty(conn, 405)
@@ -1017,6 +1234,9 @@ func readRequest(br *bufio.Reader) (request, error) {
 			if err != nil || contentLength < 0 || contentLength > 8<<20 {
 				return request{}, fmt.Errorf("invalid content length")
 			}
+			if req.Path == "/api/update/install" && contentLength > maxUpdateInstallBodyBytes {
+				return request{}, errUpdateInstallBodyTooLarge
+			}
 		}
 		if key == "transfer-encoding" && strings.Contains(strings.ToLower(value), "chunked") {
 			return request{}, fmt.Errorf("chunked requests are not supported")
@@ -1158,12 +1378,16 @@ func statusText(code int) string {
 		return "Accepted"
 	case 400:
 		return "Bad Request"
+	case 403:
+		return "Forbidden"
 	case 404:
 		return "Not Found"
 	case 405:
 		return "Method Not Allowed"
 	case 409:
 		return "Conflict"
+	case 413:
+		return "Payload Too Large"
 	case 500:
 		return "Internal Server Error"
 	case 503:

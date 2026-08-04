@@ -141,13 +141,13 @@ details.rule-row>summary::-webkit-details-marker{display:none}
 .editor-grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
 .editor-grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
 .editor-grid.align-end{align-items:end}
-.editor-grid.rule-toggle-row{grid-template-columns:minmax(132px,168px) minmax(0,1fr);align-items:start}
+.editor-grid.rule-toggle-row{grid-template-columns:minmax(0,1fr) max-content;align-items:start}
 .toggle-field{display:inline-flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:42px;background:#fff;width:max-content;max-width:100%}
 .toggle-field input{width:auto;margin:0}
 .editor-check{display:inline-flex;align-items:center;justify-self:start;align-self:center;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;font-size:14px;color:var(--text);min-height:42px;width:max-content;max-width:100%}
 .editor-check input{width:auto;margin:0}
 .editor-toggle{justify-self:end;align-self:end}
-.rule-toggle-row .editor-check{justify-self:start;align-self:start}
+.rule-toggle-row .editor-check{flex-direction:row;justify-self:start;align-self:start;white-space:nowrap}
 .rule-toggle-row .notes-field{min-width:0}
 .rule-toggle-row .notes-field input{width:100%}
 .field-disabled{opacity:.55}

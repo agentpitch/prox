@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,12 +18,98 @@ import (
 	"github.com/agentpitch/prox/internal/config"
 	"github.com/agentpitch/prox/internal/monitor"
 	"github.com/agentpitch/prox/internal/proxy"
+	"github.com/agentpitch/prox/internal/updater"
 )
 
 type fakeRuntime struct {
 	mu  sync.RWMutex
 	cfg config.Config
 	mon *monitor.Bus
+}
+
+type fakeUpdater struct {
+	mu               sync.Mutex
+	checkResult      updater.CheckResult
+	checkErr         error
+	status           updater.Status
+	startStatus      updater.Status
+	startErr         error
+	healthToken      string
+	checkCalls       int
+	statusCalls      int
+	installCalls     int
+	installedVersion string
+	checkTimeout     time.Duration
+}
+
+type blockingConfigRuntime struct {
+	*fakeRuntime
+	startedOnce sync.Once
+	started     chan struct{}
+	proceed     chan struct{}
+}
+
+func (r *blockingConfigRuntime) UpdateConfigIfCurrent(cfg config.Config, expectedUpdatedAt time.Time) error {
+	r.startedOnce.Do(func() { close(r.started) })
+	<-r.proceed
+	return r.fakeRuntime.UpdateConfigIfCurrent(cfg, expectedUpdatedAt)
+}
+
+type observingInstallUpdater struct {
+	*fakeUpdater
+	startedOnce sync.Once
+	started     chan struct{}
+}
+
+func (u *observingInstallUpdater) StartInstall(version string) (updater.Status, error) {
+	u.startedOnce.Do(func() { close(u.started) })
+	return u.fakeUpdater.StartInstall(version)
+}
+
+type cancellationAwareUpdater struct {
+	*fakeUpdater
+	startedOnce  sync.Once
+	canceledOnce sync.Once
+	started      chan struct{}
+	canceled     chan struct{}
+}
+
+func (u *cancellationAwareUpdater) Check(ctx context.Context) (updater.CheckResult, error) {
+	u.startedOnce.Do(func() { close(u.started) })
+	<-ctx.Done()
+	u.canceledOnce.Do(func() { close(u.canceled) })
+	return updater.CheckResult{}, ctx.Err()
+}
+
+func (f *fakeUpdater) Check(ctx context.Context) (updater.CheckResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkCalls++
+	if deadline, ok := ctx.Deadline(); ok {
+		f.checkTimeout = time.Until(deadline)
+	}
+	return f.checkResult, f.checkErr
+}
+
+func (f *fakeUpdater) StartInstall(version string) (updater.Status, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.installCalls++
+	f.installedVersion = version
+	return f.startStatus, f.startErr
+}
+
+func (f *fakeUpdater) Status() updater.Status {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statusCalls++
+	return f.status
+}
+
+func (f *fakeUpdater) HealthToken() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.healthToken
 }
 
 func newFakeRuntime(t *testing.T, addr string) *fakeRuntime {
@@ -201,6 +289,346 @@ func TestConfigPUTUsesUpdatedAtAsOptimisticToken(t *testing.T) {
 	}
 }
 
+func TestUpdateAPIReleasesStatusInstallAndHealth(t *testing.T) {
+	published := time.Date(2026, 8, 4, 12, 30, 0, 0, time.UTC)
+	updateService := &fakeUpdater{
+		checkResult: updater.CheckResult{
+			CurrentVersion:  "v0.43-rc.4",
+			LatestVersion:   "v0.44",
+			UpdateAvailable: true,
+			Releases: []updater.Release{{
+				Version:      "v0.44",
+				Name:         "Stable",
+				PublishedAt:  published,
+				Installable:  true,
+				Verification: "manifest",
+			}},
+		},
+		status:      updater.Status{Phase: updater.PhaseDownloading, Busy: true, Version: "v0.44", DownloadedBytes: 10, TotalBytes: 100},
+		startStatus: updater.Status{Phase: updater.PhaseChecking, Busy: true, Version: "v0.44"},
+		healthToken: "handoff-token",
+	}
+	srv, baseURL, client := startUpdateTestServer(t, updateService)
+
+	statusCode, body := performUpdateRequest(t, client, http.MethodGet, baseURL+"/api/update/releases", nil, true, "")
+	if statusCode != http.StatusOK {
+		t.Fatalf("GET releases status = %d body=%q, want 200", statusCode, body)
+	}
+	var releases updater.CheckResult
+	if err := json.Unmarshal(body, &releases); err != nil {
+		t.Fatalf("decode releases: %v", err)
+	}
+	if releases.CurrentVersion != "v0.43-rc.4" || releases.LatestVersion != "v0.44" || !releases.UpdateAvailable || len(releases.Releases) != 1 {
+		t.Fatalf("unexpected releases response: %+v", releases)
+	}
+	updateService.mu.Lock()
+	checkCalls := updateService.checkCalls
+	checkTimeout := updateService.checkTimeout
+	updateService.mu.Unlock()
+	if checkCalls != 1 || checkTimeout < 25*time.Second || checkTimeout > updateCheckTimeout {
+		t.Fatalf("Check calls=%d timeout=%s, want one call with about 30s timeout", checkCalls, checkTimeout)
+	}
+
+	statusCode, body = performUpdateRequest(t, client, http.MethodGet, baseURL+"/api/update/status", nil, true, "")
+	if statusCode != http.StatusOK {
+		t.Fatalf("GET status = %d body=%q, want 200", statusCode, body)
+	}
+	var updateStatus updater.Status
+	if err := json.Unmarshal(body, &updateStatus); err != nil {
+		t.Fatalf("decode update status: %v", err)
+	}
+	if updateStatus.Phase != updater.PhaseDownloading || updateStatus.DownloadedBytes != 10 || updateStatus.TotalBytes != 100 {
+		t.Fatalf("unexpected update status: %+v", updateStatus)
+	}
+
+	statusCode, body = performUpdateRequest(t, client, http.MethodPost, baseURL+"/api/update/install", []byte(`{"version":"v0.44"}`), true, "localhost:18080")
+	if statusCode != http.StatusAccepted {
+		t.Fatalf("POST install status = %d body=%q, want 202", statusCode, body)
+	}
+	if err := json.Unmarshal(body, &updateStatus); err != nil {
+		t.Fatalf("decode install status: %v", err)
+	}
+	if updateStatus.Phase != updater.PhaseChecking || !updateStatus.Busy {
+		t.Fatalf("unexpected install response: %+v", updateStatus)
+	}
+	updateService.mu.Lock()
+	installCalls := updateService.installCalls
+	installedVersion := updateService.installedVersion
+	updateService.mu.Unlock()
+	if installCalls != 1 || installedVersion != "v0.44" {
+		t.Fatalf("StartInstall calls=%d version=%q", installCalls, installedVersion)
+	}
+
+	statusCode, body = performUpdateRequest(t, client, http.MethodGet, baseURL+"/api/health", nil, false, "")
+	if statusCode != http.StatusOK {
+		t.Fatalf("GET health status = %d body=%q", statusCode, body)
+	}
+	var health map[string]interface{}
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	version, versionOK := health["version"].(string)
+	pid, pidOK := health["pid"].(float64)
+	if health["ok"] != true || !versionOK || version == "" || !pidOK || int(pid) != os.Getpid() || health["update_token"] != "handoff-token" {
+		t.Fatalf("unexpected health response: %+v", health)
+	}
+
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/api/update/releases"},
+		{method: http.MethodPost, path: "/api/update/status"},
+		{method: http.MethodGet, path: "/api/update/install"},
+	} {
+		statusCode, body = performUpdateRequest(t, client, test.method, baseURL+test.path, nil, true, "")
+		if statusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s status=%d body=%q, want 405", test.method, test.path, statusCode, body)
+		}
+	}
+
+	if srv.Updater != updateService {
+		t.Fatal("server updater field changed unexpectedly")
+	}
+}
+
+func TestConfigUpdateIsBlockedDuringApplicationUpdate(t *testing.T) {
+	updateService := &fakeUpdater{status: updater.Status{Phase: updater.PhaseDownloading, Busy: true, Version: "v0.44"}}
+	srv, baseURL, client := startUpdateTestServer(t, updateService)
+	before := srv.Runtime.CurrentConfig()
+	candidate := config.Clone(before)
+	candidate.RetentionMinutes++
+	body, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusCode, responseBody := performUpdateRequest(t, client, http.MethodPut, baseURL+"/api/config", body, true, "")
+	if statusCode != http.StatusConflict || !strings.Contains(string(responseBody), "while an application update is running") {
+		t.Fatalf("PUT config status=%d body=%q, want update conflict", statusCode, responseBody)
+	}
+	if after := srv.Runtime.CurrentConfig(); after.RetentionMinutes != before.RetentionMinutes || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("configuration changed during updater handoff: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestConfigUpdateAndInstallUseOneAdmissionGate(t *testing.T) {
+	addr := freeHTTPAddr(t)
+	runtime := &blockingConfigRuntime{
+		fakeRuntime: newFakeRuntime(t, addr),
+		started:     make(chan struct{}),
+		proceed:     make(chan struct{}),
+	}
+	updateService := &observingInstallUpdater{
+		fakeUpdater: &fakeUpdater{startStatus: updater.Status{Phase: updater.PhaseChecking, Busy: true, Version: "v0.44"}},
+		started:     make(chan struct{}),
+	}
+	_, baseURL, client := startUpdateTestServerWithRuntime(t, addr, runtime, updateService)
+
+	candidate := runtime.CurrentConfig()
+	candidate.RetentionMinutes++
+	body, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDone := make(chan updateRequestResult, 1)
+	go func() {
+		configDone <- executeUpdateRequest(client, http.MethodPut, baseURL+"/api/config", body, true, "localhost:18080")
+	}()
+	select {
+	case <-runtime.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("configuration update did not enter the runtime")
+	}
+
+	installDone := make(chan updateRequestResult, 1)
+	installHandlerStarted := make(chan struct{})
+	go func() {
+		close(installHandlerStarted)
+		installDone <- executeUpdateRequest(client, http.MethodPost, baseURL+"/api/update/install", []byte(`{"version":"v0.44"}`), true, "localhost:18080")
+	}()
+	<-installHandlerStarted
+	select {
+	case <-updateService.started:
+		t.Fatal("StartInstall entered while configuration mutation was still running")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(runtime.proceed)
+	select {
+	case result := <-configDone:
+		if result.err != nil || result.status != http.StatusOK {
+			t.Fatalf("config PUT status=%d err=%v body=%q, want 200", result.status, result.err, result.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("configuration update did not finish")
+	}
+	select {
+	case <-updateService.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartInstall did not proceed after configuration mutation finished")
+	}
+	select {
+	case result := <-installDone:
+		if result.err != nil || result.status != http.StatusAccepted {
+			t.Fatalf("install POST status=%d err=%v body=%q, want 202", result.status, result.err, result.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("install request did not finish")
+	}
+}
+
+func TestServerCloseCancelsUpdateCheck(t *testing.T) {
+	updateService := &cancellationAwareUpdater{
+		fakeUpdater: &fakeUpdater{},
+		started:     make(chan struct{}),
+		canceled:    make(chan struct{}),
+	}
+	srv, baseURL, client := startUpdateTestServer(t, updateService)
+	requestDone := make(chan updateRequestResult, 1)
+	go func() {
+		requestDone <- executeUpdateRequest(client, http.MethodGet, baseURL+"/api/update/releases", nil, true, "localhost:18080")
+	}()
+	select {
+	case <-updateService.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("update check did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- srv.Close() }()
+	select {
+	case <-updateService.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("Server.Close did not cancel the update check")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Server.Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Server.Close waited for the full update-check timeout")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled update request did not return")
+	}
+}
+
+func TestUpdateInstallRejectsUntrustedAndInvalidRequests(t *testing.T) {
+	updateService := &fakeUpdater{startStatus: updater.Status{Phase: updater.PhaseChecking, Busy: true}}
+	_, baseURL, client := startUpdateTestServer(t, updateService)
+
+	tests := []struct {
+		name   string
+		body   []byte
+		marker bool
+		host   string
+		want   int
+	}{
+		{name: "missing marker", body: []byte(`{"version":"v0.44"}`), host: "localhost:18080", want: http.StatusForbidden},
+		{name: "untrusted Host", body: []byte(`{"version":"v0.44"}`), marker: true, host: "pitchprox.attacker.example", want: http.StatusForbidden},
+		{name: "empty", marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "malformed", body: []byte(`{"version":`), marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "unknown field", body: []byte(`{"version":"v0.44","extra":true}`), marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "trailing value", body: []byte(`{"version":"v0.44"} {}`), marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "missing version", body: []byte(`{}`), marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "long version", body: []byte(`{"version":"` + strings.Repeat("v", maxUpdateVersionBytes+1) + `"}`), marker: true, host: "127.0.0.1:18080", want: http.StatusBadRequest},
+		{name: "oversize", body: bytes.Repeat([]byte("x"), maxUpdateInstallBodyBytes+1), marker: true, host: "127.0.0.1:18080", want: http.StatusRequestEntityTooLarge},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			statusCode, body := performUpdateRequest(t, client, http.MethodPost, baseURL+"/api/update/install", test.body, test.marker, test.host)
+			if statusCode != test.want {
+				t.Fatalf("status=%d body=%q, want %d", statusCode, body, test.want)
+			}
+		})
+	}
+	updateService.mu.Lock()
+	invalidCalls := updateService.installCalls
+	updateService.mu.Unlock()
+	if invalidCalls != 0 {
+		t.Fatalf("invalid requests called StartInstall %d times", invalidCalls)
+	}
+
+	statusCode, body := performUpdateRequest(t, client, http.MethodPost, baseURL+"/api/update/install", []byte(" \n{\"version\":\" v0.44 \"}\n "), true, "[::1]:18080")
+	if statusCode != http.StatusAccepted {
+		t.Fatalf("trusted IPv6 Host status=%d body=%q, want 202", statusCode, body)
+	}
+	updateService.mu.Lock()
+	defer updateService.mu.Unlock()
+	if updateService.installCalls != 1 || updateService.installedVersion != "v0.44" {
+		t.Fatalf("valid request calls=%d version=%q", updateService.installCalls, updateService.installedVersion)
+	}
+}
+
+func TestUpdateEndpointsUnavailableWithoutUpdaterOrPausedWebUI(t *testing.T) {
+	_, baseURL, client := startUpdateTestServer(t, nil)
+	for _, path := range []string{"/api/update/releases", "/api/update/status"} {
+		statusCode, body := performUpdateRequest(t, client, http.MethodGet, baseURL+path, nil, true, "")
+		if statusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "updater is not available") {
+			t.Errorf("GET %s status=%d body=%q, want clear 503", path, statusCode, body)
+		}
+	}
+	statusCode, body := performUpdateRequest(t, client, http.MethodPost, baseURL+"/api/update/install", []byte(`{"version":"v0.44"}`), true, "localhost:18080")
+	if statusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "updater is not available") {
+		t.Fatalf("POST install without updater status=%d body=%q, want clear 503", statusCode, body)
+	}
+	statusCode, body = performUpdateRequest(t, client, http.MethodGet, baseURL+"/api/health", nil, false, "")
+	if statusCode != http.StatusOK {
+		t.Fatalf("health without updater status=%d body=%q", statusCode, body)
+	}
+	var health map[string]interface{}
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("decode health without updater: %v", err)
+	}
+	if _, exists := health["update_token"]; exists {
+		t.Fatalf("health unexpectedly exposed empty update_token: %+v", health)
+	}
+	pid, pidOK := health["pid"].(float64)
+	if !pidOK || int(pid) != os.Getpid() {
+		t.Fatalf("health pid=%v, want %d", health["pid"], os.Getpid())
+	}
+
+	pausedUpdater := &fakeUpdater{}
+	pausedServer, pausedBaseURL, pausedClient := startUpdateTestServer(t, pausedUpdater)
+	pausedServer.SetWebUIEnabled(false)
+	for _, test := range []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{method: http.MethodGet, path: "/api/update/releases"},
+		{method: http.MethodGet, path: "/api/update/status"},
+		{method: http.MethodPost, path: "/api/update/install", body: []byte(`{"version":"v0.44"}`)},
+	} {
+		statusCode, responseBody := performUpdateRequest(t, pausedClient, test.method, pausedBaseURL+test.path, test.body, true, "localhost:18080")
+		if statusCode != http.StatusServiceUnavailable || !strings.Contains(string(responseBody), "WebUI disabled") {
+			t.Errorf("paused %s %s status=%d body=%q, want WebUI 503", test.method, test.path, statusCode, responseBody)
+		}
+		if isWebUIControlPath(test.path) {
+			t.Errorf("update path %s was classified as a control path", test.path)
+		}
+	}
+	statusCode, body = performUpdateRequest(t, pausedClient, http.MethodGet, pausedBaseURL+"/api/health", nil, false, "")
+	if statusCode != http.StatusOK {
+		t.Fatalf("paused health status=%d body=%q, want 200", statusCode, body)
+	}
+	health = nil
+	if err := json.Unmarshal(body, &health); err != nil {
+		t.Fatalf("decode paused health: %v", err)
+	}
+	if _, exists := health["update_token"]; exists {
+		t.Fatalf("health exposed update_token from updater with an empty token: %+v", health)
+	}
+	pausedUpdater.mu.Lock()
+	defer pausedUpdater.mu.Unlock()
+	if pausedUpdater.checkCalls != 0 || pausedUpdater.statusCalls != 0 || pausedUpdater.installCalls != 0 {
+		t.Fatalf("paused WebUI reached updater: %+v", pausedUpdater)
+	}
+}
+
 func TestShouldMarkUIActiveOnlyForLiveEndpoints(t *testing.T) {
 	tests := map[string]bool{
 		"/api/snapshot":       true,
@@ -230,6 +658,7 @@ func TestBrowserWebUIActivityClassification(t *testing.T) {
 		{name: "static asset", req: request{Method: "GET", Path: "/app.js"}, want: true},
 		{name: "unmarked API client", req: request{Method: "GET", Path: "/api/config"}, want: false},
 		{name: "marked WebUI API", req: request{Method: "GET", Path: "/api/config", Headers: markedHeaders}, want: true},
+		{name: "marked updater API", req: request{Method: "GET", Path: "/api/update/status", Headers: markedHeaders}, want: true},
 		{name: "opened WebUI SSE", req: request{Method: "GET", Path: "/api/events", Query: url.Values{"_ui": {"1"}}}, want: true},
 		{name: "control never counts", req: request{Method: "GET", Path: "/api/control/webui/status", Headers: markedHeaders}, want: false},
 		{name: "tray never counts", req: request{Method: "GET", Path: "/api/tray", Headers: markedHeaders}, want: false},
@@ -804,6 +1233,77 @@ func waitNoTrackedConnections(t *testing.T, srv *Server) {
 	n := len(srv.conns)
 	srv.mu.Unlock()
 	t.Fatalf("tracked connections = %d, want 0", n)
+}
+
+func startUpdateTestServer(t *testing.T, updateService Updater) (*Server, string, *http.Client) {
+	t.Helper()
+	addr := freeHTTPAddr(t)
+	return startUpdateTestServerWithRuntime(t, addr, newFakeRuntime(t, addr), updateService)
+}
+
+func startUpdateTestServerWithRuntime(t *testing.T, addr string, runtime Runtime, updateService Updater) (*Server, string, *http.Client) {
+	t.Helper()
+	srv, err := New(addr, runtime, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.SetUpdater(updateService)
+	if err := srv.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve() }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		select {
+		case err := <-done:
+			if err != nil && err != ErrClosed {
+				t.Errorf("Serve: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("Serve did not return after Close")
+		}
+	})
+	client := &http.Client{Timeout: 2 * time.Second}
+	return srv, "http://" + addr, client
+}
+
+type updateRequestResult struct {
+	status int
+	body   []byte
+	err    error
+}
+
+func executeUpdateRequest(client *http.Client, method, target string, body []byte, marked bool, host string) updateRequestResult {
+	req, err := http.NewRequest(method, target, bytes.NewReader(body))
+	if err != nil {
+		return updateRequestResult{err: err}
+	}
+	if marked {
+		req.Header.Set("X-PitchProx-WebUI", "1")
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if host != "" {
+		req.Host = host
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return updateRequestResult{err: err}
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	return updateRequestResult{status: resp.StatusCode, body: responseBody, err: err}
+}
+
+func performUpdateRequest(t *testing.T, client *http.Client, method, target string, body []byte, marked bool, host string) (int, []byte) {
+	t.Helper()
+	result := executeUpdateRequest(client, method, target, body, marked, host)
+	if result.err != nil {
+		t.Fatalf("%s %s: %v", method, target, result.err)
+	}
+	return result.status, result.body
 }
 
 func httpStatus(t *testing.T, client *http.Client, url string) int {

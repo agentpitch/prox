@@ -308,18 +308,29 @@ Minimum required endpoints:
 - `GET /api/snapshot`
 - `GET /api/tray`
 - `GET /api/events`
+- `GET /api/update/releases`
+- `GET /api/update/status`
+- `POST /api/update/install`
 - `POST /api/proxy-test`
 - `POST /api/control/stop`
 
+Update routes require the embedded-WebUI marker and a loopback Host. Release
+discovery is explicit-only and bounded to five items. Installation must be
+single-flight, verify every published integrity source, use an exact-process
+handoff, and retain a verified rollback executable until the selected build
+passes repeated health checks.
+
 ## 11. UX requirements
 
-- compact top bar, not sticky;
-- settings behind a gear button;
-- rule cards open a dialog directly on click;
-- rule enable toggle is a compact checkbox without a large label;
-- move buttons are compact and below that checkbox;
+- persistent sidebar and sticky page header;
+- settings behind a gear button, including explicit update check and five
+  latest version choices;
+- one dense rules table with search, filters, pagination, and stable-ID actions;
+- rule priority appears once in the order column;
+- one rule retains raw multi-value Applications, Hosts, and Ports text;
+- existing-rule editor opens condition activity expanded at the top;
+- rule name and enabled control stay on one row;
 - disabled rules must be visually obvious;
-- right column wider than the left;
 - process hover in connections shows full executable path.
 
 ## 12. Default config

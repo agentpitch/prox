@@ -49,6 +49,41 @@
     return quoted;
   }
 
+  function parseReleaseVersion(raw) {
+    const match = String(raw || '').trim().match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+    if (!match) return null;
+    return {
+      numbers: [Number(match[1]), Number(match[2] || 0), Number(match[3] || 0)],
+      prerelease: match[4] ? match[4].split('.') : [],
+    };
+  }
+
+  function compareReleaseVersions(left, right) {
+    const a = parseReleaseVersion(left);
+    const b = parseReleaseVersion(right);
+    if (!a || !b) return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true, sensitivity: 'base' });
+    for (let index = 0; index < a.numbers.length; index += 1) {
+      if (a.numbers[index] !== b.numbers[index]) return a.numbers[index] < b.numbers[index] ? -1 : 1;
+    }
+    if (!a.prerelease.length || !b.prerelease.length) {
+      if (a.prerelease.length === b.prerelease.length) return 0;
+      return a.prerelease.length ? -1 : 1;
+    }
+    const count = Math.max(a.prerelease.length, b.prerelease.length);
+    for (let index = 0; index < count; index += 1) {
+      const av = a.prerelease[index];
+      const bv = b.prerelease[index];
+      if (av == null || bv == null) return av == null ? -1 : 1;
+      if (av === bv) continue;
+      const an = /^\d+$/.test(av);
+      const bn = /^\d+$/.test(bv);
+      if (an && bn) return Number(av) < Number(bv) ? -1 : 1;
+      if (an !== bn) return an ? -1 : 1;
+      return av < bv ? -1 : 1;
+    }
+    return 0;
+  }
+
   function queryTokens(raw) {
     const tokens = [];
     let current = '';
@@ -595,6 +630,7 @@
     MAX_IMPORT_ERRORS,
     splitValues,
     hasUnclosedQuote,
+    compareReleaseVersions,
     queryTokens,
     buildSearchText,
     filterRules,

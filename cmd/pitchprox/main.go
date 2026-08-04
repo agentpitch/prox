@@ -8,10 +8,12 @@ import (
 	"syscall"
 
 	"github.com/agentpitch/prox/internal/app"
+	"github.com/agentpitch/prox/internal/buildinfo"
 	"github.com/agentpitch/prox/internal/config"
 	"github.com/agentpitch/prox/internal/monitor"
 	svcwrap "github.com/agentpitch/prox/internal/service"
 	"github.com/agentpitch/prox/internal/trayapp"
+	"github.com/agentpitch/prox/internal/updater"
 	"github.com/agentpitch/prox/internal/util"
 )
 
@@ -64,6 +66,10 @@ func main() {
 		must(util.OpenBrowser("http://" + st.Get().HTTP.Listen))
 	case "tray":
 		must(runTray())
+	case "update-helper":
+		planPath, err := updater.HelperPlanPathFromArgs(os.Args[2:])
+		must(err)
+		must(updater.RunHelper(planPath))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -106,6 +112,14 @@ func runForeground() error {
 	if err != nil {
 		return err
 	}
+	updateManager, err := newUpdateManager(prog, updater.ModeDesktop)
+	if err != nil {
+		return err
+	}
+	defer updateManager.Close()
+	if err := prog.SetUpdater(updateManager); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := prog.Start(ctx); err != nil {
@@ -130,7 +144,28 @@ func runService() error {
 	if err != nil {
 		return err
 	}
+	updateManager, err := newUpdateManager(prog, updater.ModeService)
+	if err != nil {
+		return err
+	}
+	defer updateManager.Close()
+	if err := prog.SetUpdater(updateManager); err != nil {
+		return err
+	}
 	return svcwrap.RunService(serviceName, prog)
+}
+
+func newUpdateManager(prog *app.Program, mode string) (*updater.Manager, error) {
+	return updater.NewManager(updater.ManagerOptions{
+		CurrentVersion: buildinfo.CurrentVersion(),
+		Mode:           mode,
+		ServiceName:    serviceName,
+		ListenAddress:  prog.Runtime().CurrentConfig().HTTP.Listen,
+		ListenAddressProvider: func() string {
+			return prog.Runtime().CurrentConfig().HTTP.Listen
+		},
+		StopFunc: prog.RequestStop,
+	})
 }
 
 func runTray() error {

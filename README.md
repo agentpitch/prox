@@ -109,16 +109,17 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.4
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.5 -DownloadWinDivertArchive
 ```
 
-The candidate is written to `build\candidates\v0.43-rc.4\`; it does not replace
+The candidate is written to `build\candidates\v0.43-rc.5\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
-script runs all Go and WebUI checks, verifies the existing root
-`WinDivert.dll`/`WinDivert64.sys` and the tracked upstream license by exact
-hash, includes third-party licenses, and writes a build manifest plus SHA-256
-file. It refuses recursive cleanup through junctions/symlinks and does not
-download or temporarily unpack duplicate runtime files.
+script runs all Go and WebUI checks, then downloads and verifies the pinned
+official WinDivert archive for a release-grade updater manifest. Temporary
+extraction remains inside the candidate tree and is removed before packaging;
+the running application and root runtime files are untouched. The script also
+includes third-party licenses and writes a build manifest plus SHA-256 file. It
+refuses recursive cleanup through junctions/symlinks.
 `-AllowDirty` is only for disposable test builds; `-SkipChecks` is accepted
 only together with it. A publishable candidate must report a clean tree,
 completed checks, the injected version, and `vcs.modified=false`.
@@ -233,6 +234,28 @@ Main areas:
 - **Active connections** - grouped connection table with a free-text search field plus rule/action click-filters.
 - **Log** - live event log with process/rule/action filtering.
 
+### Application updates
+
+The Settings dialog checks GitHub Releases only after **Проверить обновления**
+is pressed. It reports whether a newer stable version exists and always shows
+up to five latest published releases. Any compatible listed version can be
+installed, including an explicitly confirmed downgrade.
+
+Installation downloads and verifies the selected executable beside the running
+application, then hands a bounded transaction to a short-lived helper. The
+helper stops the exact current process/service, atomically replaces the
+executable, starts the selected build, and removes the old executable only
+after three successful health checks. If the new build does not start, the
+verified old executable is restored and restarted. Configuration, history, and
+the installed WinDivert runtime are not replaced.
+
+Current release-format builds require matching GitHub asset digests, the
+published SHA-256 file, and a clean build manifest compatible with the local
+WinDivert DLL/driver. Older pre-manifest releases are offered only when their
+complete ZIP proves that their WinDivert runtime exactly matches the installed
+one. After downgrading to such a legacy build, the updater is no longer present;
+return to a current build manually if needed.
+
 ## Documentation map
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - runtime architecture and data flow.
@@ -290,6 +313,7 @@ Desktop mode is optimized for a quiet idle state:
 - connection/log/rule/traffic history is stored in compact hourly file segments instead of remaining in RAM;
 - when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
 - after one hour without a marked browser request, only WebUI is automatically paused; one lazy deadline timer is used, proxy routing continues unchanged, and **Управление** in the tray enables the interface again;
+- GitHub release discovery is strictly on demand; outside an active check or installation the updater performs no network polling and retains only a bounded five-release cache;
 - WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception; a shared redirector is opened lazily while at least one selected flow exists and is closed again as soon as the flow table becomes empty;

@@ -22,15 +22,17 @@ elevates its permission to `contents: write`; normal builds remain read-only.
 From a committed clean working tree on Windows:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.4
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.5 -DownloadWinDivertArchive
 ```
 
-Review the files under `build\candidates\v0.43-rc.4\`. This path is separate
+Review the files under `build\candidates\v0.43-rc.5\`. This path is separate
 from `build\pitchProx.exe`, so packaging does not overwrite or stop an already
-running main application. The local script verifies and reuses the existing
-root `WinDivert.dll` and `WinDivert64.sys`; it neither downloads a duplicate nor
-loads the driver. CI explicitly downloads the pinned official archive because
-those ignored runtime binaries are absent from a clean checkout.
+running main application. `-DownloadWinDivertArchive` verifies the pinned
+official archive and produces the release-grade manifest required by the
+built-in updater; it does not load the driver or touch a running application.
+Without that switch the local script may reuse the verified root runtime, but
+the resulting manifest is intended only for local review and must not be
+published as an updater-compatible release.
 
 `-AllowDirty` is a diagnostic convenience only, and `-SkipChecks` is accepted
 only together with it. Artifacts made with either switch are not release
@@ -61,6 +63,10 @@ The release contains:
 The ZIP is the complete new-install package. It contains the verified official
 WinDivert 2.2.2 x64 runtime, upstream WinDivert license, Go and
 `golang.org/x/sys` licenses, `THIRD_PARTY_NOTICES.md`, README, checks, and docs.
+
+The built-in updater depends on the four asset names above being unique and
+unchanged. Current releases must include the manifest; deleting, renaming, or
+re-uploading one asset makes that release unavailable for automatic install.
 
 ## Signing and runtime tests
 

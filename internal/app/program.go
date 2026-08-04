@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/agentpitch/prox/internal/httpapi"
+	"github.com/agentpitch/prox/internal/updater"
 )
 
 type Program struct {
@@ -24,6 +25,7 @@ type Program struct {
 
 	httpMu sync.Mutex
 	http   *httpapi.Server
+	update updater.Service
 
 	stateMu sync.Mutex
 	ctx     context.Context
@@ -39,6 +41,21 @@ func NewProgram(configPath string, historyPath string) (*Program, error) {
 }
 
 func (p *Program) Runtime() *Runtime { return p.runtime }
+
+func (p *Program) SetUpdater(service updater.Service) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.stopping || p.stopped {
+		return fmt.Errorf("program is stopping")
+	}
+	p.update = service
+	p.httpMu.Lock()
+	if p.http != nil {
+		p.http.SetUpdater(service)
+	}
+	p.httpMu.Unlock()
+	return nil
+}
 
 func (p *Program) StopRequested() <-chan struct{} { return p.stopCh }
 
@@ -98,6 +115,7 @@ func (p *Program) enableWebUILocked() error {
 	srv.PauseFunc = p.PauseService
 	srv.ResumeFunc = p.ResumeService
 	srv.PausedFunc = p.ServicePaused
+	srv.SetUpdater(p.update)
 	if err := srv.Listen(); err != nil {
 		_ = srv.Close()
 		return err
@@ -227,6 +245,9 @@ func (p *Program) Stop() error {
 	p.lifecycleMu.Unlock()
 	if srv != nil {
 		_ = srv.Close()
+	}
+	if p.update != nil {
+		p.update.Close()
 	}
 	if p.runtime != nil {
 		_ = p.runtime.Stop()

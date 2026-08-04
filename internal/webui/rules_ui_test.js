@@ -29,6 +29,131 @@ test('rules search uses one explicit clear control', () => {
   assert.equal((markup.match(/id="clearRuleSearchBtn"/g) || []).length, 1);
 });
 
+test('existing rule editor opens condition activity before editable fields', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const editorStart = source.indexOf('function openRuleEditor(');
+  const editorEnd = source.indexOf('\nfunction collectRuleEditorPayload(', editorStart);
+  const editorSource = source.slice(editorStart, editorEnd);
+  const bodyStart = editorSource.indexOf('bodyHTML: `');
+
+  assert.ok(editorStart >= 0 && editorEnd > editorStart && bodyStart >= 0);
+  assert.match(editorSource, /const conditionActivityHTML = isDraft \? '' : `/);
+  assert.match(editorSource, /<details id="ed_condition_activity_details"[^>]* data-editor-transient open>/);
+  assert.equal((editorSource.match(/\$\{conditionActivityHTML\}/g) || []).length, 1);
+  assert.ok(
+    editorSource.indexOf('${conditionActivityHTML}', bodyStart) < editorSource.indexOf('Назначение правила', bodyStart),
+    'condition activity must be the first rule-editor body section',
+  );
+});
+
+test('rule enabled control is a single-line row after the name field', () => {
+  const styles = fs.readFileSync(path.join(__dirname, 'dist', 'styles.css'), 'utf8');
+  assert.match(styles, /\.editor-grid\.rule-toggle-row\{[^}]*grid-template-columns:minmax\(0,1fr\) max-content/);
+  assert.match(styles, /\.rule-toggle-row \.editor-check\{[^}]*flex-direction:row;[^}]*white-space:nowrap/);
+});
+
+test('release version comparison detects upgrades, current builds, and downgrades', () => {
+  assert.equal(rulesUI.compareReleaseVersions('v0.43', '0.43.0'), 0);
+  assert.equal(rulesUI.compareReleaseVersions('v0.44.0', 'v0.43.9'), 1);
+  assert.equal(rulesUI.compareReleaseVersions('v0.42.9', 'v0.43.0'), -1);
+  assert.equal(rulesUI.compareReleaseVersions('v0.43.0', 'v0.43.0-rc.4'), 1);
+  assert.equal(rulesUI.compareReleaseVersions('v0.43.0-rc.10', 'v0.43.0-rc.2'), 1);
+});
+
+test('settings updater is explicit, bounded, and releases request resources on close', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const settingsStart = source.indexOf('function openSettingsEditor()');
+  const settingsEnd = source.indexOf('\nfunction openProxyEditor(', settingsStart);
+  const settingsSource = source.slice(settingsStart, settingsEnd);
+
+  assert.ok(settingsStart >= 0 && settingsEnd > settingsStart);
+  assert.match(settingsSource, /id="ed_update_check"[^>]*>Проверить обновления</);
+  assert.match(settingsSource, /data-editor-transient aria-labelledby="ed_update_title"/);
+  assert.match(settingsSource, /role="status" aria-live="polite"/);
+  assert.match(settingsSource, /checkButton\.onclick = \(\) => void checkUpdates\(\)/);
+  assert.match(settingsSource, /api\('\/api\/update\/releases'/);
+  assert.match(settingsSource, /\.slice\(0, 5\)/);
+  assert.match(settingsSource, /api\('\/api\/update\/install'/);
+  assert.match(settingsSource, /body: JSON\.stringify\(\{ version \}\)/);
+  assert.match(settingsSource, /api\('\/api\/update\/status'/);
+  assert.match(settingsSource, /status\?\.downloaded_bytes/);
+  assert.match(settingsSource, /status\?\.total_bytes/);
+  assert.match(settingsSource, /status\?\.updated_at/);
+  assert.match(settingsSource, /старше установленной[^]*confirm|confirm\(`Версия[^]*старше установленной/);
+  assert.match(settingsSource, /const installable = !!release\.installable && !!version && !isCurrent/);
+  assert.match(settingsSource, /isCurrent \? 'Установлена'/);
+  assert.match(settingsSource, /if \(ui\.editorDirty\)/);
+  assert.match(settingsSource, /встроенный модуль обновления будет недоступен/);
+  assert.match(settingsSource, /lifecycle\.legacyInstall \|\| \(lifecycle\.statusWasAvailable && lifecycle\.reloadAfterInstall\)/);
+  assert.match(settingsSource, /api\('\/api\/health'/);
+  assert.match(settingsSource, /lifecycle\.statusFailures < 120/);
+  assert.doesNotMatch(settingsSource, /setInterval\(/);
+  assert.match(settingsSource, /clearTimeout\(lifecycle\.statusTimer\)/);
+  assert.match(settingsSource, /lifecycle\.releasesRequest\?\.abort\(\)/);
+  assert.match(settingsSource, /lifecycle\.installRequest\?\.abort\(\)/);
+  assert.match(settingsSource, /lifecycle\.statusRequest\?\.abort\(\)/);
+});
+
+test('settings updater resumes an active install and confirms the running version before success', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const settingsStart = source.indexOf('function openSettingsEditor()');
+  const settingsEnd = source.indexOf('\nfunction openProxyEditor(', settingsStart);
+  const settingsSource = source.slice(settingsStart, settingsEnd);
+  const initialSync = settingsSource.indexOf('const syncInitialUpdateStatus = async () =>');
+  const initialStatusRequest = settingsSource.indexOf("api('/api/update/status'", initialSync);
+  const resume = settingsSource.indexOf('lifecycle.installing = true;', initialStatusRequest);
+  const resumePoll = settingsSource.indexOf('scheduleStatusPoll(0);', resume);
+  const polling = settingsSource.indexOf('const pollInstallStatus = async () =>');
+  const completionHealth = settingsSource.indexOf("const health = await api('/api/health'", polling);
+  const confirmedCompletion = settingsSource.indexOf('completeConfirmedInstall(status, health', completionHealth);
+
+  assert.ok(initialSync >= 0 && initialStatusRequest > initialSync);
+  assert.ok(resume > initialStatusRequest && resumePoll > resume, 'busy persisted status must resume polling');
+  assert.match(settingsSource, /void syncInitialUpdateStatus\(\)/);
+  assert.match(settingsSource, /targetVersion: String\(ui\.updatePendingVersion \|\| ''\)/);
+  assert.match(settingsSource, /reloadAfterInstall: !!ui\.updatePendingVersion/);
+  assert.ok(completionHealth > polling && confirmedCompletion > completionHealth, 'completion must follow a health check');
+  assert.match(settingsSource, /if \(expectedVersion && runningVersion && !versionsEqual\(expectedVersion, runningVersion\)\)/);
+  assert.match(settingsSource, /if \(expectedVersion && !runningVersion && !allowVersionless\)/);
+  assert.match(settingsSource, /ui\.version = runningVersion/);
+  assert.match(settingsSource, /if \(lifecycle\.reloadAfterInstall && isActive\(\)\) window\.location\.reload\(\)/);
+});
+
+test('settings updater recovers a legacy install after its status endpoint disappears', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const settingsStart = source.indexOf('function openSettingsEditor()');
+  const settingsEnd = source.indexOf('\nfunction openProxyEditor(', settingsStart);
+  const settingsSource = source.slice(settingsStart, settingsEnd);
+  const initialSync = settingsSource.indexOf('const syncInitialUpdateStatus = async () =>');
+  const initialCatch = settingsSource.indexOf('} catch (error) {', initialSync);
+  const legacyFallback = settingsSource.indexOf('if (lifecycle.legacyInstall && lifecycle.targetVersion)', initialCatch);
+  const healthRequest = settingsSource.indexOf("api('/api/health'", legacyFallback);
+  const versionlessConfirmation = settingsSource.indexOf('allowVersionless: true, notify: false', healthRequest);
+  const resumeAfterFailure = settingsSource.indexOf('if (lifecycle.reloadAfterInstall)', versionlessConfirmation);
+
+  assert.ok(initialSync >= 0 && initialCatch > initialSync);
+  assert.ok(legacyFallback > initialCatch && healthRequest > legacyFallback);
+  assert.ok(versionlessConfirmation > healthRequest, 'known legacy releases may confirm via versionless health');
+  assert.ok(resumeAfterFailure > versionlessConfirmation, 'temporarily unavailable legacy service must keep polling');
+  assert.match(settingsSource.slice(resumeAfterFailure), /lifecycle\.installing = true;[^]*scheduleStatusPoll\(1500\);/);
+});
+
+test('settings updater reloads a stale page after a completed external update', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+  const settingsStart = source.indexOf('function openSettingsEditor()');
+  const settingsEnd = source.indexOf('\nfunction openProxyEditor(', settingsStart);
+  const settingsSource = source.slice(settingsStart, settingsEnd);
+  const completion = settingsSource.indexOf('const completeConfirmedInstall =');
+  const comparePageVersion = settingsSource.indexOf('!versionsEqual(confirmedVersion, pageVersion)', completion);
+  const enableReload = settingsSource.indexOf('lifecycle.reloadAfterInstall = true;', comparePageVersion);
+  const adoptVersion = settingsSource.indexOf('adoptRunningVersion(runningVersion)', enableReload);
+  const reload = settingsSource.indexOf('window.location.reload()', adoptVersion);
+
+  assert.ok(completion >= 0 && comparePageVersion > completion);
+  assert.ok(enableReload > comparePageVersion && adoptVersion > enableReload);
+  assert.ok(reload > adoptVersion, 'a stale bundle must reload only after the running version is confirmed');
+});
+
 test('splitValues preserves delimiters inside quoted values', () => {
   assert.deepEqual(
     rulesUI.splitValues('firefox.exe; "C:\\Some, App\\app.exe"\ntelegram.exe'),

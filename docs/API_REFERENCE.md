@@ -9,11 +9,13 @@ The API is intended for localhost use only.
 Response:
 
 ```json
-{"ok": true, "version": "v0.43-rc.4"}
+{"ok": true, "version": "v0.43-rc.5", "pid": 1234}
 ```
 
 `version` is injected at build time. Unversioned developer builds report
-`"dev"`.
+`"dev"`. `pid` identifies the exact running process. During a verified updater
+handoff, the newly started current-format build also returns a short-lived
+`update_token`; it is omitted during normal operation and from legacy builds.
 
 ## `GET /api/config`
 
@@ -32,6 +34,9 @@ Behavior:
 - a zero or omitted token remains an unconditional update for legacy API clients;
 - `updated_at` is rewritten server-side;
 - the JSON file is written atomically.
+- config replacement returns HTTP `409 Conflict` while an application update is
+  running, so the helper restarts the exact listener/service identity captured
+  for that transaction.
 
 Transparent-listener and routing changes are applied by a transactional runtime restart; if activation fails, the previous runtime/configuration is restored. Changing the HTTP listen address still requires a service/process restart.
 
@@ -289,6 +294,92 @@ UI subscriptions. Runtime routing, WinDivert, proxy tunnels and connection
 history continue normally. Health, tray and control endpoints remain
 available. A browser navigation to a disabled WebUI receives a small standalone
 HTTP 503 explanation page instead of loading the full application.
+
+## Application update API
+
+All three update endpoints are intended for the embedded local WebUI. They
+require both a loopback/`localhost` `Host` header and
+`X-PitchProx-WebUI: 1`; otherwise they return HTTP `403`. The updater never
+checks GitHub in the background.
+
+### `GET /api/update/releases`
+
+Performs one explicit, 30-second-bounded GitHub Releases check and returns at
+most the five latest non-draft published releases:
+
+```json
+{
+  "current_version": "v0.43-rc.5",
+  "latest_version": "v0.43",
+  "update_available": true,
+  "comparison_known": true,
+  "checked_at": "2026-08-04T12:00:00Z",
+  "releases": [
+    {
+      "version": "v0.43",
+      "name": "pitchProx v0.43",
+      "published_at": "2026-08-04T10:00:00Z",
+      "prerelease": false,
+      "page_url": "https://github.com/agentpitch/prox/releases/tag/v0.43",
+      "size": 7340032,
+      "installable": true,
+      "verification": "manifest"
+    }
+  ]
+}
+```
+
+`latest_version` and `update_available` concern the newest stable release;
+prereleases still appear in `releases`. A development version may set
+`comparison_known=false`. Unusable releases remain visible with
+`installable=false` and a bounded human-readable `reason`. The bounded result
+is reusable for installation for five minutes, avoiding another download when
+the user immediately chooses a version.
+
+### `GET /api/update/status`
+
+Returns the current bounded transaction state:
+
+```json
+{
+  "phase": "downloading",
+  "busy": true,
+  "version": "v0.43",
+  "message": "Загрузка и проверка файлов…",
+  "downloaded_bytes": 1048576,
+  "total_bytes": 7340032,
+  "updated_at": "2026-08-04T12:01:00Z"
+}
+```
+
+Phases are `idle`, `checking`, `downloading`, `verifying`, `restarting`,
+`completed`, and `failed`. `transaction_id` is present after the handoff plan is
+committed; `error` contains a terminal failure. The frontend polls this endpoint
+only while an installation requested by that editor is active.
+
+### `POST /api/update/install`
+
+Starts installation of one exact version from the most recent five-release
+result:
+
+```json
+{"version": "v0.43"}
+```
+
+The body is strict JSON, limited to 512 bytes; `version` is limited to 128
+bytes. Success returns HTTP `202` with the initial status. HTTP `409` means an
+operation or unresolved transaction already exists, the version is not in the
+bounded release set, or that release cannot be installed.
+
+The Windows helper verifies hashes and build/runtime compatibility, stages
+files beside `pitchProx.exe`, and identifies the parent by PID plus process
+creation time. In service mode it additionally verifies the SCM service name
+and executable path. It atomically replaces the executable, requires three
+matching health responses from the selected build, and only then deletes the
+verified rollback copy. Failure restores and health-checks the old build.
+Current-format health includes version, PID, and transaction token; the legacy
+downgrade path instead requires the exact launched process and an `ok` health
+response.
 
 ## `POST /api/proxy-test`
 

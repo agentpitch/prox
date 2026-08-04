@@ -12,6 +12,12 @@ the explicit `-DownloadWinDivertArchive` switch because ignored runtime
 binaries are not present in a fresh checkout. The workflow does not maintain a
 second copy of the build/package commands or hashes.
 
+A candidate intended to exercise or publish the built-in updater must also use
+`-DownloadWinDivertArchive`. That records `verified-official-archive` and the
+verified archive digest in the manifest. A manifest made from repository-root
+runtime files remains useful for local inspection, but the updater deliberately
+rejects it as a published supply-chain input.
+
 The release path fixes:
 
 - Go `1.26.5`;
@@ -81,6 +87,14 @@ The release job downloads the Windows artifact, verifies its SHA-256 file on
 Linux, then publishes the executable, ZIP, checksum, and manifest. The curated
 v0.43 notes are prepended to GitHub-generated change notes. Tags containing a
 hyphen, such as `v0.43-rc.1`, are marked as prereleases.
+
+The built-in updater treats these exact unique asset names as an API contract.
+It cross-checks the GitHub asset SHA-256 digest, checksum file, executable, and
+manifest before staging an update. Therefore a published asset must never be
+renamed or replaced in place; publish a new version instead. Releases from
+`v0.42` onward are installable only with a valid manifest. Older releases use a
+restricted compatibility path that also verifies the ZIP's WinDivert runtime
+against the currently installed DLL and driver.
 
 ## Runtime scope
 

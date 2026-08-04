@@ -87,8 +87,7 @@ Only one config save may be in flight from a WebUI tab. Controls are disabled du
 
 The editor contains:
 
-- name;
-- enabled state;
+- name and the enabled-state control on one non-wrapping row;
 - multiline comment/purpose saved in the existing `notes` field;
 - Applications textarea;
 - Target hosts textarea;
@@ -111,7 +110,13 @@ Similarity is advisory. It compares normalized values and does not claim full gl
 
 Closing a dirty editor requires confirmation. Save is single-flight. An existing rule is located by its original stable ID at save time rather than by a stale array index.
 
-Existing rules also contain a lazy **Фактические срабатывания условий** disclosure. It makes no request until opened (or opened directly from the row's **Детали условий** action). Unsaved editor text is not included; because history is keyed by stable rule ID, the selected window can still contain the previous saved revision of that ID.
+For an existing rule, **Фактические срабатывания условий** is the first editor
+section and is expanded immediately. This makes the saved rule's real behavior
+visible before its editable fields. A new unsaved rule omits the section because
+it has no stable history identity. Opening an existing editor starts one lazy
+request (the row's **Детали условий** action opens the same view). Unsaved editor
+text is not included; because history is keyed by stable rule ID, the selected
+window can still contain the previous saved revision of that ID.
 
 `GET /api/rules/condition-activity?id=<exact-id>&window_minutes=<1..60>&limit=20` supplies two complementary views without constructing the Applications × Hosts × Ports cross-product:
 
@@ -195,6 +200,23 @@ history backfill when that connection opens or reconnects; it does not run the
 Monitoring snapshot timer. Monitoring uses sequential snapshots without log
 payloads and does not open SSE.
 
+### Settings and application versions
+
+Settings includes an **Обновление приложения** section. It does not issue a
+network request on open: **Проверить обновления** explicitly requests GitHub,
+reports whether a newer stable release exists, and renders at most five latest
+published versions. The installed version is disabled as **Установлена**;
+compatible newer, prerelease, and older versions can be selected.
+
+A downgrade requires confirmation. A pre-manifest legacy version adds a second
+warning that its built-in updater will disappear after the transition. Install
+is disabled while settings have unsaved changes. During an accepted install the
+dialog shows bounded download progress and polls only transaction status. The
+old WebUI may briefly disappear while the exact process or service is replaced;
+the page then recognizes the verified new build. Legacy success falls back to
+the old `{ok:true}` health response and clearly states that further automatic
+updates are unavailable.
+
 ## 7. Resource lifecycle
 
 The routed UI must remain quiet when configuration pages are open:
@@ -208,8 +230,10 @@ The routed UI must remain quiet when configuration pages are open:
 - rule selection and activity maps are replaced/pruned, not appended indefinitely;
 - export Blob URLs are revoked;
 - import file inputs are cleared immediately after reading;
-- no application-icon cache is introduced.
+- no application-icon cache is introduced;
 - pending route callbacks, bounded toasts, config reads, editor condition reads, and view-specific animation frames are cancelled or released on their lifecycle boundary.
+- update discovery has no timer or startup request; its five-item result,
+  abort controllers, and install-status timer are released when Settings closes.
 
 After one hour without a browser request, the backend automatically pauses only
 the WebUI. It uses one reschedulable timer rather than a polling loop. A loaded

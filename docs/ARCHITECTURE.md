@@ -35,6 +35,8 @@ pitchProx is a Windows transparent TCP proxy manager written in Go. The program 
 - renders a tray icon in desktop mode;
 - lets the direct observer go dormant again when no active UI client remains;
 - compacts WebUI traffic snapshots into bounded time buckets before serializing them.
+- checks GitHub Releases only on explicit user request and performs a verified,
+  rollback-capable executable handoff through a short-lived helper.
 
 ## 2. Process model
 
@@ -49,6 +51,12 @@ Inside that one process:
 - `trayapp.Run()` is started in a goroutine and uses an in-process provider instead of talking to the full snapshot API.
 
 This is the normal daily-use mode.
+
+During an accepted application update, the current executable creates one
+verified helper copy beside itself. The helper is a temporary process, not a
+resident updater service. It takes over a cross-process lock, waits for an
+explicit full-identity permission record, replaces the executable, and exits
+after the selected build or the restored old build passes health checks.
 
 ### Service mode
 
@@ -77,6 +85,7 @@ Commands:
 - `stop`
 - `open`
 - `tray` (diagnostic tray-only mode against a running localhost URL)
+- `update-helper --plan <path>` (hidden internal handoff mode; not a user command)
 
 ### `internal/app`
 
@@ -174,6 +183,26 @@ Serves:
 - SSE event stream;
 - embedded WebUI static files.
 
+### `internal/updater`
+
+On-demand GitHub release discovery and Windows executable replacement.
+
+- keeps at most five releases in a five-minute in-memory cache;
+- uses no background network polling and one bounded install goroutine only
+  after an explicit request;
+- cross-checks GitHub asset digests, the checksum file, the clean build
+  manifest, PE architecture, and installed WinDivert hashes;
+- supports a restricted pre-manifest downgrade only when the selected ZIP's
+  runtime hashes exactly match the installed DLL and driver;
+- binds a handoff to PID plus process creation time and, in service mode, the
+  exact SCM service/image identity;
+- transfers a two-byte file-lock baton to one exact helper process and requires
+  observing/acquired/proceeding acknowledgements bound to the transaction;
+- uses `ReplaceFileW`, verified backup/recovery copies, and three matching
+  health probes before deleting the old executable;
+- reconciles interrupted fixed-path transactions at startup/status access and
+  quarantines ambiguous state instead of guessing or discarding rollback data.
+
 ### `internal/trayapp`
 
 Windows tray implementation.
@@ -261,6 +290,9 @@ its affected summaries as truncated.
 - the flow cleanup timer is armed only while pending flow records exist;
 - forced heap release is conditional and infrequent rather than an unconditional periodic GC;
 - configuration changes that require a routing restart are activated before being committed to disk and roll back to the previous running configuration if activation fails.
+- release checks allocate only for the explicit request; install/download
+  buffers, HTTP bodies, release lists, helper handles, and timers are capped and
+  released. Startup reconciliation has a finite retry schedule and then exits.
 
 ## 6. Retention model
 
@@ -286,6 +318,12 @@ Portable files next to the executable:
 
 - `pitchProx.config.json`
 - `pitchProx.history\`
+
+During an update, fixed-name transaction files may briefly appear beside the
+executable (`.pitchProx-update-*`). Success removes stage, rollback, plan,
+acknowledgement, and permission files; a single zero-byte lock file may remain
+for safe path-stable reuse. On interruption, verified rollback material is kept
+until a later bounded reconciliation can determine the state safely.
 
 Transient/ephemeral:
 

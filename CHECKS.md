@@ -14,7 +14,9 @@ This archive contains the current optimized baseline with segment-backed history
 - periodic WebUI refreshes can skip historical log payloads, while tab hide/close explicitly marks the UI inactive;
 - WebUI traffic snapshots are bucketed on the backend, so long retention windows do not emit or render full per-second series;
 - relay accounting is batched instead of writing counters on every copied chunk;
-- the embedded WebUI/control plane now uses a lightweight loopback HTTP implementation instead of `net/http`;
+- the embedded WebUI/control plane uses a lightweight loopback HTTP
+  implementation; `net/http` and TLS are linked only for the explicit GitHub
+  updater client and perform no idle polling;
 - SQLite and `modernc` were removed from the runtime path.
 - history recovery, retry and pending-memory behavior are bounded for long-running disk-error scenarios;
 - process-path caches validate PID reuse with process creation time;
@@ -30,7 +32,7 @@ A publishable v0.43 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.4
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.5 -DownloadWinDivertArchive
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is
@@ -55,8 +57,10 @@ go build -mod=readonly -trimpath -buildvcs=true with the Windows GUI subsystem
 
 Release packaging additionally:
 
-- locally reuses and verifies the exact root WinDivert 2.2.2 x64 DLL/driver plus the tracked upstream LICENSE, without temporary archive extraction;
-- in CI, explicitly downloads and verifies the official archive before verifying its x64 DLL, driver, and LICENSE;
+- for an updater-compatible local candidate and in CI, explicitly downloads
+  and verifies the pinned official archive before verifying its x64 DLL,
+  driver, and LICENSE; temporary extraction stays inside the candidate tree and
+  is removed before packaging finishes;
 - includes WinDivert, Go, and `golang.org/x/sys` licenses plus `THIRD_PARTY_NOTICES.md`;
 - statically verifies the exact injected version in the binary, and requires `go version -m` to report the intended target, commit, and `vcs.modified=false` for a clean candidate;
 - writes `pitchProx-build-manifest.json` with source, toolchain, target, dependency, license, and executable hashes;
@@ -83,21 +87,28 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 
 ## Binary-level validation
 
-- stripped `build\pitchProx.exe` size dropped from about `11.9 MB` to about `4.26 MB`;
-- `go version -m build\pitchProx.exe` now lists only `golang.org/x/sys` as a non-stdlib dependency;
-- `go tool nm -size build\pitchProx-debug.exe` no longer shows:
+- `go version -m` lists only `golang.org/x/sys` as a non-stdlib dependency;
+- SQLite/`modernc` remain absent from the runtime and symbol table;
+- `net/http` and `crypto/tls` are now intentionally linked by the on-demand
+  GitHub updater. The custom WebUI server still does not use them, and no
+  updater network request runs until the user presses **Проверить обновления**;
+- executable size is no longer compared with the pre-updater 4.26 MB baseline.
+  The exact size and SHA-256 of each candidate are recorded in
+  `pitchProx-build-manifest.json` and `pitchProx-windows-amd64.sha256`;
+- `go tool nm -size` of an unstripped diagnostic build must still not show:
   - `crypto/internal/fips140/drbg.memory`
   - `modernc.org/sqlite`
   - `modernc.org/libc`
-  - `net/http`
-  - `crypto/tls`
 
 ## What was not executed here
 
 - elevated end-to-end runtime execution of `pitchProx.exe run`;
 - WinDivert interception against a live Windows network stack;
 - Windows tray interaction with the real shell;
-- Windows Service installation/start/stop.
+- Windows Service installation/start/stop;
+- elevated end-to-end updater handoff through helper, SCM replacement, health
+  confirmation, and forced rollback. Unit tests exercise real Windows
+  `LockFileEx`/`ReplaceFileW`, but not a live installed service.
 
 ## Recommended Windows verification
 
@@ -112,7 +123,15 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 - proxy activity, connection history, and logs continue to work after long uptime;
 - hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
 - WebUI auto-pauses after one hour without browser requests, control/tray polling and a long-lived SSE do not prevent it, the loaded page reports that routing continues, and **Управление** in the tray enables it again;
-- idle memory is materially lower than older builds because the binary no longer links `net/http`/TLS or SQLite.
+- Settings performs no release request until explicitly asked, shows exactly the
+  latest five GitHub releases, and leaves no status timer after the dialog closes;
+- in a controlled disposable installation, update to a current-format release,
+  verify exact-version restart and cleanup, then simulate a failed new start and
+  confirm that the verified old executable is restored; separately validate
+  service-mode SCM handoff;
+- idle memory remains materially lower than older builds because SQLite is
+  absent and both observability and updater work are dormant/bounded when idle,
+  even though the updater now intentionally links `net/http`/TLS.
 
 ## Audit verification on 2026-07-28
 
@@ -135,3 +154,31 @@ Result:
 - SHA-256: `C31B2B51AA056BE7537CAC1189058A1B57CD78369BD139AF1852D7654567B3D3`.
 
 The review binary was deliberately written under a different filename. The already running elevated `pitchProx.exe` process was not stopped, replaced, or used for WinDivert end-to-end testing.
+
+## Isolated updater verification on 2026-08-04
+
+An isolated pre-release test build was built and launched unelevated with a disposable
+config/history on `127.0.0.1:18183`, while the existing application remained on
+`127.0.0.1:18080` with the same PID. Browser automation confirmed:
+
+- existing-rule condition activity opens expanded above editable fields;
+- the rule-enabled control stays on the name row at desktop width;
+- Settings makes no release request before the explicit button is pressed;
+- the real response contains exactly v0.41–v0.37, all five compatible legacy
+  releases, and the downgrade warning explains the one-way updater limitation;
+- closing the dialog/browser leaves no console errors or updater polling.
+
+The disposable candidate then performed a real GitHub-backed desktop downgrade
+to v0.41. The original isolated PID `16112` was replaced by PID `17476`; the
+new target SHA-256 exactly matched the published v0.41 checksum, legacy health
+passed, and the transaction state reported `completed`. Plan, stage, backup,
+recovery, acknowledgement, and permission files were gone. Only the single
+fixed-name state file, zero-byte reusable lock, and one fixed-name legacy helper
+remained; the helper is registered for best-effort deletion at reboot and
+cannot accumulate under versioned names. The isolated v0.41 process was then
+stopped, and the production `v0.43-rc.3` health endpoint/PID were unchanged.
+
+This verifies the real download, legacy compatibility gate, desktop lock
+handoff, executable replacement, restart, health confirmation, and successful
+cleanup path. It does not replace the still-recommended elevated WinDivert,
+forced-rollback, or installed-SCM end-to-end tests listed above.

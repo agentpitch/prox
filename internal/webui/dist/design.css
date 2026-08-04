@@ -477,7 +477,6 @@ button:disabled:hover { background: var(--surface); border-color: var(--border-s
 .order-buttons button:disabled { opacity: .25; cursor: not-allowed; }
 .rule-name-cell { min-width: 0; cursor: pointer; }
 .rule-table-name { overflow: hidden; color: #28374f; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.rule-table-id { color: var(--ink-muted); font-weight: 500; }
 .rule-table-note {
   margin-top: 3px;
   overflow: hidden;

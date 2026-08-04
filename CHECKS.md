@@ -30,7 +30,7 @@ A publishable v0.43 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.2
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.3
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is

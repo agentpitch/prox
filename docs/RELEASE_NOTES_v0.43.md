@@ -4,6 +4,7 @@
 
 - New application-shell WebUI with sidebar navigation and dedicated pages.
 - Dense rules table with search by name, ID, comment, every application, host, port, action, proxy, and chain.
+- Rule priority is shown once in the order column without a duplicate `#number` prefix in the name.
 - Filters, 25/50 pagination, one consistently compact table, persistent column preferences, and responsive mobile layout.
 - Multi-selection and atomic bulk enable, disable, and delete.
 - Multiline rule comments using the existing compatible `notes` field.

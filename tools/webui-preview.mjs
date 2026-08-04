@@ -236,7 +236,7 @@ async function serveStatic(requestPath, response) {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || '/', `http://127.0.0.1:${port}`);
   try {
-    if (url.pathname === '/api/health') return json(response, 200, { ok: true, version: 'v0.43-rc.2-preview' });
+    if (url.pathname === '/api/health') return json(response, 200, { ok: true, version: 'v0.43-rc.3-preview' });
     if (url.pathname === '/api/control/webui/status') {
       return json(response, 200, {
         enabled: webUIEnabled,

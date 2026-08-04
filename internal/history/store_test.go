@@ -134,19 +134,20 @@ func TestRuleConditionActivityAggregatesSourcesAndTopLimit(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	now := time.Now().UTC().Add(-time.Second)
+	flushedAt := time.Now().UTC().Truncate(ruleActivityWriteBucket).Add(-time.Second)
 	for i := 0; i < 2; i++ {
-		store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceIntercepted)
+		store.AddRuleConditionHit(flushedAt, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceIntercepted)
 	}
 	if err := store.Flush(); err != nil {
 		t.Fatalf("flush intercepted condition hits: %v", err)
 	}
-	store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceDirectObserver)
-	store.AddRuleConditionHit(now, "Rule-ID", "Rule", config.ActionProxy, "curl.exe", "api.example.com", "400-500", RuleConditionSourceIntercepted)
-	store.AddRuleConditionHit(now, "rule-id", "Different exact ID", config.ActionProxy, "ignored.exe", "Any", "Any", RuleConditionSourceIntercepted)
+	pendingAt := time.Now().UTC().Truncate(time.Second)
+	store.AddRuleConditionHit(pendingAt, "Rule-ID", "Rule", config.ActionProxy, "chrome.exe", "*.example.com", "443", RuleConditionSourceDirectObserver)
+	store.AddRuleConditionHit(pendingAt, "Rule-ID", "Rule", config.ActionProxy, "curl.exe", "api.example.com", "400-500", RuleConditionSourceIntercepted)
+	store.AddRuleConditionHit(pendingAt, "rule-id", "Different exact ID", config.ActionProxy, "ignored.exe", "Any", "Any", RuleConditionSourceIntercepted)
 	// Legacy activity and traffic-only records have no exact tuple and must not
 	// dilute condition shares.
-	store.AddRuleActivity(now, "Rule-ID", "Rule", config.ActionProxy, 7, 100, 200)
+	store.AddRuleActivity(pendingAt, "Rule-ID", "Rule", config.ActionProxy, 7, 100, 200)
 
 	result, err := store.RuleConditionActivity("Rule-ID", time.Minute, 1)
 	if err != nil {

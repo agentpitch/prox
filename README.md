@@ -114,9 +114,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.
 
 The candidate is written to `build\candidates\v0.43-rc.5\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
-script runs all Go and WebUI checks, then downloads and verifies the pinned
-official WinDivert archive for a release-grade updater manifest. Temporary
-extraction remains inside the candidate tree and is removed before packaging;
+script runs all Go and WebUI checks, then obtains and verifies the pinned
+official WinDivert archive for a release-grade updater manifest. If a network
+filter blocks GitHub downloads, the mutually exclusive
+`-WinDivertArchivePath C:\path\WinDivert-2.2.2-A.zip` option accepts an existing
+copy only after the same pinned SHA-256 and internal runtime/license checks.
+Temporary extraction remains inside the candidate tree and is removed before packaging;
 the running application and root runtime files are untouched. The script also
 includes third-party licenses and writes a build manifest plus SHA-256 file. It
 refuses recursive cleanup through junctions/symlinks.

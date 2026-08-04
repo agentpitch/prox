@@ -3,6 +3,7 @@ param(
     [switch]$SkipChecks,
     [switch]$AllowDirty,
     [switch]$DownloadWinDivertArchive,
+    [string]$WinDivertArchivePath = "",
     [string]$ReleaseNotesSource = ""
 )
 
@@ -167,6 +168,9 @@ if ($Version -notmatch '^(?:v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9]
 if ($SkipChecks -and -not $AllowDirty) {
     throw "-SkipChecks is allowed only together with -AllowDirty for a disposable diagnostic build."
 }
+if ($DownloadWinDivertArchive -and -not [string]::IsNullOrWhiteSpace($WinDivertArchivePath)) {
+    throw "-DownloadWinDivertArchive and -WinDivertArchivePath are mutually exclusive."
+}
 
 $savedEnvironment = $null
 $locationPushed = $false
@@ -221,23 +225,31 @@ try {
     $winDivertDirectory = $repoRoot
     $winDivertRuntimeSource = "repository-root"
     $winDivertArchiveVerified = $false
-    if ($DownloadWinDivertArchive) {
+    if ($DownloadWinDivertArchive -or -not [string]::IsNullOrWhiteSpace($WinDivertArchivePath)) {
         $runtimeWork = Join-Path $resolvedCandidate "_windivert"
         $runtimeExtract = Join-Path $runtimeWork "extracted"
         New-Item -ItemType Directory -Force -Path $runtimeExtract | Out-Null
-        $archivePath = Join-Path $runtimeWork "WinDivert-$($PitchProxReleaseSettings.WinDivertVersion)-A.zip"
-        $oldProgressPreference = $ProgressPreference
-        $ProgressPreference = "SilentlyContinue"
-        try {
-            $oldSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
-            [Net.ServicePointManager]::SecurityProtocol = $oldSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        if ($DownloadWinDivertArchive) {
+            $archivePath = Join-Path $runtimeWork "WinDivert-$($PitchProxReleaseSettings.WinDivertVersion)-A.zip"
+            $oldProgressPreference = $ProgressPreference
+            $ProgressPreference = "SilentlyContinue"
             try {
-                Invoke-WebRequest -UseBasicParsing -Uri $PitchProxReleaseSettings.WinDivertReleaseURL -OutFile $archivePath
+                $oldSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+                [Net.ServicePointManager]::SecurityProtocol = $oldSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                try {
+                    Invoke-WebRequest -UseBasicParsing -Uri $PitchProxReleaseSettings.WinDivertReleaseURL -OutFile $archivePath
+                } finally {
+                    [Net.ServicePointManager]::SecurityProtocol = $oldSecurityProtocol
+                }
             } finally {
-                [Net.ServicePointManager]::SecurityProtocol = $oldSecurityProtocol
+                $ProgressPreference = $oldProgressPreference
             }
-        } finally {
-            $ProgressPreference = $oldProgressPreference
+        } else {
+            $archiveItem = Get-Item -LiteralPath $WinDivertArchivePath -ErrorAction Stop
+            if ($archiveItem.PSIsContainer) {
+                throw "-WinDivertArchivePath must point to a ZIP file."
+            }
+            $archivePath = $archiveItem.FullName
         }
         Assert-PitchProxFileSHA256 -LiteralPath $archivePath -ExpectedSHA256 $PitchProxReleaseSettings.WinDivertArchiveSHA256 -Description "WinDivert release archive"
         Expand-Archive -LiteralPath $archivePath -DestinationPath $runtimeExtract -Force

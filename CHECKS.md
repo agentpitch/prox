@@ -57,10 +57,10 @@ go build -mod=readonly -trimpath -buildvcs=true with the Windows GUI subsystem
 
 Release packaging additionally:
 
-- for an updater-compatible local candidate and in CI, explicitly downloads
-  and verifies the pinned official archive before verifying its x64 DLL,
-  driver, and LICENSE; temporary extraction stays inside the candidate tree and
-  is removed before packaging finishes;
+- for an updater-compatible local candidate and in CI, downloads or accepts an
+  explicitly supplied copy of the pinned official archive, then verifies its
+  archive hash, x64 DLL, driver, and LICENSE; temporary extraction stays inside
+  the candidate tree and is removed before packaging finishes;
 - includes WinDivert, Go, and `golang.org/x/sys` licenses plus `THIRD_PARTY_NOTICES.md`;
 - statically verifies the exact injected version in the binary, and requires `go version -m` to report the intended target, commit, and `vcs.modified=false` for a clean candidate;
 - writes `pitchProx-build-manifest.json` with source, toolchain, target, dependency, license, and executable hashes;

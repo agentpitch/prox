@@ -30,7 +30,11 @@ from `build\pitchProx.exe`, so packaging does not overwrite or stop an already
 running main application. `-DownloadWinDivertArchive` verifies the pinned
 official archive and produces the release-grade manifest required by the
 built-in updater; it does not load the driver or touch a running application.
-Without that switch the local script may reuse the verified root runtime, but
+When direct download is unavailable, use
+`-WinDivertArchivePath C:\path\WinDivert-2.2.2-A.zip` instead; the options are
+mutually exclusive and the local archive must pass the identical pinned hash
+and content checks.
+Without either archive option the local script may reuse the verified root runtime, but
 the resulting manifest is intended only for local review and must not be
 published as an updater-compatible release.
 

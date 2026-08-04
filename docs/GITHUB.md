@@ -12,11 +12,13 @@ the explicit `-DownloadWinDivertArchive` switch because ignored runtime
 binaries are not present in a fresh checkout. The workflow does not maintain a
 second copy of the build/package commands or hashes.
 
-A candidate intended to exercise or publish the built-in updater must also use
-`-DownloadWinDivertArchive`. That records `verified-official-archive` and the
-verified archive digest in the manifest. A manifest made from repository-root
-runtime files remains useful for local inspection, but the updater deliberately
-rejects it as a published supply-chain input.
+A candidate intended to exercise or publish the built-in updater must use
+`-DownloadWinDivertArchive`, or `-WinDivertArchivePath` with an existing exact
+copy when direct download is unavailable. Both paths verify the pinned archive,
+its DLL, driver, and license before recording `verified-official-archive` and
+the archive digest in the manifest. A manifest made from repository-root runtime
+files remains useful for local inspection, but the updater deliberately rejects
+it as a published supply-chain input.
 
 The release path fixes:
 

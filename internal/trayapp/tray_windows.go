@@ -68,6 +68,7 @@ const (
 	menuDisableWebUI   = 1003
 	menuPauseService   = 1004
 	menuResumeService  = 1005
+	menuEnableWebUI    = 1006
 	offlineExitAfter   = 15 * time.Second
 	pollInterval       = 2 * time.Second
 	trayHistorySeconds = 12
@@ -99,6 +100,11 @@ type remoteWebUIController struct {
 type Options struct {
 	URL      string
 	Provider Provider
+}
+
+type menuItem struct {
+	command uint32
+	label   string
 }
 
 type point struct {
@@ -358,6 +364,12 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		case menuResumeService:
 			h.openManagement()
 			return 0
+		case menuEnableWebUI:
+			h.enableWebUI()
+			return 0
+		case menuDisableWebUI:
+			h.disableWebUI()
+			return 0
 		case menuExit:
 			go h.requestProgramStop()
 			return 0
@@ -395,25 +407,25 @@ func (h *helper) showContextMenu() {
 		return
 	}
 	defer procDestroyMenu.Call(menu)
-	manageText, _ := windows.UTF16PtrFromString("Управление")
-	disableWebUIText, _ := windows.UTF16PtrFromString("Отключить WebUI")
-	pauseText, _ := windows.UTF16PtrFromString("Приостановить")
-	resumeText, _ := windows.UTF16PtrFromString("Запустить")
-	exitText, _ := windows.UTF16PtrFromString("Выйти")
 	paused := false
 	if ctl := h.serviceController(); ctl != nil {
 		paused = ctl.ServicePaused()
 	}
-	if paused {
-		procAppendMenuW.Call(menu, mfString, menuResumeService, uintptr(unsafe.Pointer(resumeText)))
-	} else {
-		procAppendMenuW.Call(menu, mfString, menuManage, uintptr(unsafe.Pointer(manageText)))
-		procAppendMenuW.Call(menu, mfString, menuPauseService, uintptr(unsafe.Pointer(pauseText)))
-		if ctl := h.webUIController(); ctl != nil && ctl.WebUIRunning() {
-			procAppendMenuW.Call(menu, mfString, menuDisableWebUI, uintptr(unsafe.Pointer(disableWebUIText)))
+	webUIAvailable := false
+	webUIRunning := false
+	if !paused {
+		if ctl := h.webUIController(); ctl != nil {
+			webUIAvailable = true
+			webUIRunning = ctl.WebUIRunning()
 		}
 	}
-	procAppendMenuW.Call(menu, mfString, menuExit, uintptr(unsafe.Pointer(exitText)))
+	for _, item := range contextMenuItems(paused, webUIAvailable, webUIRunning) {
+		label, err := windows.UTF16PtrFromString(item.label)
+		if err != nil {
+			continue
+		}
+		procAppendMenuW.Call(menu, mfString, uintptr(item.command), uintptr(unsafe.Pointer(label)))
+	}
 	anchor, flags := h.menuAnchor()
 	h.setContextMenuOwnerTopmost(true)
 	defer h.setContextMenuOwnerTopmost(false)
@@ -437,6 +449,8 @@ func (h *helper) showContextMenu() {
 		h.openManagement()
 	case menuDisableWebUI:
 		h.disableWebUI()
+	case menuEnableWebUI:
+		h.enableWebUI()
 	case menuExit:
 		go h.requestProgramStop()
 	}
@@ -444,6 +458,28 @@ func (h *helper) showContextMenu() {
 		nid := h.notifyData(h.iconHandle, "")
 		procShellNotifyIconW.Call(nimSetFocus, uintptr(unsafe.Pointer(&nid)))
 	}
+}
+
+func contextMenuItems(servicePaused, webUIAvailable, webUIRunning bool) []menuItem {
+	if servicePaused {
+		return []menuItem{
+			{command: menuResumeService, label: "Запустить"},
+			{command: menuExit, label: "Выйти"},
+		}
+	}
+
+	items := []menuItem{
+		{command: menuManage, label: "Управление"},
+		{command: menuPauseService, label: "Приостановить работу"},
+	}
+	if webUIAvailable {
+		if webUIRunning {
+			items = append(items, menuItem{command: menuDisableWebUI, label: "Отключить WebUI"})
+		} else {
+			items = append(items, menuItem{command: menuEnableWebUI, label: "Включить WebUI"})
+		}
+	}
+	return append(items, menuItem{command: menuExit, label: "Выйти"})
 }
 
 func (h *helper) setContextMenuOwnerTopmost(topmost bool) {
@@ -490,6 +526,12 @@ func (h *helper) serviceController() ServiceController {
 func (h *helper) disableWebUI() {
 	if ctl := h.webUIController(); ctl != nil {
 		_ = ctl.DisableWebUI()
+	}
+}
+
+func (h *helper) enableWebUI() {
+	if ctl := h.webUIController(); ctl != nil {
+		_ = ctl.EnableWebUI()
 	}
 }
 

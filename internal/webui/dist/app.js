@@ -422,8 +422,8 @@ function renderWebUIStatus() {
   if (text) {
     const timeoutMinutes = Math.max(1, Math.round(Number(ui.webUIIdleTimeoutSeconds || 3600) / 60));
     text.textContent = ui.webUIAutoPaused
-      ? `После ${timeoutMinutes} минут без обращений WebUI освободил ресурсы. Проксирование и правила продолжают работать. Возобновите WebUI через меню pitchProx в области уведомлений.`
-      : 'Проксирование продолжает работать. Возобновите WebUI через меню pitchProx в области уведомлений.';
+      ? `После ${timeoutMinutes} минут без обращений WebUI освободил ресурсы. Проксирование и правила продолжают работать. Выберите «Включить WebUI» в меню pitchProx в области уведомлений.`
+      : 'Проксирование продолжает работать. Выберите «Включить WebUI» в меню pitchProx в области уведомлений.';
   }
   if (check) check.disabled = !!ui.webUIStatusRequest;
 }
@@ -503,7 +503,7 @@ async function recheckWebUIStatus() {
     return false;
   }
   if (ui.webUIPaused) {
-    showToast('WebUI всё ещё приостановлен. Возобновите его из меню pitchProx в трее.', 'warn', 6000);
+    showToast('WebUI всё ещё приостановлен. Выберите «Включить WebUI» в меню pitchProx в трее.', 'warn', 6000);
     return false;
   }
   if (wasPaused || !state) {

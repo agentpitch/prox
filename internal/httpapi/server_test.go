@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1052,6 +1053,8 @@ func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	var servicePaused atomic.Bool
+	srv.PausedFunc = servicePaused.Load
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -1064,9 +1067,32 @@ func TestServerDisabledWebUIKeepsControlEndpointsAvailable(t *testing.T) {
 
 	srv.SetWebUIEnabled(false)
 	client := &http.Client{Timeout: 2 * time.Second}
-	if status := httpStatus(t, client, "http://"+addr+"/"); status != http.StatusServiceUnavailable {
-		t.Fatalf("GET / status = %d, want 503", status)
+	resp, err := client.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET disabled WebUI page: %v", err)
 	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read disabled WebUI page: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "Включить WebUI") {
+		t.Fatalf("GET / status=%d body=%q, want 503 with tray enable action", resp.StatusCode, body)
+	}
+	servicePaused.Store(true)
+	resp, err = client.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET paused service page: %v", err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read paused service page: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), "«Запустить»") {
+		t.Fatalf("paused service page status=%d body=%q, want 503 with resume action", resp.StatusCode, body)
+	}
+	servicePaused.Store(false)
 	if status := httpStatus(t, client, "http://"+addr+"/api/health"); status != http.StatusOK {
 		t.Fatalf("GET health status = %d, want 200", status)
 	}

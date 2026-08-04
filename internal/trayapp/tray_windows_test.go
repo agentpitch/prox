@@ -87,6 +87,60 @@ func TestTrafficIconFrameUsesHighContrastPixels(t *testing.T) {
 	}
 }
 
+func TestContextMenuOffersWebUIToggleAndFullPauseLabel(t *testing.T) {
+	tests := []struct {
+		name           string
+		servicePaused  bool
+		webUIAvailable bool
+		webUIRunning   bool
+		want           []menuItem
+	}{
+		{
+			name:           "running WebUI",
+			webUIAvailable: true,
+			webUIRunning:   true,
+			want: []menuItem{
+				{command: menuManage, label: "Управление"},
+				{command: menuPauseService, label: "Приостановить работу"},
+				{command: menuDisableWebUI, label: "Отключить WebUI"},
+				{command: menuExit, label: "Выйти"},
+			},
+		},
+		{
+			name:           "disabled WebUI",
+			webUIAvailable: true,
+			want: []menuItem{
+				{command: menuManage, label: "Управление"},
+				{command: menuPauseService, label: "Приостановить работу"},
+				{command: menuEnableWebUI, label: "Включить WebUI"},
+				{command: menuExit, label: "Выйти"},
+			},
+		},
+		{
+			name:          "paused service",
+			servicePaused: true,
+			want: []menuItem{
+				{command: menuResumeService, label: "Запустить"},
+				{command: menuExit, label: "Выйти"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := contextMenuItems(test.servicePaused, test.webUIAvailable, test.webUIRunning)
+			if len(got) != len(test.want) {
+				t.Fatalf("menu length = %d, want %d: %+v", len(got), len(test.want), got)
+			}
+			for i := range test.want {
+				if got[i] != test.want[i] {
+					t.Fatalf("menu item %d = %+v, want %+v", i, got[i], test.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestRemoteWebUIController(t *testing.T) {
 	var enabled atomic.Bool
 	var paused atomic.Bool

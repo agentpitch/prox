@@ -278,11 +278,8 @@ Users can hide Applications, Hosts, Ports, or Activity columns. Column choices, 
 
 ## 10. Tray behavior
 
-Tray behavior is unchanged:
-
-- double click opens WebUI;
-- the context menu controls WebUI and process shutdown;
-- the tray reads the lightweight traffic view;
-- disabling WebUI keeps health/tray/control endpoints available.
-- after an idle auto-pause, choosing **Управление** enables WebUI before opening
-  the browser; proxy routing never stopped.
+- Double click and **Управление** enable WebUI when necessary and open it in the browser.
+- While the service is active, the context menu shows **Приостановить работу** and exactly one WebUI toggle: **Отключить WebUI** while enabled or **Включить WebUI** while disabled/idle-paused.
+- **Включить WebUI** only enables the interface; it does not open a browser. Proxy routing continues throughout a WebUI-only pause.
+- A fully paused service shows **Запустить** instead of the WebUI toggle, because routing is paused too.
+- The tray reads the lightweight traffic view, and disabling WebUI keeps health/tray/control endpoints available.

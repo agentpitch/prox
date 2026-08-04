@@ -22,10 +22,10 @@ elevates its permission to `contents: write`; normal builds remain read-only.
 From a committed clean working tree on Windows:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.6 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43 -DownloadWinDivertArchive
 ```
 
-Review the files under `build\candidates\v0.43-rc.6\`. This path is separate
+Review the files under `build\candidates\v0.43\`. This path is separate
 from `build\pitchProx.exe`, so packaging does not overwrite or stop an already
 running main application. `-DownloadWinDivertArchive` verifies the pinned
 official archive and produces the release-grade manifest required by the

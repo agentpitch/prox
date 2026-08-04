@@ -26,13 +26,13 @@ This archive contains the current optimized baseline with segment-backed history
 - IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
 - runtime config activation rolls back if a required listener/interception restart fails.
 
-## v0.43 release-candidate gate
+## v0.43 release gate
 
 A publishable v0.43 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.6 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43 -DownloadWinDivertArchive
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is
@@ -128,7 +128,7 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
   client-side without a partial save;
 - proxy activity, connection history, and logs continue to work after long uptime;
 - hiding or closing the WebUI allows the runtime to return to a colder quiet mode;
-- WebUI auto-pauses after one hour without browser requests, control/tray polling and a long-lived SSE do not prevent it, the loaded page reports that routing continues, and **Управление** in the tray enables it again;
+- WebUI auto-pauses after one hour without browser requests, control/tray polling and a long-lived SSE do not prevent it, and the loaded page reports that routing continues; right-clicking the tray must switch **Отключить WebUI** to **Включить WebUI**, while the full-service action is labelled **Приостановить работу**;
 - Settings performs no release request until explicitly asked, shows exactly the
   latest five GitHub releases, and leaves no status timer after the dialog closes;
 - in a controlled disposable installation, update to a current-format release,

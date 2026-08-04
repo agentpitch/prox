@@ -295,7 +295,10 @@ Desktop mode tray must:
 - show live proxied Rx/Tx traffic;
 - render a small filled graph with separate Rx/Tx colors;
 - open WebUI on double click;
-- show `Управление` and `Выйти` on right click;
+- show `Управление`, `Приостановить работу`, `Выйти`, and exactly one dynamic
+  WebUI action on right click: `Отключить WebUI` while enabled or
+  `Включить WebUI` while disabled/idle-paused;
+- show `Запустить` instead of WebUI controls while the full service is paused;
 - stop the whole desktop runtime on `Выйти`.
 
 ## 10. API surface

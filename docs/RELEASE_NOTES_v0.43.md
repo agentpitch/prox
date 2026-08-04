@@ -32,6 +32,9 @@
 - WebUI automatically pauses after one hour without marked browser requests,
   while proxy routing continues; tray/control endpoints remain available to
   enable it again. The deadline uses one lazy timer with no idle polling.
+- The tray now shows **Включить WebUI** whenever WebUI is disabled or idle-paused,
+  switches back to **Отключить WebUI** after enabling, and labels the full-service
+  action **Приостановить работу**.
 - Build version is reported by the API and injected into release binaries.
 - Long-running resource hardening from the post-v0.41 work is included: bounded history recovery/retries, PID creation-time validation, released high-water buffers, stricter protocol parsing, and transactional runtime-config activation.
 - WebUI-only process metadata is released on dormancy, and connection maps compact geometrically after traffic bursts even when a long-lived connection remains.

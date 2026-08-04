@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43-rc.6 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43 -DownloadWinDivertArchive
 ```
 
-The candidate is written to `build\candidates\v0.43-rc.6\`; it does not replace
+The candidate is written to `build\candidates\v0.43\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, then obtains and verifies the pinned
 official WinDivert archive for a release-grade updater manifest. If a network
@@ -316,7 +316,7 @@ Desktop mode is optimized for a quiet idle state:
 - verbose `info/debug` logging is captured only while the WebUI is open or recently active;
 - connection/log/rule/traffic history is stored in compact hourly file segments instead of remaining in RAM;
 - when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
-- after one hour without a marked browser request, only WebUI is automatically paused; one lazy deadline timer is used, proxy routing continues unchanged, and **Управление** in the tray enables the interface again;
+- after one hour without a marked browser request, only WebUI is automatically paused; one lazy deadline timer is used, proxy routing continues unchanged, and the tray exposes **Включить WebUI** while **Управление** remains an enable-and-open shortcut;
 - GitHub release discovery is strictly on demand; outside an active check or installation the updater performs no network polling and retains only a bounded five-release cache;
 - WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;

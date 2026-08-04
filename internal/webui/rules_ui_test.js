@@ -29,6 +29,16 @@ test('rules search uses one explicit clear control', () => {
   assert.equal((markup.match(/id="clearRuleSearchBtn"/g) || []).length, 1);
 });
 
+test('paused WebUI guidance names the exact tray action', () => {
+  const markup = fs.readFileSync(path.join(__dirname, 'dist', 'index.html'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');
+
+  assert.match(markup, /Выберите «Включить WebUI» в меню pitchProx/);
+  assert.match(source, /Выберите «Включить WebUI» в меню pitchProx/);
+  assert.doesNotMatch(markup, /Возобновите WebUI через меню pitchProx/);
+  assert.doesNotMatch(source, /Возобновите WebUI через меню pitchProx/);
+});
+
 test('rules import and export open clipboard dialogs while retaining file operations', () => {
   const markup = fs.readFileSync(path.join(__dirname, 'dist', 'index.html'), 'utf8');
   const source = fs.readFileSync(path.join(__dirname, 'dist', 'app.js'), 'utf8');

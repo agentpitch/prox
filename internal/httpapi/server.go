@@ -604,14 +604,16 @@ func (s *Server) handleDisabledWebUIPage(conn net.Conn) {
 	status := s.webUIStatus()
 	title := "WebUI отключён"
 	detail := "Интерфейс управления отключён. Проксирование продолжает работать."
+	hint := "Чтобы снова включить интерфейс, выберите «Включить WebUI» в меню значка pitchProx в системном трее."
 	if status.Paused {
 		title = "Сервис приостановлен"
 		detail = "Сервис и WebUI приостановлены пользователем."
+		hint = "Чтобы возобновить работу, выберите «Запустить» в меню значка pitchProx в системном трее."
 	} else if status.AutoPaused {
 		title = "WebUI приостановлен"
 		detail = "В течение часа не было обращений из браузера, поэтому WebUI был автоматически приостановлен. Проксирование продолжает работать."
 	}
-	body := []byte("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + title + " — pitchProx</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f8fc;color:#16233a;font:16px system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:560px;margin:24px;padding:32px;border:1px solid #dce5f2;border-radius:18px;background:#fff;box-shadow:0 16px 44px #183d7514}h1{margin:0 0 12px;font-size:26px}p{line-height:1.55;color:#52627a}.brand{color:#086cf0;font-weight:750}.hint{margin-top:22px;padding:14px 16px;border-radius:12px;background:#edf5ff;color:#24466f}</style></head><body><main class=\"card\"><div class=\"brand\">pitchProx</div><h1>" + title + "</h1><p>" + detail + "</p><p class=\"hint\">Чтобы снова открыть интерфейс, выберите «Управление» в меню значка pitchProx в системном трее.</p></main></body></html>")
+	body := []byte("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + title + " — pitchProx</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f8fc;color:#16233a;font:16px system-ui,-apple-system,Segoe UI,sans-serif}.card{max-width:560px;margin:24px;padding:32px;border:1px solid #dce5f2;border-radius:18px;background:#fff;box-shadow:0 16px 44px #183d7514}h1{margin:0 0 12px;font-size:26px}p{line-height:1.55;color:#52627a}.brand{color:#086cf0;font-weight:750}.hint{margin-top:22px;padding:14px 16px;border-radius:12px;background:#edf5ff;color:#24466f}</style></head><body><main class=\"card\"><div class=\"brand\">pitchProx</div><h1>" + title + "</h1><p>" + detail + "</p><p class=\"hint\">" + hint + "</p></main></body></html>")
 	writeBytes(conn, 503, "text/html; charset=utf-8", body)
 }
 

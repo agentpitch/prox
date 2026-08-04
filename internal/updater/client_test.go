@@ -329,7 +329,7 @@ func TestValidateBuildManifest(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			directory := t.TempDir()
+			directory := updaterTestTempDir(t)
 			dllHash, driverHash := writeTestWinDivertRuntime(t, directory)
 			executable := minimalPE(pe.IMAGE_FILE_MACHINE_AMD64)
 			executableHash := sha256Hex(executable)
@@ -367,7 +367,7 @@ func TestValidateBuildManifest(t *testing.T) {
 }
 
 func TestGitHubClientStageVerifiedExecutable(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	dllHash, driverHash := writeTestWinDivertRuntime(t, directory)
 	executable := minimalPE(pe.IMAGE_FILE_MACHINE_AMD64)
 	executableHash := sha256Hex(executable)
@@ -531,7 +531,7 @@ func TestDownloadExecutableVerification(t *testing.T) {
 				APIURL: client.releasesURL.String(),
 				Size:   int64(len(test.body)) + test.sizeDelta,
 			}
-			destination := filepath.Join(t.TempDir(), executableName)
+			destination := filepath.Join(updaterTestTempDir(t), executableName)
 			err := client.downloadExecutable(context.Background(), item, destination, wantHash, nil)
 			if test.wantError == "" {
 				if err != nil {
@@ -568,7 +568,7 @@ func TestDownloadExecutableRejectsOversizeBeforeRequest(t *testing.T) {
 		APIURL: client.releasesURL.String(),
 		Size:   maxExecutableBytes + 1,
 	}
-	err := client.downloadExecutable(context.Background(), item, filepath.Join(t.TempDir(), executableName), strings.Repeat("0", 64), nil)
+	err := client.downloadExecutable(context.Background(), item, filepath.Join(updaterTestTempDir(t), executableName), strings.Repeat("0", 64), nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid executable size") {
 		t.Fatalf("downloadExecutable error = %v, want invalid size", err)
 	}

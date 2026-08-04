@@ -12,7 +12,7 @@ import (
 )
 
 func TestWindowsUpdateLockBatonExcludesOtherManagers(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	target := filepath.Join(directory, executableName)
 	mustWriteWindowsTestFile(t, target, []byte("target"))
 
@@ -82,7 +82,7 @@ func TestHelperReadyMatcherUsesFullTransactionIdentity(t *testing.T) {
 }
 
 func TestVerifyActiveTransactionIsBoundToPlan(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	token := strings.Repeat("a", 64)
 	createdAt := time.Now().UTC().Add(-time.Second)
 	plan := HandoffPlan{
@@ -119,7 +119,7 @@ func TestVerifyActiveTransactionIsBoundToPlan(t *testing.T) {
 }
 
 func TestProceedPermissionRequiresFullHelperIdentity(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	plan := HandoffPlan{
 		ProceedPath: filepath.Join(directory, proceedFileName),
 		UpdateToken: strings.Repeat("a", 64), TransactionID: strings.Repeat("b", 64), ParentStarted: 42,
@@ -152,7 +152,7 @@ func TestReplaceAndInventoryKeepsVerifiedRollbackSource(t *testing.T) {
 		{name: "invalid recovery with valid ReplaceFile backup", recoveryContent: []byte("damaged recovery")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			directory := t.TempDir()
+			directory := updaterTestTempDir(t)
 			oldContent := []byte("old executable")
 			newContent := []byte("new executable")
 			plan := windowsReplacementPlan(directory, oldContent, newContent)
@@ -175,7 +175,7 @@ func TestReplaceAndInventoryKeepsVerifiedRollbackSource(t *testing.T) {
 }
 
 func TestRestoreOldExecutableFallsBackAcrossVerifiedSources(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	oldContent := []byte("old executable")
 	newContent := []byte("new executable")
 	plan := windowsReplacementPlan(directory, oldContent, newContent)
@@ -195,7 +195,7 @@ func TestRestoreOldExecutableFallsBackAcrossVerifiedSources(t *testing.T) {
 }
 
 func TestReplaceAndInventoryLeavesOldTargetWhenStageIsUnavailable(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	oldContent := []byte("old executable")
 	newContent := []byte("new executable")
 	plan := windowsReplacementPlan(directory, oldContent, newContent)
@@ -228,7 +228,7 @@ func mustWriteWindowsTestFile(t *testing.T, path string, content []byte) {
 }
 
 func TestRestoreOldExecutableReportsMissingSources(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	plan := windowsReplacementPlan(directory, []byte("old"), []byte("new"))
 	mustWriteWindowsTestFile(t, plan.TargetPath, []byte("unknown"))
 	restored, err := restoreOldExecutable(plan)

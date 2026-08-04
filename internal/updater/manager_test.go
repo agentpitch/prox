@@ -362,6 +362,7 @@ func TestManagerPossiblyCommittedHandoffStaysRestarting(t *testing.T) {
 	if persisted.Phase != PhaseRestarting || !persisted.Busy || persisted.TransactionID == "" {
 		t.Fatalf("persisted possibly committed status = %#v", persisted)
 	}
+
 }
 
 func TestManagerCloseCancelsActiveInstall(t *testing.T) {
@@ -432,7 +433,7 @@ func TestManagerCloseCancelsActiveInstall(t *testing.T) {
 }
 
 func TestManagerLoadsPersistedStatusAndHealthToken(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	executablePath := filepath.Join(directory, "pitchProx.exe")
 	if err := os.WriteFile(executablePath, []byte("current executable"), 0o700); err != nil {
 		t.Fatal(err)
@@ -584,7 +585,7 @@ func TestReconcileRequiresMatchingCompletedTransaction(t *testing.T) {
 		{name: "stale commit", transactionID: strings.Repeat("f", 64), wantClean: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			directory := t.TempDir()
+			directory := updaterTestTempDir(t)
 			oldContent := []byte("old executable")
 			newContent := []byte("new executable")
 			target := filepath.Join(directory, "pitchProx.exe")
@@ -672,7 +673,7 @@ func TestReconcileRequiresMatchingCompletedTransaction(t *testing.T) {
 }
 
 func TestCheckPreservesSuccessfulCleanupWarningWhilePlanRemains(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	oldContent := []byte("old executable")
 	newContent := []byte("new executable")
 	target := filepath.Join(directory, executableName)
@@ -727,7 +728,7 @@ func TestCheckPreservesSuccessfulCleanupWarningWhilePlanRemains(t *testing.T) {
 }
 
 func TestReconcileKeepsRollbackCopiesWhenOldTargetSyncFails(t *testing.T) {
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	oldContent := []byte("old executable")
 	newContent := []byte("new executable")
 	target := filepath.Join(directory, executableName)
@@ -819,7 +820,7 @@ func (s *managerTestSource) callCounts() (int, int) {
 
 func newManagerTestFixture(t *testing.T, current string, source Source, handoff func(HandoffPlan) error, stop func()) (*Manager, string) {
 	t.Helper()
-	directory := t.TempDir()
+	directory := updaterTestTempDir(t)
 	executablePath := filepath.Join(directory, "pitchProx.exe")
 	if err := os.WriteFile(executablePath, []byte("current pitchProx executable"), 0o700); err != nil {
 		t.Fatal(err)

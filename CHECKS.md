@@ -4,6 +4,13 @@ The September 2026 background-resource audit, measured hot paths, regression
 checks and remaining live-runtime verification are recorded in
 [RESOURCE_AUDIT_2026-09-23.md](docs/RESOURCE_AUDIT_2026-09-23.md).
 
+Headless control is documented in [AGENT_CLI.md](docs/AGENT_CLI.md). Its tests
+cover strict JSON, revision conflicts, no-op apply, rule positioning, inactive
+WebUI access, mutation serialization with the updater, HTTP listener handoff,
+and rollback after bind/runtime/config-save failures. A disposable Windows
+GUI-subsystem EXE was also exercised with redirected stdin/stdout/stderr through
+all CLI commands, including runtime restart and HTTP rebind with an unchanged PID.
+
 This archive contains the current optimized baseline with segment-backed history and the single-process desktop mode.
 
 ## Cleanup and optimization work included
@@ -19,8 +26,8 @@ This archive contains the current optimized baseline with segment-backed history
 - WebUI traffic snapshots are bucketed on the backend, so long retention windows do not emit or render full per-second series;
 - relay accounting is batched instead of writing counters on every copied chunk;
 - the embedded WebUI/control plane uses a lightweight loopback HTTP
-  implementation; `net/http` and TLS are linked only for the explicit GitHub
-  updater client and perform no idle polling;
+  implementation; the explicit GitHub updater and short-lived `ctl` client
+  use `net/http`, with no idle network polling;
 - SQLite and `modernc` were removed from the runtime path.
 - history recovery, retry and pending-memory behavior are bounded for long-running disk-error scenarios;
 - process-path caches validate PID reuse with process creation time;

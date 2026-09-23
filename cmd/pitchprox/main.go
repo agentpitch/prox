@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/agentpitch/prox/internal/agentcli"
 	"github.com/agentpitch/prox/internal/app"
 	"github.com/agentpitch/prox/internal/buildinfo"
 	"github.com/agentpitch/prox/internal/config"
@@ -30,6 +31,10 @@ func main() {
 	}
 	if cmd == "run" {
 		util.HideConsoleIfOwn()
+	}
+	if cmd == "ctl" {
+		util.PrepareCLIConsole()
+		os.Exit(agentcli.Run(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
 
 	switch cmd {
@@ -188,6 +193,7 @@ func runTray() error {
 
 func usage() {
 	fmt.Println(`pitchProx commands:
+  ctl         headless agent control (ctl help / ctl schema; JSON, no elevation)
   run         run desktop mode (single process: runtime + WebUI + tray)
   service     run under Windows Service Manager (headless)
   install     install Windows service

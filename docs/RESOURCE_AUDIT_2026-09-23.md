@@ -118,5 +118,5 @@ go test ./internal/rules -run '^$' -bench 'BenchmarkPreflight' -benchmem
 `agentpitch <277300638+agentpitch@users.noreply.github.com>`; GitHub API
 `/repos/agentpitch/prox/contributors?anon=1` также вернул только `agentpitch`.
 Нормализация user.name для новых коммитов не требует переписывания истории.
-Исправления предназначены для `main`; дублирующая ветка удаляется с проверкой
-ожидаемого SHA, без force-push истории `main` и без изменения release-тегов.
+Исправления сохранены в `main`; дублирующая ветка удалена локально и на GitHub
+с проверкой ожидаемого SHA, без force-push истории `main` и без изменения release-тегов.

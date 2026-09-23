@@ -21,6 +21,7 @@ import (
 
 	"github.com/agentpitch/prox/internal/buildinfo"
 	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/control"
 	"github.com/agentpitch/prox/internal/history"
 	"github.com/agentpitch/prox/internal/monitor"
 	"github.com/agentpitch/prox/internal/proxy"
@@ -32,6 +33,7 @@ import (
 var (
 	ErrClosed                    = net.ErrClosed
 	errUpdateInstallBodyTooLarge = errors.New("update install request body is too large")
+	errRequestBodyTooLarge       = errors.New("request body exceeds 8 MiB")
 )
 
 type Runtime interface {
@@ -49,12 +51,14 @@ type Updater interface {
 }
 
 type Server struct {
-	Runtime    Runtime
-	Updater    Updater
-	StopFunc   func()
-	PauseFunc  func() error
-	ResumeFunc func() error
-	PausedFunc func() bool
+	Runtime          Runtime
+	Updater          Updater
+	StopFunc         func()
+	PauseFunc        func() error
+	ResumeFunc       func() error
+	PausedFunc       func() bool
+	ApplyConfigFunc  func(control.ConfigRequest) (control.ConfigResult, error)
+	WebUIControlFunc func(bool) (WebUIStatus, error)
 
 	addr     string
 	staticFS fs.FS
@@ -81,7 +85,7 @@ type Server struct {
 	webUIIdleWG             sync.WaitGroup
 	webUIIdleCallbackHook   func() func()
 	updaterMu               sync.RWMutex
-	updateMutationMu        sync.Mutex
+	updateMutationMu        *sync.Mutex
 	shutdownCtx             context.Context
 	shutdownCancel          context.CancelFunc
 }
@@ -96,6 +100,15 @@ func (s *Server) updater() Updater {
 	s.updaterMu.RLock()
 	defer s.updaterMu.RUnlock()
 	return s.Updater
+}
+
+func (s *Server) mutationGuard() *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.updateMutationMu == nil {
+		s.updateMutationMu = &sync.Mutex{}
+	}
+	return s.updateMutationMu
 }
 
 type proxyTestRequest struct {
@@ -124,6 +137,11 @@ type webUIStatusDTO struct {
 	IdleTimeoutSeconds int64      `json:"idle_timeout_seconds"`
 	IdleDeadlineAt     *time.Time `json:"idle_deadline_at,omitempty"`
 }
+
+// WebUIStatus is the state returned by lifecycle-aware UI controls. The
+// callback may be invoked by a retiring listener and must describe the current
+// listener, rather than the server that originally accepted the request.
+type WebUIStatus = webUIStatusDTO
 
 type droppedDeleteRequest struct {
 	IDs []string `json:"ids"`
@@ -297,6 +315,51 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// Retire stops accepting requests while allowing the response that changed the
+// listening address to finish. The timeout bounds old event streams and slow
+// clients. Call it outside a request handler: it waits for all tracked handlers.
+func (s *Server) Retire(timeout time.Duration) error {
+	if timeout <= 0 {
+		return s.Close()
+	}
+	s.mu.Lock()
+	s.closed = true
+	ln := s.listener
+	s.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	s.shutdownWebUIIdleTimer()
+	timer := time.AfterFunc(timeout, func() { _ = s.Close() })
+	defer timer.Stop()
+	s.wg.Wait()
+	return s.Close()
+}
+
+// CopyWebUIStateFrom transfers the UI's idle deadline to a replacement server
+// before that server starts serving requests, without changing monitor demand.
+func (s *Server) CopyWebUIStateFrom(old *Server) {
+	if old == nil || old == s {
+		return
+	}
+	// In-flight old-listener requests and new-listener requests must retain
+	// the same check-and-mutate exclusion across a listener handoff.
+	mutationMu := old.mutationGuard()
+	s.mu.Lock()
+	s.updateMutationMu = mutationMu
+	s.mu.Unlock()
+	old.webUIMu.RLock()
+	enabled, reason, disabledAt := old.webUIEnabled, old.webUIDisabledReason, old.webUIDisabledAt
+	lastRequest, idleTimeout := old.webUILastBrowserRequest, old.webUIIdleTimeout
+	old.webUIMu.RUnlock()
+	s.webUIMu.Lock()
+	s.stopWebUIIdleTimerLocked()
+	s.webUIEnabled, s.webUIDisabledReason, s.webUIDisabledAt = enabled, reason, disabledAt
+	s.webUILastBrowserRequest, s.webUIIdleTimeout = lastRequest, idleTimeout
+	s.startWebUIIdleTimerLocked(time.Now())
+	s.webUIMu.Unlock()
+}
+
 func (s *Server) trackConn(conn net.Conn) bool {
 	s.mu.Lock()
 	if s.closed {
@@ -340,6 +403,14 @@ func (s *Server) handleConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	req, err := readRequest(br)
 	if err != nil {
+		if isAgentControlPath(req.Path) {
+			status, code := 400, "invalid_json"
+			if errors.Is(err, errRequestBodyTooLarge) {
+				status, code = 413, "request_too_large"
+			}
+			writeAgentError(conn, status, &control.APIError{Code: code, Message: err.Error()})
+			return
+		}
 		if errors.Is(err, errUpdateInstallBodyTooLarge) {
 			writeText(conn, 413, err.Error())
 			return
@@ -400,6 +471,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	case "/api/control/service/resume":
 		s.handleServiceResume(conn, req)
 	default:
+		if isAgentControlPath(req.Path) {
+			s.handleAgentControl(conn, req)
+			return
+		}
 		if strings.HasPrefix(req.Path, "/api/") {
 			writeText(conn, 404, "not found")
 			return
@@ -477,6 +552,8 @@ func (s *Server) webUIStatus() webUIStatusDTO {
 	status.Paused = s.ServicePaused()
 	return status
 }
+
+func (s *Server) WebUIStatus() WebUIStatus { return s.webUIStatus() }
 
 func (s *Server) webUIStatusLocked() webUIStatusDTO {
 	status := webUIStatusDTO{
@@ -632,6 +709,15 @@ func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
 		writeEmpty(conn, 405)
 		return
 	}
+	if s.WebUIControlFunc != nil {
+		status, err := s.WebUIControlFunc(true)
+		if err != nil {
+			writeText(conn, 500, err.Error())
+			return
+		}
+		writeJSON(conn, 200, status)
+		return
+	}
 	if s.ServicePaused() && s.ResumeFunc != nil {
 		if err := s.ResumeFunc(); err != nil {
 			writeText(conn, 500, err.Error())
@@ -645,6 +731,15 @@ func (s *Server) handleWebUIEnable(conn net.Conn, req request) {
 func (s *Server) handleWebUIDisable(conn net.Conn, req request) {
 	if req.Method != "POST" {
 		writeEmpty(conn, 405)
+		return
+	}
+	if s.WebUIControlFunc != nil {
+		status, err := s.WebUIControlFunc(false)
+		if err != nil {
+			writeText(conn, 500, err.Error())
+			return
+		}
+		writeJSON(conn, 200, status)
 		return
 	}
 	s.SetWebUIEnabled(false)
@@ -713,24 +808,44 @@ func (s *Server) handleConfig(conn net.Conn, req request) {
 			writeText(conn, 400, fmt.Sprintf("invalid json: %v", err))
 			return
 		}
-		s.updateMutationMu.Lock()
+		mutationMu := s.mutationGuard()
+		mutationMu.Lock()
 		if updateService := s.updater(); updateService != nil && updateService.Status().Busy {
-			s.updateMutationMu.Unlock()
+			mutationMu.Unlock()
 			writeText(conn, 409, "configuration cannot be changed while an application update is running")
 			return
 		}
 		expectedUpdatedAt := cfg.UpdatedAt
-		if err := s.Runtime.UpdateConfigIfCurrent(cfg, expectedUpdatedAt); err != nil {
-			s.updateMutationMu.Unlock()
-			if errors.Is(err, config.ErrConfigConflict) {
-				writeText(conn, 409, err.Error())
-				return
+		var current config.Config
+		var err error
+		if s.ApplyConfigFunc != nil {
+			// Preserve older WebUI clients that omit revision while routing all
+			// actual activation (including HTTP rebinding) through Program.
+			if expectedUpdatedAt.IsZero() {
+				expectedUpdatedAt = s.Runtime.CurrentConfig().UpdatedAt
 			}
-			writeText(conn, 400, err.Error())
+			var result control.ConfigResult
+			result, err = s.ApplyConfigFunc(control.ConfigRequest{Config: cfg, ExpectedUpdatedAt: expectedUpdatedAt, AllowDisruptive: true})
+			current = result.Config
+		} else {
+			err = s.Runtime.UpdateConfigIfCurrent(cfg, expectedUpdatedAt)
+			if err == nil {
+				current = s.Runtime.CurrentConfig()
+			}
+		}
+		if err != nil {
+			mutationMu.Unlock()
+			var apiErr *control.APIError
+			if errors.As(err, &apiErr) {
+				writeText(conn, agentErrorStatus(apiErr.Code), apiErr.Message)
+			} else if errors.Is(err, config.ErrConfigConflict) {
+				writeText(conn, 409, err.Error())
+			} else {
+				writeText(conn, 400, err.Error())
+			}
 			return
 		}
-		current := s.Runtime.CurrentConfig()
-		s.updateMutationMu.Unlock()
+		mutationMu.Unlock()
 		writeJSON(conn, 200, current)
 	default:
 		writeEmpty(conn, 405)
@@ -1025,9 +1140,10 @@ func (s *Server) handleUpdateInstall(conn net.Conn, req request) {
 		writeText(conn, 400, "version must be a non-empty release tag of at most 128 bytes")
 		return
 	}
-	s.updateMutationMu.Lock()
+	mutationMu := s.mutationGuard()
+	mutationMu.Lock()
 	status, err := updateService.StartInstall(payload.Version)
-	s.updateMutationMu.Unlock()
+	mutationMu.Unlock()
 	if err != nil {
 		writeText(conn, 409, err.Error())
 		return
@@ -1049,7 +1165,11 @@ func isTrustedWebUIRequest(req request) bool {
 	if strings.TrimSpace(req.Headers["x-pitchprox-webui"]) != "1" {
 		return false
 	}
-	host := strings.TrimSpace(req.Headers["host"])
+	return isTrustedLoopbackHost(req.Headers["host"])
+}
+
+func isTrustedLoopbackHost(rawHost string) bool {
+	host := strings.TrimSpace(rawHost)
 	if host == "" {
 		return false
 	}
@@ -1238,7 +1358,7 @@ func readRequest(br *bufio.Reader) (request, error) {
 	for {
 		line, err := readLine(br)
 		if err != nil {
-			return request{}, err
+			return req, err
 		}
 		if line == "" {
 			break
@@ -1246,32 +1366,40 @@ func readRequest(br *bufio.Reader) (request, error) {
 		headerCount++
 		headerBytes += len(line)
 		if headerCount > maxHTTPHeaders || headerBytes > maxHTTPHeaderBytes {
-			return request{}, fmt.Errorf("request headers too large")
+			return req, fmt.Errorf("request headers too large")
 		}
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
-			return request{}, fmt.Errorf("invalid header")
+			return req, fmt.Errorf("invalid header")
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = strings.TrimSpace(value)
+		if isAgentControlPath(req.Path) {
+			if _, exists := req.Headers[key]; exists {
+				return req, fmt.Errorf("duplicate request header %q", key)
+			}
+		}
 		req.Headers[key] = value
 		if key == "content-length" {
 			contentLength, err = strconv.Atoi(value)
-			if err != nil || contentLength < 0 || contentLength > 8<<20 {
-				return request{}, fmt.Errorf("invalid content length")
+			if err != nil || contentLength < 0 {
+				return req, fmt.Errorf("invalid content length")
+			}
+			if contentLength > control.MaxConfigBytes {
+				return req, errRequestBodyTooLarge
 			}
 			if req.Path == "/api/update/install" && contentLength > maxUpdateInstallBodyBytes {
-				return request{}, errUpdateInstallBodyTooLarge
+				return req, errUpdateInstallBodyTooLarge
 			}
 		}
 		if key == "transfer-encoding" && strings.Contains(strings.ToLower(value), "chunked") {
-			return request{}, fmt.Errorf("chunked requests are not supported")
+			return req, fmt.Errorf("chunked requests are not supported")
 		}
 	}
 	if contentLength > 0 {
 		req.Body = make([]byte, contentLength)
 		if _, err := io.ReadFull(br, req.Body); err != nil {
-			return request{}, err
+			return req, err
 		}
 	}
 	return req, nil
@@ -1419,6 +1547,8 @@ func statusText(code int) string {
 		return "Conflict"
 	case 413:
 		return "Payload Too Large"
+	case 428:
+		return "Precondition Required"
 	case 500:
 		return "Internal Server Error"
 	case 503:
@@ -1451,6 +1581,9 @@ func shouldMarkUIActive(path string) bool {
 }
 
 func isWebUIControlPath(path string) bool {
+	if isAgentControlPath(path) {
+		return true
+	}
 	switch path {
 	case "/api/health", "/api/tray", "/api/control/stop", "/api/control/webui/status", "/api/control/webui/enable", "/api/control/webui/disable", "/api/control/service/status", "/api/control/service/pause", "/api/control/service/resume":
 		return true

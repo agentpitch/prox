@@ -5,7 +5,46 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestStoreEstablishesAndPersistsMissingRevisionOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := DefaultConfig()
+	cfg.UpdatedAt = time.Time{}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := first.Get().UpdatedAt
+	if revision.IsZero() {
+		t.Fatal("legacy configuration has no usable revision")
+	}
+	second, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Get().UpdatedAt != revision {
+		t.Fatal("loading an existing revision changed it")
+	}
+}
+
+func TestConfigRejectsUndiscoverableHTTPPorts(t *testing.T) {
+	for _, listen := range []string{"127.0.0.1:0", "localhost:http", "[::1]:65536", "127.0.0.1:-1", "127.0.0.1:"} {
+		cfg := DefaultConfig()
+		cfg.HTTP.Listen = listen
+		if _, err := Canonicalize(cfg); err == nil {
+			t.Errorf("accepted HTTP listener %q", listen)
+		}
+	}
+}
 
 func TestStoreLoadsUTF8BOMConfig(t *testing.T) {
 	tmp := t.TempDir()

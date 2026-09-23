@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agentpitch/prox/internal/config"
+	"github.com/agentpitch/prox/internal/control"
 	"github.com/agentpitch/prox/internal/monitor"
 	"github.com/agentpitch/prox/internal/proxy"
 	"github.com/agentpitch/prox/internal/rules"
@@ -103,11 +104,7 @@ func (r *Runtime) UpdateConfigIfCurrent(cfg config.Config, expectedUpdatedAt tim
 }
 
 func (r *Runtime) updateConfigIfCurrentTransitionLocked(cfg config.Config, expectedUpdatedAt time.Time) error {
-	r.mu.RLock()
-	old := config.Clone(r.cfg)
-	oldEngine := r.engine
-	oldInterception := r.interceptionEnabled
-	r.mu.RUnlock()
+	old := r.CurrentConfig()
 	if !expectedUpdatedAt.IsZero() && !expectedUpdatedAt.Equal(old.UpdatedAt) {
 		return fmt.Errorf(
 			"%w: expected updated_at %s, current %s",
@@ -117,16 +114,34 @@ func (r *Runtime) updateConfigIfCurrentTransitionLocked(cfg config.Config, expec
 		)
 	}
 
-	cfg, err := config.Canonicalize(cfg)
+	cfg, eng, newInterception, err := r.prepareConfig(cfg)
 	if err != nil {
 		return err
+	}
+	return r.applyPreparedConfigTransitionLocked(cfg, eng, newInterception)
+}
+
+func (r *Runtime) prepareConfig(cfg config.Config) (config.Config, *rules.Engine, bool, error) {
+	cfg, err := config.Canonicalize(config.Clone(cfg))
+	if err != nil {
+		return config.Config{}, nil, false, err
 	}
 	eng, err := rules.Compile(cfg, r.computerName)
 	if err != nil {
-		return err
+		return config.Config{}, nil, false, err
 	}
+	return cfg, eng, !eng.AllEnabledActionsDirect(), nil
+}
 
-	newInterception := !eng.AllEnabledActionsDirect()
+// The caller must hold transitionMu from preview/revision checking through
+// activation. Program additionally reserves a new HTTP listener before calling
+// this method, so a failed bind cannot modify the runtime or saved settings.
+func (r *Runtime) applyPreparedConfigTransitionLocked(cfg config.Config, eng *rules.Engine, newInterception bool) error {
+	r.mu.RLock()
+	old := config.Clone(r.cfg)
+	oldEngine := r.engine
+	oldInterception := r.interceptionEnabled
+	r.mu.RUnlock()
 	restart := runtimeRestartRequired(old, cfg, oldInterception, newInterception) && r.Running()
 
 	if restart {
@@ -159,9 +174,6 @@ func (r *Runtime) updateConfigIfCurrentTransitionLocked(cfg config.Config, expec
 	}
 	r.applyConfigInMemory(savedCfg, eng, newInterception)
 	r.applyConfigToMonitor(savedCfg)
-	if old.HTTP.Listen != savedCfg.HTTP.Listen {
-		r.monitor.AddLog("warn", "HTTP listener changes require service restart to take effect")
-	}
 	r.monitor.AddLog("info", "configuration updated")
 	return nil
 }
@@ -438,12 +450,7 @@ func (r *Runtime) stopActiveLocked() error {
 }
 
 func runtimeRestartRequired(oldCfg, newCfg config.Config, oldInterception, newInterception bool) bool {
-	return oldInterception != newInterception ||
-		oldCfg.Transparent.ListenerPort != newCfg.Transparent.ListenerPort ||
-		oldCfg.Transparent.IPv4Listener != newCfg.Transparent.IPv4Listener ||
-		oldCfg.Transparent.IPv6Listener != newCfg.Transparent.IPv6Listener ||
-		oldCfg.Transparent.SniffBytes != newCfg.Transparent.SniffBytes ||
-		oldCfg.Transparent.SniffTimeout != newCfg.Transparent.SniffTimeout
+	return control.RuntimeRestartRequired(oldCfg, newCfg, oldInterception, newInterception)
 }
 
 func (r *Runtime) route(flow proxy.Flow, sniff proxy.SniffResult) (proxy.RouteResult, config.Config, error) {

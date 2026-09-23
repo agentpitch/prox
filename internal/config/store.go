@@ -55,6 +55,14 @@ func (s *Store) LoadOrCreate() error {
 	if err != nil {
 		return fmt.Errorf("validate config: %w", err)
 	}
+	if cfg.UpdatedAt.IsZero() {
+		// Older/manually prepared files may lack a revision. Establish and
+		// persist one at startup so compare-and-swap control writes are usable.
+		cfg.UpdatedAt = time.Now().UTC()
+		if err := s.saveConfigLocked(cfg); err != nil {
+			return err
+		}
+	}
 	s.cfg = cfg
 	return nil
 }

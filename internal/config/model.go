@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -214,12 +215,15 @@ func Validate(cfg Config) error {
 	if cfg.HTTP.Listen == "" {
 		return fmt.Errorf("http.listen is required")
 	}
-	host, _, err := net.SplitHostPort(cfg.HTTP.Listen)
+	host, port, err := net.SplitHostPort(cfg.HTTP.Listen)
 	if err != nil {
 		return fmt.Errorf("http.listen must be host:port: %v", err)
 	}
 	if !isLoopbackHTTPHost(host) {
 		return fmt.Errorf("http.listen must use a loopback host")
+	}
+	if number, err := strconv.ParseUint(port, 10, 16); err != nil || number == 0 {
+		return fmt.Errorf("http.listen port must be numeric and in 1..65535")
 	}
 	if cfg.Transparent.ListenerPort < 1 || cfg.Transparent.ListenerPort > 65535 {
 		return fmt.Errorf("transparent.listener_port must be in 1..65535")

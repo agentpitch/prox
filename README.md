@@ -159,6 +159,11 @@ One rule may still contain multiple Applications, Target hosts, and Target ports
 
 ## Config file
 
+For headless agents, use `pitchProx.exe ctl help` and `pitchProx.exe ctl schema`.
+The CLI can read, validate, preview and apply settings and individual rules even
+while the WebUI is disabled. See [Agent CLI](docs/AGENT_CLI.md) for revision-safe
+writes, connection-preserving reloads, HTTP listener handoff and examples.
+
 pitchProx stores its config next to the executable:
 
 ```text

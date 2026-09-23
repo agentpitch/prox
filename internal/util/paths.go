@@ -26,6 +26,18 @@ func DefaultDataDir() string {
 }
 
 func ConfigPath() string {
+	path := ConfigPathReadOnly()
+	if os.Getenv("PITCHPROX_CONFIG") == "" && os.Getenv("MYPROX_CONFIG") == "" {
+		if exe, err := os.Executable(); err == nil && path == filepath.Join(filepath.Dir(exe), portableConfigName) {
+			migrateLegacyFile(path, legacyConfigCandidates())
+		}
+	}
+	return path
+}
+
+// ConfigPathReadOnly is safe for discovery commands: resolving an address must
+// never create or migrate configuration files in a stopped installation.
+func ConfigPathReadOnly() string {
 	if override := os.Getenv("PITCHPROX_CONFIG"); override != "" {
 		return override
 	}
@@ -33,9 +45,7 @@ func ConfigPath() string {
 		return override
 	}
 	if exe, err := os.Executable(); err == nil {
-		portable := filepath.Join(filepath.Dir(exe), portableConfigName)
-		migrateLegacyFile(portable, legacyConfigCandidates())
-		return portable
+		return filepath.Join(filepath.Dir(exe), portableConfigName)
 	}
 	return filepath.Join(DefaultDataDir(), "config.json")
 }

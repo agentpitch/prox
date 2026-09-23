@@ -38,7 +38,102 @@ Behavior:
   running, so the helper restarts the exact listener/service identity captured
   for that transaction.
 
-Transparent-listener and routing changes are applied by a transactional runtime restart; if activation fails, the previous runtime/configuration is restored. Changing the HTTP listen address still requires a service/process restart.
+Ordinary rule/proxy changes are hot-reloaded for new connections. Changing
+transparent listener/sniff settings or entering/leaving interception restarts
+the routing runtime transactionally; activation failure restores the previous
+configuration. When hosted by `Program`, changing the HTTP address pre-binds a
+replacement listener, applies the config, returns the response through the old
+listener and retires it with a bounded drain. The process does not restart.
+Legacy WebUI PUT permits disruptive changes; agents should use the explicit
+preview and disruption controls below.
+
+## Headless agent control, protocol v1
+
+See [AGENT_CLI.md](AGENT_CLI.md) or `pitchProx.exe ctl schema` for CLI examples.
+These endpoints remain available while WebUI is disabled/idle-paused and do not
+mark the UI active or renew its idle timer. Every request requires
+`X-PitchProx-Agent: 1`, a loopback peer and a loopback Host. Browser Origin
+headers and non-local Fetch Metadata are rejected; CORS is not enabled.
+
+### `GET /api/control/agent/status`
+
+Returns `protocol_version`, `version`, `pid`, `updated_at`,
+`listening_address`, `service_paused`, and `webui_enabled`. The address is the
+actual listening socket; the revision belongs to the active configuration.
+
+### `GET /api/control/agent/config`
+
+Returns the raw full Config, including proxy credentials and `updated_at`.
+There is no wrapper, allowing direct export/edit/import. It performs no writes.
+
+### `POST /api/control/agent/config/validate`
+
+Validates and previews an entire proposed configuration. The server forces
+`dry_run:true`; it never binds, activates or saves. `expected_updated_at` is
+optional for preview; if supplied, it must match the live revision.
+
+### `PUT /api/control/agent/config`
+
+Request, with the full Config in `config`:
+
+```json
+{
+  "config": {},
+  "expected_updated_at": "2026-09-23T08:00:00.123456789Z",
+  "dry_run": false,
+  "allow_disruptive": false
+}
+```
+
+The empty object above is only a placeholder for the complete configuration.
+PUT always requires a nonzero expected revision, including PUT dry-runs.
+Unknown/duplicate/wrong-case JSON fields, null scalar settings, multiple
+documents and payloads above 8 MiB are rejected. Invalid UTF-8 is rejected; BOM is accepted;
+null collections are accepted for compatibility with normal exports.
+
+Response:
+
+```json
+{
+  "config": {},
+  "previous_updated_at": "2026-09-23T08:00:00.123456789Z",
+  "applied": true,
+  "plan": {
+    "mode": "hot_reload",
+    "runtime_restart": false,
+    "http_rebind": false,
+    "connections_preserved": true,
+    "listening_address": "127.0.0.1:18080",
+    "reasons": ["New rules and proxy settings apply to new connections; existing connections keep their established route"]
+  }
+}
+```
+
+`config` contains the resulting saved configuration and new revision after
+apply, the current configuration after a no-op, or the proposed canonical
+configuration after preview. No-op/preview returns `applied:false`.
+`mode` is `no_change`, `hot_reload`, `listener_rebind`, or `runtime_restart`.
+The latter requires `allow_disruptive:true`; HTTP rebinding alone does not.
+Paused routing stays paused. Listener replacement preserves WebUI state/deadline.
+Revision checking, planning and activation form one serialized operation.
+
+Errors are JSON: `{"error":{"code":"revision_conflict","message":"...","current_updated_at":"..."}}`.
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 400 | `invalid_json`, `invalid_config` | Invalid document or rules |
+| 403 | `forbidden` | Not a permitted local agent request |
+| 409 | `revision_conflict` | Reload and reconcile current configuration |
+| 409 | `disruptive_change` | Preview, then explicitly allow runtime restart |
+| 409 | `update_busy` | Executable update is in progress |
+| 413 | `request_too_large` | Request exceeds the body limit |
+| 428 | `revision_required` | Read the current revision before a PUT |
+| 500 | `activation_failed` | Binding/activation/save failed; inspect the message |
+| 503 | `unavailable` | Application control is stopping/unavailable |
+
+Do not blindly retry a PUT after a transport failure: activation may already
+have succeeded, especially during listener handoff. Read back config/revision
+using the old or proposed new address. CLI exit code 8 represents this case.
 
 ## `GET /api/snapshot`
 

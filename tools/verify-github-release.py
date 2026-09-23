@@ -94,6 +94,7 @@ def verify_assets(assets, expected, *, allow_partial=False):
     ):
         raise GateError("Release must expose exactly the four packaged assets")
     seen = set()
+    seen_ids = set()
     for asset in assets:
         if not isinstance(asset, dict):
             raise GateError("Release asset metadata is invalid")
@@ -101,6 +102,10 @@ def verify_assets(assets, expected, *, allow_partial=False):
         if not isinstance(name, str) or name not in expected or name in seen:
             raise GateError("Release asset names are missing, duplicated, or unexpected")
         seen.add(name)
+        asset_id = asset.get("id")
+        if type(asset_id) is not int or not 0 < asset_id <= (1 << 63) - 1 or asset_id in seen_ids:
+            raise GateError(f"Release asset ID is invalid or duplicated: {name}")
+        seen_ids.add(asset_id)
         size, digest = expected[name]
         if asset.get("state") != "uploaded":
             raise GateError(f"Release asset is not fully uploaded: {name}")

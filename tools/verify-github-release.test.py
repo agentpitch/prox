@@ -23,8 +23,8 @@ class ReleaseGateTests(unittest.TestCase):
     def setUp(self):
         self.expected = {name: (index + 1, "sha256:" + str(index) * 64) for index, name in enumerate(gate.ASSET_NAMES)}
         self.assets = [
-            {"name": name, "state": "uploaded", "size": size, "digest": digest}
-            for name, (size, digest) in self.expected.items()
+            {"id": index + 100, "name": name, "state": "uploaded", "size": size, "digest": digest}
+            for index, (name, (size, digest)) in enumerate(self.expected.items())
         ]
         self.release = {"id": 42, "tag_name": "v0.44.1", "draft": False, "prerelease": False, "assets": self.assets}
 
@@ -130,6 +130,18 @@ class ReleaseGateTests(unittest.TestCase):
         for assets in bad_sets:
             with self.subTest(assets=assets), self.assertRaises(gate.GateError):
                 gate.verify_assets(assets, self.expected, allow_partial=True)
+
+    def test_asset_ids_must_be_unique_positive_int64_values(self):
+        for value in (None, 0, -1, True, "100", 1 << 63):
+            for partial in (False, True):
+                assets = copy.deepcopy(self.assets)
+                assets[0]["id"] = value
+                with self.subTest(value=value, partial=partial), self.assertRaisesRegex(gate.GateError, "asset ID"):
+                    gate.verify_assets(assets, self.expected, allow_partial=partial)
+        assets = copy.deepcopy(self.assets)
+        assets[1]["id"] = assets[0]["id"]
+        with self.assertRaisesRegex(gate.GateError, "asset ID"):
+            gate.verify_assets(assets, self.expected)
 
     def test_current_public_does_not_fall_back_past_corrupt_nested_metadata(self):
         bad_asset = {**self.assets[0], "digest": "sha256:" + "f" * 64}

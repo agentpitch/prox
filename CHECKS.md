@@ -56,7 +56,7 @@ Node.js v22.17.0
 node --check internal/webui/dist/rules-ui.js
 node --check internal/webui/dist/app.js
 node --test internal/webui/rules_ui_test.js internal/webui/lifecycle_test.js
-go1.26.5 windows/amd64, GOAMD64=v1, CGO_ENABLED=0
+go1.26.8 windows/amd64, GOAMD64=v1, CGO_ENABLED=0
 GOWORK=off, GOENV=off, default GOEXPERIMENT/GOFIPS140, exact repository go.mod
 go mod download + verify with GOFLAGS=-mod=readonly
 go test -mod=readonly -count=1 -cover ./...
@@ -65,6 +65,9 @@ git diff --check and git show --check HEAD
 physical working-tree EOLs match .gitattributes
 go build -mod=readonly -trimpath -buildvcs=true with the Windows GUI subsystem
 ```
+
+Before packaging, GitHub CI also runs the pinned `govulncheck` v1.8.0 against
+the current Go vulnerability database and rejects reachable vulnerabilities.
 
 Release packaging additionally:
 

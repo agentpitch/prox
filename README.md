@@ -69,7 +69,7 @@ In service mode the process is headless. The service does not display a tray ico
 Requirements:
 
 - Windows 10/11 x64
-- Go with toolchain switching support; release builds force the exact `go1.26.5` toolchain
+- Go with toolchain switching support; release builds force the exact `go1.26.8` toolchain
 - Node.js `22.17.0` for release-candidate WebUI checks
 - the exact official WinDivert `2.2.2` x64 runtime
 
@@ -98,7 +98,7 @@ Or invoke the same script directly:
 ```
 
 Both entry points force `windows/amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`,
-`-mod=readonly`, `-trimpath`, Go `1.26.5`, and `GOWORK=off`. Release builds also
+`-mod=readonly`, `-trimpath`, Go `1.26.8`, and `GOWORK=off`. Release builds also
 ignore per-user Go environment files and reject unexpected experiment/FIPS
 modes. Go may download the pinned toolchain on the first build. A missing
 WinDivert runtime produces a development-build warning; an existing runtime in
@@ -360,7 +360,7 @@ Use:
 If you build manually and want the same behavior, use:
 
 ```powershell
-$env:GOTOOLCHAIN = 'go1.26.5'
+$env:GOTOOLCHAIN = 'go1.26.8'
 $env:GOOS = 'windows'
 $env:GOARCH = 'amd64'
 $env:GOAMD64 = 'v1'

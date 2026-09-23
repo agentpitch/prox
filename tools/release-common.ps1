@@ -1,5 +1,5 @@
 $PitchProxReleaseSettings = [ordered]@{
-    GoVersion                = "go1.26.5"
+    GoVersion                = "go1.26.8"
     NodeVersion              = "v22.17.0"
     GOOS                     = "windows"
     GOARCH                   = "amd64"

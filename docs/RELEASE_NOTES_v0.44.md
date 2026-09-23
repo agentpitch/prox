@@ -2,6 +2,8 @@
 
 ## Background efficiency and reliability
 
+- Build with Go 1.26.8, including standard-library security fixes released
+  after the previous Go 1.26.5 pin.
 - Reduce temporary allocations while detecting HTTP hostnames and matching rules.
 - Avoid frequent full map rebuilds while many connections remain active; release
   high-water capacity after traffic bursts.
@@ -64,9 +66,11 @@ remain under user control.
 
 ## Verification
 
-Release packaging requires a clean committed source tree, Go 1.26.5,
+Release packaging requires a clean committed source tree, Go 1.26.8,
 Node.js 22.17.0, Go tests/vet, JavaScript checks and tests, exact runtime hashes,
 clean VCS metadata, a build manifest and verified SHA-256 checksums.
+GitHub CI also checks for reachable known Go vulnerabilities with pinned
+`govulncheck` v1.8.0 before packaging.
 Windows race-detector tests and isolated GUI-subsystem executable/CLI checks
 also passed during preparation, including revision conflicts, rollback,
 runtime restart and listener handoff with unchanged PID.

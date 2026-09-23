@@ -22,7 +22,7 @@ it as a published supply-chain input.
 
 The release path fixes:
 
-- Go `1.26.5`;
+- Go `1.26.8`;
 - Node.js `22.17.0` for WebUI checks;
 - `windows/amd64`, `GOAMD64=v1`, and `CGO_ENABLED=0`;
 - read-only Go module mode, `GOWORK=off`, `GOENV=off`, default experiment/FIPS modes, and `-trimpath`;
@@ -37,7 +37,9 @@ with `vcs.modified=false`.
 
 ## Workflow output
 
-The Windows job runs WebUI syntax/unit checks, Go tests, `go vet`, builds the GUI
+The Windows job checks reachable vulnerabilities with pinned `govulncheck`
+v1.8.0 against the current Go vulnerability database, runs WebUI syntax/unit
+checks, Go tests and `go vet`, builds the GUI
 subsystem executable, verifies WinDivert, and creates:
 
 - `pitchProx.exe` — standalone update executable;

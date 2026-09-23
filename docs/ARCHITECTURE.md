@@ -211,7 +211,7 @@ Responsibilities:
 
 - hidden tray window;
 - dynamic icon rendering;
-- double-click open;
+- double-click opens `/#/monitor` with the **All** connection tab and cleared search/process/rule filters;
 - context menu;
 - lightweight traffic polling in diagnostic mode;
 - in-process provider mode in desktop mode.

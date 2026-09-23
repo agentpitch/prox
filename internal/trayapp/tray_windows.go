@@ -346,7 +346,7 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 		event := uint32(lParam) & 0xFFFF
 		switch event {
 		case wmLButtonDblClk, ninKeySelect:
-			h.openManagement()
+			h.openPage("/monitor?filter=all")
 			return 0
 		case wmRButtonUp, wmContextMenu:
 			h.showContextMenu()
@@ -385,6 +385,10 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 }
 
 func (h *helper) openManagement() {
+	h.openPage("")
+}
+
+func (h *helper) openPage(fragment string) {
 	if ctl := h.serviceController(); ctl != nil && ctl.ServicePaused() {
 		if err := ctl.ResumeService(); err != nil {
 			return
@@ -399,7 +403,14 @@ func (h *helper) openManagement() {
 		}
 	}
 	if h.url != "" {
-		_ = util.OpenBrowser(h.url)
+		target, err := url.Parse(h.url)
+		if err != nil {
+			return
+		}
+		if fragment != "" {
+			target.Fragment = fragment
+		}
+		_ = util.OpenBrowser(target.String())
 	}
 }
 

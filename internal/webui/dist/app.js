@@ -195,6 +195,20 @@ function routeFromHash() {
   return PAGE_META[value] ? value : 'rules';
 }
 
+function applyMonitorRouteOptions() {
+  const params = new URLSearchParams(String(location.hash || '').split('?')[1] || '');
+  if (params.get('filter') !== 'all') return;
+  ui.connFilter = 'all';
+  ui.connSearch = '';
+  ui.focus = blankFocus();
+  writeStorage(sessionStorage, 'pitchprox_conn_filter', ui.connFilter);
+  writeStorage(sessionStorage, 'pitchprox_conn_search', ui.connSearch);
+  // Consume the tray's opening preference so later navigation keeps user choices.
+  params.delete('filter');
+  const query = params.toString();
+  history.replaceState(history.state, '', `#/monitor${query ? `?${query}` : ''}`);
+}
+
 function routeNeedsLive(route = ui.route) {
   return route === 'monitor' || route === 'logs';
 }
@@ -233,6 +247,7 @@ function setRoute(nextRoute, options = {}) {
     location.hash = `#/${route}`;
     return;
   }
+  if (route === 'monitor') applyMonitorRouteOptions();
   const previous = ui.route;
   const routeChanged = previous !== route;
   ui.route = route;

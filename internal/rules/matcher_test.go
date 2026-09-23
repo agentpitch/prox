@@ -1,11 +1,47 @@
 package rules
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 
 	"github.com/agentpitch/prox/internal/config"
 )
+
+func TestLargeRuleSetNormalizesOnceWithoutChangingFirstMatch(t *testing.T) {
+	cfg := config.Config{}
+	for i := 0; i < 256; i++ {
+		cfg.Rules = append(cfg.Rules, config.Rule{
+			ID: fmt.Sprintf("miss-%d", i), Enabled: true,
+			Applications: "other.exe", TargetHosts: "*.invalid", TargetPorts: "443", Action: config.ActionBlock,
+		})
+	}
+	cfg.Rules = append(cfg.Rules, config.Rule{
+		ID: "winner", Enabled: true, Applications: `C:\Apps\*.EXE; browser.exe`,
+		TargetHosts: "*.EXAMPLE.COM; AnyHost.invalid", TargetPorts: "443", Action: config.ActionProxy,
+	})
+	eng, err := Compile(cfg, "WORKSTATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{AppPath: " C:/Apps/Browser.EXE ", Hostname: " API.Example.COM ", TargetPort: 443}
+	want := MatchDetails{Application: `c:\apps\*.exe`, Host: "*.example.com", Port: "443"}
+	for name, match := range map[string]func() Decision{
+		"match":     func() Decision { return eng.Match(req) },
+		"preflight": func() Decision { return eng.Preflight(req).Decision },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := match(); got.RuleID != "winner" || got.Match != want {
+				t.Fatalf("decision = %+v, want winner with %+v", got, want)
+			}
+			// The budget allows path separator conversion, path casing and host
+			// casing, but must not grow with the number of visited rules.
+			if allocs := testing.AllocsPerRun(100, func() { _ = match() }); allocs > 4 {
+				t.Fatalf("allocations per decision = %v, want <= 4", allocs)
+			}
+		})
+	}
+}
 
 func TestEngineMatch(t *testing.T) {
 	cfg := config.Config{Rules: []config.Rule{

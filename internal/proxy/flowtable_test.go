@@ -149,6 +149,27 @@ func TestFlowTableHighWaterChurnReleasesAndSignalsOnce(t *testing.T) {
 	}
 }
 
+func TestFlowTableSteadyChurnDoesNotRebuildLiveSet(t *testing.T) {
+	table := benchmarkFlowTable(1024)
+	flow, _ := table.Lookup(netip.MustParseAddr("192.0.2.10"), 40000)
+	flow.ClientPort = 60000
+	// A steady stream of short connections alongside long-lived ones should
+	// reuse the table without allocating maps proportional to the live set.
+	allocs := testing.AllocsPerRun(256, func() {
+		table.Register(flow)
+		table.Delete(flow.ClientIP, flow.ClientPort)
+	})
+	if allocs > 1 {
+		t.Fatalf("steady connection churn allocates %.1f times per connection", allocs)
+	}
+	for port := uint16(40000); port < 41023; port++ {
+		table.Delete(flow.ClientIP, port)
+	}
+	if table.Len() != 1 || table.peak > flowMapCompactDeletes {
+		t.Fatalf("burst did not compact around surviving flow: len=%d peak=%d", table.Len(), table.peak)
+	}
+}
+
 func BenchmarkFlowTableRedirectPacketUntracked(b *testing.B) {
 	table := benchmarkFlowTable(1024)
 	src := netip.MustParseAddr("203.0.113.10")

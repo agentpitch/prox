@@ -42,6 +42,7 @@ type Store struct {
 	retry                   chan struct{}
 	flushNow                chan struct{}
 	stop                    chan struct{}
+	closed                  bool
 	closeOnce               sync.Once
 	closeErr                error
 	lastError               string
@@ -162,7 +163,14 @@ func Open(path string, retention time.Duration) (*Store, error) {
 }
 
 func (s *Store) Close() error {
-	s.closeOnce.Do(func() { close(s.stop) })
+	s.closeOnce.Do(func() {
+		// Serialize final-flush admission with producers: an accepted record
+		// must precede the stop signal and be included in the final flush.
+		s.mu.Lock()
+		s.closed = true
+		close(s.stop)
+		s.mu.Unlock()
+	})
 	s.wg.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -225,6 +233,10 @@ func (s *Store) DiagnosticStats() DiagnosticStats {
 
 func (s *Store) RecordLog(entry LogRecord) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	if len(s.pendingLogs) >= maxPendingLogs {
 		s.discardedPending.Add(1)
 		s.mu.Unlock()
@@ -244,6 +256,10 @@ func (s *Store) RecordLog(entry LogRecord) {
 
 func (s *Store) RecordConnection(entry ConnectionRecord) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	if len(s.pendingConnections) >= maxPendingConnections {
 		s.discardedPending.Add(1)
 		s.mu.Unlock()
@@ -279,6 +295,10 @@ func (s *Store) RecordDroppedConnection(entry ConnectionRecord) {
 		Connection: entry,
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	if len(s.pendingDropped) >= maxPendingDropped {
 		s.discardedPending.Add(1)
 		s.mu.Unlock()
@@ -303,6 +323,10 @@ func (s *Store) AddTraffic(ts time.Time, upBytes, downBytes int64) {
 	bucket := ts.UTC().Truncate(time.Second)
 	key := bucket.Unix()
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	wasEmpty := s.pendingEmptyLocked()
 	item, exists := s.pendingTraffic[key]
 	if !exists && len(s.pendingTraffic) >= maxPendingTrafficBuckets {
@@ -385,6 +409,10 @@ func (s *Store) addRuleConditionActivity(ts time.Time, activity RuleActivity) {
 	detailKey := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityPendingIdentity(activity))
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	wasEmpty := s.pendingEmptyLocked()
 	item, exists := s.pendingRule[detailKey]
 	if exists {
@@ -473,6 +501,10 @@ func (s *Store) addRuleActivity(ts time.Time, activity RuleActivity) {
 	bucket := eventTime.Truncate(ruleActivityWriteBucket)
 	key := fmt.Sprintf("%d\x1f%s", bucket.Unix(), ruleActivityPendingIdentity(activity))
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	wasEmpty := s.pendingEmptyLocked()
 	item, exists := s.pendingRule[key]
 	if !exists && len(s.pendingRule) >= maxPendingRuleBuckets {
@@ -1197,9 +1229,21 @@ func (s *Store) enforceDroppedLimit() error {
 	if info.Size() <= maxBytes {
 		return nil
 	}
-	start, err := nextLineOffset(path, info.Size()-maxBytes)
+	// Leave 1/8 of the budget free after compaction. Trimming only the bytes
+	// that overflowed rewrites nearly the entire file on every blocked batch
+	// once full (up to 1 GiB). Headroom amortizes that background disk/CPU cost.
+	targetBytes := maxBytes - maxBytes/8
+	start, err := nextLineOffset(path, info.Size()-targetBytes)
 	if err != nil {
 		return err
+	}
+	if start == info.Size() {
+		// A single large newest record may fit the configured limit but not
+		// the headroom target. Preserve it whenever the hard limit permits.
+		start, err = nextLineOffset(path, info.Size()-maxBytes)
+		if err != nil {
+			return err
+		}
 	}
 	return rewriteFileTail(path, start)
 }
@@ -1389,6 +1433,13 @@ func nextLineOffset(path string, offset int64) (int64, error) {
 		return 0, fmt.Errorf("open dropped log for compaction: %w", err)
 	}
 	defer f.Close()
+	var previous [1]byte
+	if _, err := f.ReadAt(previous[:], offset-1); err != nil {
+		return 0, fmt.Errorf("read dropped log compaction boundary: %w", err)
+	}
+	if previous[0] == '\n' {
+		return offset, nil
+	}
 	buf := make([]byte, 64*1024)
 	pos := offset
 	for {

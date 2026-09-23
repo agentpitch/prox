@@ -229,10 +229,19 @@ func (c *OwnerCache) ForceRefresh() error {
 }
 
 func compactExeCache(cache map[uint32]exeCacheEntry, now time.Time) map[uint32]exeCacheEntry {
-	if len(cache) == 0 {
+	if cache == nil {
 		return map[uint32]exeCacheEntry{}
 	}
-	next := map[uint32]exeCacheEntry{}
+	live := 0
+	for _, entry := range cache {
+		if now.Before(entry.Expires) {
+			live++
+		}
+	}
+	if live == len(cache) {
+		return cache
+	}
+	next := make(map[uint32]exeCacheEntry, live)
 	for pid, entry := range cache {
 		if now.Before(entry.Expires) {
 			next[pid] = entry

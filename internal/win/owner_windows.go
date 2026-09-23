@@ -145,12 +145,22 @@ func loadTCP4Table(tableClass uint32) ([]mibTCPRowOwnerPID, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rows := make([]mibTCPRowOwnerPID, 0, n)
+	return decodeTCP4Table(buf)
+}
+
+func decodeTCP4Table(buf []byte) ([]mibTCPRowOwnerPID, error) {
+	if len(buf) < 4 {
+		return nil, fmt.Errorf("truncated IPv4 TCP owner table header")
+	}
+	n := binary.LittleEndian.Uint32(buf[:4])
 	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
 	if uint64(n)*uint64(rowSize)+4 > uint64(len(buf)) {
 		return nil, fmt.Errorf("truncated IPv4 TCP owner table")
 	}
+	if n == 0 {
+		return nil, nil
+	}
+	rows := make([]mibTCPRowOwnerPID, 0, n)
 	base := unsafe.Pointer(&buf[4])
 	for i := uint32(0); i < n; i++ {
 		row := *(*mibTCPRowOwnerPID)(unsafe.Add(base, uintptr(i)*rowSize))
@@ -164,12 +174,22 @@ func loadTCP6Table(tableClass uint32) ([]mibTCP6RowOwnerPID, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rows := make([]mibTCP6RowOwnerPID, 0, n)
+	return decodeTCP6Table(buf)
+}
+
+func decodeTCP6Table(buf []byte) ([]mibTCP6RowOwnerPID, error) {
+	if len(buf) < 4 {
+		return nil, fmt.Errorf("truncated IPv6 TCP owner table header")
+	}
+	n := binary.LittleEndian.Uint32(buf[:4])
 	rowSize := unsafe.Sizeof(mibTCP6RowOwnerPID{})
 	if uint64(n)*uint64(rowSize)+4 > uint64(len(buf)) {
 		return nil, fmt.Errorf("truncated IPv6 TCP owner table")
 	}
+	if n == 0 {
+		return nil, nil
+	}
+	rows := make([]mibTCP6RowOwnerPID, 0, n)
 	base := unsafe.Pointer(&buf[4])
 	for i := uint32(0); i < n; i++ {
 		row := *(*mibTCP6RowOwnerPID)(unsafe.Add(base, uintptr(i)*rowSize))

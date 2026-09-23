@@ -215,17 +215,23 @@ func (m *Manager) Check(ctx context.Context) (CheckResult, error) {
 	}
 	unresolved := planPresent && (m.status.Phase == PhaseFailed || m.status.Phase == PhaseSucceeded)
 	unresolvedStatus := m.status
+	ctx, cancel := context.WithCancel(ctx)
+	m.cancel = cancel
 	m.active = true
+	m.wg.Add(1)
 	if !unresolved {
 		m.status = Status{Phase: PhaseChecking, Busy: true, Message: "Проверка релизов GitHub…", UpdatedAt: time.Now().UTC()}
 	}
 	m.mu.Unlock()
+	defer m.wg.Done()
+	defer cancel()
 
 	releases, err := m.source.ListReleases(ctx)
 	now := time.Now().UTC()
 	visibleReleases := limitVisibleReleases(releases)
 	m.mu.Lock()
 	m.active = false
+	m.cancel = nil
 	if err != nil {
 		if unresolved && transactionPlanExists(m.directory) {
 			m.status = unresolvedStatus

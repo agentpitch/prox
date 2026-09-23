@@ -32,7 +32,10 @@ type FlowTable struct {
 	onEmpty func()
 }
 
-const flowMapCompactDeletes = 64
+const (
+	flowMapCompactDeletes = 64
+	flowMapCompactRatio   = 4
+)
 
 type RedirectDirection uint8
 
@@ -156,7 +159,10 @@ func (t *FlowTable) compactMaybeLocked() {
 		t.peak = 0
 		return
 	}
-	if t.deletes < flowMapCompactDeletes {
+	// Rebuilding on a fixed number of closes copies every long-lived flow
+	// repeatedly under steady traffic. Compact only after the live set shrinks
+	// substantially; ordinary churn can reuse the map's existing capacity.
+	if t.deletes < flowMapCompactDeletes || len(t.flows) > t.peak/flowMapCompactRatio {
 		return
 	}
 	next := make(map[flowKey]Flow, len(t.flows))

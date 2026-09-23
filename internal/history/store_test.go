@@ -13,6 +13,118 @@ import (
 	"github.com/agentpitch/prox/internal/config"
 )
 
+func BenchmarkDroppedLogAtCapacity(b *testing.B) {
+	store := &Store{root: b.TempDir()}
+	const limit = 1024 * 1024
+	store.droppedMaxBytes.Store(limit)
+	line := []byte("{\"drop_id\":\"" + strings.Repeat("s", 240) + "\"}\n")
+	if err := os.WriteFile(store.droppedPath(), bytes.Repeat(line, limit/len(line)), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	batch := bytes.Repeat(line, 16)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(batch)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		file, err := os.OpenFile(store.droppedPath(), os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, writeErr := file.Write(batch)
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			b.Fatalf("append: %v, close: %v", writeErr, closeErr)
+		}
+		if err := store.enforceDroppedLimit(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestClosedStoreDoesNotRetainLateTelemetry(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history"), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	store.RecordLog(LogRecord{Time: now, Level: "warn", Message: "before close"})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordLog(LogRecord{Time: now, Message: "late log"})
+	store.RecordConnection(ConnectionRecord{ID: "late connection"})
+	store.RecordDroppedConnection(ConnectionRecord{ID: "late drop"})
+	store.AddTraffic(now, 1, 2)
+	store.AddRuleActivity(now, "rule", "Rule", config.ActionProxy, 1, 2, 3)
+	store.AddRuleConditionHit(now, "rule", "Rule", config.ActionProxy, "app", "host", "443", RuleConditionSourceIntercepted)
+	store.mu.Lock()
+	empty := store.pendingEmptyLocked()
+	admissionKeys := len(store.conditionAdmissionKeys)
+	store.mu.Unlock()
+	if !empty || admissionKeys != 0 {
+		t.Fatalf("closed store retained undrainable telemetry: %+v", store.DiagnosticStats())
+	}
+	logs, err := store.queryLogs(now.Add(-time.Second))
+	if err != nil || len(logs) != 1 || logs[0].Message != "before close" {
+		t.Fatalf("final-flush logs = %+v, error = %v", logs, err)
+	}
+}
+
+func TestDroppedLogCompactionLeavesHeadroom(t *testing.T) {
+	store := &Store{root: t.TempDir()}
+	line := []byte("{\"drop_id\":\"" + strings.Repeat("s", 240) + "\"}\n")
+	limit := int64(16 * len(line))
+	store.droppedMaxBytes.Store(limit)
+	if err := os.WriteFile(store.droppedPath(), bytes.Repeat(line, 20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.enforceDroppedLimit(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(store.droppedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(14 * len(line)); info.Size() != want {
+		t.Fatalf("compacted size = %d, want %d with 1/8 headroom", info.Size(), want)
+	}
+	file, err := os.OpenFile(store.droppedPath(), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.Write(line)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("append = %v, close = %v", writeErr, closeErr)
+	}
+	if err := store.enforceDroppedLimit(); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(store.droppedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(15 * len(line)); info.Size() != want {
+		t.Fatalf("next batch compacted again: size = %d, want %d", info.Size(), want)
+	}
+}
+
+func TestDroppedLogHeadroomPreservesLargeNewestRecord(t *testing.T) {
+	store := &Store{root: t.TempDir()}
+	store.droppedMaxBytes.Store(1024)
+	line := []byte("{\"drop_id\":\"" + strings.Repeat("s", 936) + "\"}\n")
+	if err := os.WriteFile(store.droppedPath(), bytes.Repeat(line, 2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.enforceDroppedLimit(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(store.droppedPath())
+	if err != nil || !bytes.Equal(got, line) {
+		t.Fatalf("newest record size = %d, want %d; error = %v", len(got), len(line), err)
+	}
+}
+
 func TestStoreSnapshotRoundTrip(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "pitchProx.history")
 	store, err := Open(root, 10*time.Minute)

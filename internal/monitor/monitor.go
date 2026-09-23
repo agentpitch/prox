@@ -522,10 +522,7 @@ func (b *Bus) publishLog(entry LogEntry) {
 	if b.history != nil {
 		b.history.RecordLog(toHistoryLog(entry))
 	}
-	payload := b.mustJSON(Event{Type: "log", Data: entry})
-	b.mu.Lock()
-	b.broadcastLocked(payload)
-	b.mu.Unlock()
+	b.PublishTransientEvent("log", entry)
 }
 
 // PublishTransientEvent broadcasts control-plane state to the currently open
@@ -533,6 +530,14 @@ func (b *Bus) publishLog(entry LogEntry) {
 // bounded by the existing per-subscriber queues, just like live log events.
 func (b *Bus) PublishTransientEvent(eventType string, data interface{}) {
 	if b == nil || strings.TrimSpace(eventType) == "" {
+		return
+	}
+	// Background operation has no event consumers. In particular, warning
+	// logs still belong in history but need no second JSON encoding for SSE.
+	b.mu.RLock()
+	hasSubscribers := len(b.subs) != 0
+	b.mu.RUnlock()
+	if !hasSubscribers {
 		return
 	}
 	payload := b.mustJSON(Event{Type: eventType, Data: data})
@@ -810,7 +815,10 @@ func (b *Bus) compactActiveMaybeLocked() {
 		b.activeDeletes = 0
 		return
 	}
-	if b.activeDeletes < mapCompactDeletes {
+	// Rebuilding after a fixed number of closes copies the whole live map
+	// repeatedly during large bursts. Require proportional turnover so both
+	// burst drainage and steady connection churn have amortized linear cost.
+	if b.activeDeletes < mapCompactDeletes || b.activeDeletes < len(b.active) {
 		return
 	}
 	next := make(map[string]Connection, len(b.active))

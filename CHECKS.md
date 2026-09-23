@@ -1,5 +1,9 @@
 # Verification notes
 
+The September 2026 background-resource audit, measured hot paths, regression
+checks and remaining live-runtime verification are recorded in
+[RESOURCE_AUDIT_2026-09-23.md](docs/RESOURCE_AUDIT_2026-09-23.md).
+
 This archive contains the current optimized baseline with segment-backed history and the single-process desktop mode.
 
 ## Cleanup and optimization work included
@@ -44,7 +48,7 @@ and executes:
 Node.js v22.17.0
 node --check internal/webui/dist/rules-ui.js
 node --check internal/webui/dist/app.js
-node --test internal/webui/rules_ui_test.js
+node --test internal/webui/rules_ui_test.js internal/webui/lifecycle_test.js
 go1.26.5 windows/amd64, GOAMD64=v1, CGO_ENABLED=0
 GOWORK=off, GOENV=off, default GOEXPERIMENT/GOFIPS140, exact repository go.mod
 go mod download + verify with GOFLAGS=-mod=readonly

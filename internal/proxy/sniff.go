@@ -49,6 +49,12 @@ func peekSniffData(br *bufio.Reader, maxBytes int) ([]byte, error) {
 			}
 			return peek, err
 		}
+		// Peek may have filled the reader with a complete request. Parse those
+		// available bytes together instead of reparsing the same header for each
+		// additional byte (quadratic CPU and allocation cost for long headers).
+		if available := min(maxBytes, br.Buffered()); available > len(peek) {
+			peek, _ = br.Peek(available)
+		}
 		if sniffHTTPHost(peek) != "" {
 			return peek, nil
 		}
@@ -102,24 +108,20 @@ func sniffHTTPHost(data []byte) string {
 	if !ok {
 		return ""
 	}
-	lines := bytes.Split(data, []byte("\r\n"))
-	for i, line := range lines {
-		completeLine := i < len(lines)-1
-		lower := strings.ToLower(string(line))
-		if strings.HasPrefix(lower, "host:") {
-			if !completeLine {
-				return ""
-			}
+	for len(data) > 0 {
+		line, rest, completeLine := bytes.Cut(data, []byte("\r\n"))
+		if !completeLine || len(line) == 0 {
+			return ""
+		}
+		data = rest
+		if len(line) >= 5 && bytes.EqualFold(line[:5], []byte("host:")) {
 			host := strings.TrimSpace(string(line[5:]))
 			if h, _, err := net.SplitHostPort(host); err == nil {
 				host = h
 			}
 			return strings.ToLower(strings.Trim(host, "[]"))
 		}
-		if strings.HasPrefix(lower, "connect ") {
-			if !completeLine {
-				return ""
-			}
+		if len(line) >= 8 && bytes.EqualFold(line[:8], []byte("connect ")) {
 			parts := strings.SplitN(string(line), " ", 3)
 			if len(parts) >= 2 {
 				host := parts[1]

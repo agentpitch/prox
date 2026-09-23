@@ -3,12 +3,55 @@
 package windivert
 
 import (
+	"context"
 	"encoding/binary"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/agentpitch/prox/internal/proxy"
 )
+
+type delayedOwnerCache struct {
+	refreshes  int
+	foundAfter int
+	onRefresh  func()
+}
+
+func (*delayedOwnerCache) RefreshIfStale(time.Duration) error { return nil }
+func (c *delayedOwnerCache) ForceRefresh() error {
+	c.refreshes++
+	if c.onRefresh != nil {
+		c.onRefresh()
+	}
+	return nil
+}
+func (c *delayedOwnerCache) Lookup(netip.Addr, uint16, netip.Addr, uint16) (uint32, string, bool) {
+	if c.refreshes >= c.foundAfter {
+		return 42, `C:\late.exe`, true
+	}
+	return 0, "", false
+}
+
+func TestOwnerLookupRefreshesDelayedRows(t *testing.T) {
+	owners := &delayedOwnerCache{foundAfter: 2}
+	engine := &Engine{owners: owners}
+	pid, exe, tries, ok := engine.lookup(context.Background(), Packet{})
+	if !ok || pid != 42 || exe != `C:\late.exe` || tries != 3 {
+		t.Fatalf("late owner lookup = pid=%d exe=%q tries=%d ok=%v", pid, exe, tries, ok)
+	}
+}
+
+func TestOwnerLookupRetryStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	owners := &delayedOwnerCache{foundAfter: 100, onRefresh: cancel}
+	engine := &Engine{owners: owners}
+	_, _, tries, ok := engine.lookup(ctx, Packet{})
+	if ok || tries != 2 || owners.refreshes != 1 {
+		t.Fatalf("canceled lookup continued: tries=%d refreshes=%d ok=%v", tries, owners.refreshes, ok)
+	}
+}
 
 func TestSharedRedirectorRewritesAppAndListenerPackets(t *testing.T) {
 	clientIP := netip.MustParseAddr("192.0.2.10")

@@ -35,6 +35,19 @@ type Request struct {
 	TargetPort uint16
 }
 
+// matchRequest lazily normalizes values once per decision. In particular, a
+// Windows executable path must not be lowercased and allocated for every rule
+// visited. Unconditional rules still avoid this work entirely.
+type matchRequest struct {
+	Request
+	appReady  bool
+	appPath   string
+	appBase   string
+	hostReady bool
+	host      string
+	ipText    string
+}
+
 type Decision struct {
 	Matched bool
 	RuleID  string
@@ -102,15 +115,16 @@ func (e *Engine) AllEnabledActionsDirect() bool {
 }
 
 func (e *Engine) Match(req Request) Decision {
+	prepared := matchRequest{Request: req}
 	for _, r := range e.rules {
 		if !r.Rule.Enabled {
 			continue
 		}
-		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		application, ok := r.matchApplication(&prepared)
 		if !ok {
 			continue
 		}
-		host, ok := r.matchHostCondition(req.Hostname, req.TargetIP, e.computerName)
+		host, ok := r.matchHostRequest(&prepared, e.computerName)
 		if !ok {
 			continue
 		}
@@ -136,11 +150,12 @@ func (e *Engine) Match(req Request) Decision {
 }
 
 func (e *Engine) Preflight(req Request) PreflightResult {
+	prepared := matchRequest{Request: req}
 	for i, r := range e.rules {
 		if !r.Rule.Enabled {
 			continue
 		}
-		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		application, ok := r.matchApplication(&prepared)
 		if !ok {
 			continue
 		}
@@ -148,7 +163,7 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 		if !ok {
 			continue
 		}
-		hostState, host := r.preflightHostCondition(req.Hostname, req.TargetIP, e.computerName)
+		hostState, host := r.preflightHostRequest(&prepared, e.computerName)
 		match := MatchDetails{Application: application, Host: host, Port: port}
 		switch hostState {
 		case hostPreflightMatch:
@@ -159,7 +174,7 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 			}
 		case hostPreflightNeedHostname:
 			if r.Rule.Action == config.ActionDirect {
-				if dec, ok := e.definitiveDirectWithoutHostname(req, i+1); ok {
+				if dec, ok := e.definitiveDirectWithoutHostname(&prepared, i+1); ok {
 					return PreflightResult{
 						Decision:   dec,
 						Definitive: true,
@@ -177,12 +192,12 @@ func (e *Engine) Preflight(req Request) PreflightResult {
 	return PreflightResult{Decision: Decision{Action: config.ActionDirect}, Definitive: true}
 }
 
-func (e *Engine) definitiveDirectWithoutHostname(req Request, start int) (Decision, bool) {
+func (e *Engine) definitiveDirectWithoutHostname(req *matchRequest, start int) (Decision, bool) {
 	for _, r := range e.rules[start:] {
 		if !r.Rule.Enabled {
 			continue
 		}
-		application, ok := r.matchAppCondition(req.AppPath, req.PID)
+		application, ok := r.matchApplication(req)
 		if !ok {
 			continue
 		}
@@ -190,7 +205,7 @@ func (e *Engine) definitiveDirectWithoutHostname(req Request, start int) (Decisi
 		if !ok {
 			continue
 		}
-		hostState, host := r.preflightHostCondition(req.Hostname, req.TargetIP, e.computerName)
+		hostState, host := r.preflightHostRequest(req, e.computerName)
 		switch hostState {
 		case hostPreflightMatch:
 			if r.Rule.Action != config.ActionDirect {
@@ -226,26 +241,34 @@ func (r CompiledRule) matchApp(path string, pid uint32) bool {
 }
 
 func (r CompiledRule) matchAppCondition(path string, pid uint32) (string, bool) {
+	req := matchRequest{Request: Request{AppPath: path, PID: pid}}
+	return r.matchApplication(&req)
+}
+
+func (r CompiledRule) matchApplication(req *matchRequest) (string, bool) {
 	if r.appsAny {
 		if r.appsAnyStar {
 			return "*", true
 		}
 		return "Any", true
 	}
-	path = normalizeWindowsPath(path)
-	base := pathBaseAny(path)
 	for _, p := range r.apps {
 		if p.pidOnly {
-			if pid != 0 && pid == p.pid {
+			if req.PID != 0 && req.PID == p.pid {
 				return p.raw, true
 			}
 			continue
 		}
+		if !req.appReady {
+			req.appPath = normalizeWindowsPath(req.AppPath)
+			req.appBase = pathBaseNormalized(req.appPath)
+			req.appReady = true
+		}
 		if p.fullPath {
-			if wildcardMatch(p.raw, path) {
+			if wildcardMatchNormalized(p.raw, req.appPath) {
 				return p.raw, true
 			}
-		} else if wildcardMatch(p.raw, base) {
+		} else if wildcardMatchNormalized(p.raw, req.appBase) {
 			return p.raw, true
 		}
 	}
@@ -258,11 +281,19 @@ func (r CompiledRule) matchHost(hostname string, ip netip.Addr, computerName str
 }
 
 func (r CompiledRule) matchHostCondition(hostname string, ip netip.Addr, computerName string) (string, bool) {
+	req := matchRequest{Request: Request{Hostname: hostname, TargetIP: ip}}
+	return r.matchHostRequest(&req, computerName)
+}
+
+func (r CompiledRule) matchHostRequest(req *matchRequest, computerName string) (string, bool) {
 	if r.hostsAny {
 		return "Any", true
 	}
-	h := strings.ToLower(strings.TrimSpace(hostname))
-	ipStr := ""
+	if !req.hostReady {
+		req.host = strings.ToLower(strings.TrimSpace(req.Hostname))
+		req.hostReady = true
+	}
+	h, ip := req.host, req.TargetIP
 	for _, p := range r.hosts {
 		switch p.kind {
 		case hostAny:
@@ -276,7 +307,7 @@ func (r CompiledRule) matchHostCondition(hostname string, ip netip.Addr, compute
 				return p.raw, true
 			}
 		case hostGlobName:
-			if h != "" && wildcardMatch(p.raw, h) {
+			if h != "" && wildcardMatchNormalized(p.raw, h) {
 				return p.raw, true
 			}
 		case hostExactIP:
@@ -292,10 +323,10 @@ func (r CompiledRule) matchHostCondition(hostname string, ip netip.Addr, compute
 				return p.raw, true
 			}
 		case hostGlobIP:
-			if ipStr == "" && ip.IsValid() {
-				ipStr = strings.ToLower(ip.String())
+			if req.ipText == "" && ip.IsValid() {
+				req.ipText = strings.ToLower(ip.String())
 			}
-			if ip.IsValid() && wildcardMatch(p.raw, ipStr) {
+			if ip.IsValid() && wildcardMatchNormalized(p.raw, req.ipText) {
 				return p.raw, true
 			}
 		}
@@ -317,17 +348,19 @@ func (r CompiledRule) preflightHost(hostname string, ip netip.Addr, computerName
 }
 
 func (r CompiledRule) preflightHostCondition(hostname string, ip netip.Addr, computerName string) (hostPreflightState, string) {
+	req := matchRequest{Request: Request{Hostname: hostname, TargetIP: ip}}
+	return r.preflightHostRequest(&req, computerName)
+}
+
+func (r CompiledRule) preflightHostRequest(req *matchRequest, computerName string) (hostPreflightState, string) {
 	if r.hostsAny {
 		return hostPreflightMatch, "Any"
 	}
-	if strings.TrimSpace(hostname) != "" {
-		if label, ok := r.matchHostCondition(hostname, ip, computerName); ok {
-			return hostPreflightMatch, label
-		}
-		return hostPreflightNoMatch, ""
-	}
-	if label, ok := r.matchHostCondition("", ip, computerName); ok {
+	if label, ok := r.matchHostRequest(req, computerName); ok {
 		return hostPreflightMatch, label
+	}
+	if req.host != "" {
+		return hostPreflightNoMatch, ""
 	}
 	if r.hostnameDependent {
 		return hostPreflightNeedHostname, ""
@@ -376,7 +409,10 @@ func normalizeWindowsPath(path string) string {
 }
 
 func pathBaseAny(path string) string {
-	path = normalizeWindowsPath(path)
+	return pathBaseNormalized(normalizeWindowsPath(path))
+}
+
+func pathBaseNormalized(path string) string {
 	path = strings.TrimRight(path, `\`)
 	if idx := strings.LastIndex(path, `\`); idx >= 0 {
 		return path[idx+1:]
@@ -385,8 +421,10 @@ func pathBaseAny(path string) string {
 }
 
 func wildcardMatch(pattern, value string) bool {
-	pattern = strings.ToLower(pattern)
-	value = strings.ToLower(value)
+	return wildcardMatchNormalized(strings.ToLower(pattern), strings.ToLower(value))
+}
+
+func wildcardMatchNormalized(pattern, value string) bool {
 	pi, vi := 0, 0
 	star := -1
 	match := 0

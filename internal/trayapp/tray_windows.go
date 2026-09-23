@@ -13,8 +13,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -39,8 +37,6 @@ const (
 	wmRButtonUp        = 0x0205
 	wmContextMenu      = 0x007B
 	trayMessage        = wmApp + 1
-	imageIcon          = 1
-	lrLoadFromFile     = 0x0010
 	nimAdd             = 0x00000000
 	nimModify          = 0x00000001
 	nimDelete          = 0x00000002
@@ -170,40 +166,43 @@ type notifyIconData struct {
 }
 
 var (
-	procRegisterClassExW    = windows.NewLazySystemDLL("user32.dll").NewProc("RegisterClassExW")
-	procCreateWindowExW     = windows.NewLazySystemDLL("user32.dll").NewProc("CreateWindowExW")
-	procDefWindowProcW      = windows.NewLazySystemDLL("user32.dll").NewProc("DefWindowProcW")
-	procGetMessageW         = windows.NewLazySystemDLL("user32.dll").NewProc("GetMessageW")
-	procTranslateMessage    = windows.NewLazySystemDLL("user32.dll").NewProc("TranslateMessage")
-	procDispatchMessageW    = windows.NewLazySystemDLL("user32.dll").NewProc("DispatchMessageW")
-	procPostQuitMessage     = windows.NewLazySystemDLL("user32.dll").NewProc("PostQuitMessage")
-	procPostMessageW        = windows.NewLazySystemDLL("user32.dll").NewProc("PostMessageW")
-	procShellNotifyIconW    = windows.NewLazySystemDLL("shell32.dll").NewProc("Shell_NotifyIconW")
-	procCreatePopupMenu     = windows.NewLazySystemDLL("user32.dll").NewProc("CreatePopupMenu")
-	procAppendMenuW         = windows.NewLazySystemDLL("user32.dll").NewProc("AppendMenuW")
-	procTrackPopupMenu      = windows.NewLazySystemDLL("user32.dll").NewProc("TrackPopupMenu")
-	procDestroyMenu         = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyMenu")
-	procGetCursorPos        = windows.NewLazySystemDLL("user32.dll").NewProc("GetCursorPos")
-	procSetForegroundWindow = windows.NewLazySystemDLL("user32.dll").NewProc("SetForegroundWindow")
-	procSetWindowPos        = windows.NewLazySystemDLL("user32.dll").NewProc("SetWindowPos")
-	procMonitorFromPoint    = windows.NewLazySystemDLL("user32.dll").NewProc("MonitorFromPoint")
-	procGetMonitorInfoW     = windows.NewLazySystemDLL("user32.dll").NewProc("GetMonitorInfoW")
-	procLoadImageW          = windows.NewLazySystemDLL("user32.dll").NewProc("LoadImageW")
-	procDestroyIcon         = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyIcon")
-	procGetModuleHandleW    = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetModuleHandleW")
-	procCreateMutexW        = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
-	currentTrayMu           sync.Mutex
-	currentTray             *helper
-	hwndTopmost             = ^uintptr(0)
-	hwndNotopmost           = ^uintptr(1)
+	procRegisterClassExW         = windows.NewLazySystemDLL("user32.dll").NewProc("RegisterClassExW")
+	procCreateWindowExW          = windows.NewLazySystemDLL("user32.dll").NewProc("CreateWindowExW")
+	procDestroyWindow            = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyWindow")
+	procDefWindowProcW           = windows.NewLazySystemDLL("user32.dll").NewProc("DefWindowProcW")
+	procGetMessageW              = windows.NewLazySystemDLL("user32.dll").NewProc("GetMessageW")
+	procTranslateMessage         = windows.NewLazySystemDLL("user32.dll").NewProc("TranslateMessage")
+	procDispatchMessageW         = windows.NewLazySystemDLL("user32.dll").NewProc("DispatchMessageW")
+	procPostQuitMessage          = windows.NewLazySystemDLL("user32.dll").NewProc("PostQuitMessage")
+	procPostMessageW             = windows.NewLazySystemDLL("user32.dll").NewProc("PostMessageW")
+	procShellNotifyIconW         = windows.NewLazySystemDLL("shell32.dll").NewProc("Shell_NotifyIconW")
+	procCreatePopupMenu          = windows.NewLazySystemDLL("user32.dll").NewProc("CreatePopupMenu")
+	procAppendMenuW              = windows.NewLazySystemDLL("user32.dll").NewProc("AppendMenuW")
+	procTrackPopupMenu           = windows.NewLazySystemDLL("user32.dll").NewProc("TrackPopupMenu")
+	procDestroyMenu              = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyMenu")
+	procGetCursorPos             = windows.NewLazySystemDLL("user32.dll").NewProc("GetCursorPos")
+	procSetForegroundWindow      = windows.NewLazySystemDLL("user32.dll").NewProc("SetForegroundWindow")
+	procSetWindowPos             = windows.NewLazySystemDLL("user32.dll").NewProc("SetWindowPos")
+	procMonitorFromPoint         = windows.NewLazySystemDLL("user32.dll").NewProc("MonitorFromPoint")
+	procGetMonitorInfoW          = windows.NewLazySystemDLL("user32.dll").NewProc("GetMonitorInfoW")
+	procCreateIconFromResourceEx = windows.NewLazySystemDLL("user32.dll").NewProc("CreateIconFromResourceEx")
+	procDestroyIcon              = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyIcon")
+	procGetModuleHandleW         = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetModuleHandleW")
+	procCreateMutexW             = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
+	currentTrayMu                sync.Mutex
+	currentTray                  *helper
+	trayWindowCallback           = syscall.NewCallback(windowProc)
+	hwndTopmost                  = ^uintptr(0)
+	hwndNotopmost                = ^uintptr(1)
 )
 
 type helper struct {
 	provider          Provider
 	url               string
 	hwnd              windows.Handle
+	iconMu            sync.Mutex
 	iconHandle        windows.Handle
-	iconPath          string
+	iconClosed        bool
 	mutexHandle       windows.Handle
 	quitOnce          sync.Once
 	offlineFrom       time.Time
@@ -222,16 +221,15 @@ func Run(opts Options) error {
 	h := &helper{
 		provider: opts.Provider,
 		url:      url,
-		iconPath: filepath.Join(os.TempDir(), fmt.Sprintf("pitchprox_tray_%d.ico", os.Getpid())),
 	}
 	already, err := h.acquireMutex()
 	if err != nil {
 		return err
 	}
+	defer h.releaseMutex()
 	if already {
 		return nil
 	}
-	defer h.releaseMutex()
 
 	currentTrayMu.Lock()
 	currentTray = h
@@ -250,7 +248,8 @@ func Run(opts Options) error {
 	defer h.cleanup()
 
 	h.setOfflineIcon()
-	go h.pollLoop()
+	stopPolling := h.startPolling()
+	defer stopPolling()
 	return h.messageLoop()
 }
 
@@ -291,7 +290,7 @@ func (h *helper) createWindow() error {
 	}
 	wc := wndClassEx{
 		CbSize:    uint32(unsafe.Sizeof(wndClassEx{})),
-		WndProc:   syscall.NewCallback(windowProc),
+		WndProc:   trayWindowCallback,
 		Instance:  windows.Handle(instance),
 		ClassName: className,
 	}
@@ -374,7 +373,10 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 			go h.requestProgramStop()
 			return 0
 		}
-	case wmClose, wmDestroy:
+	case wmClose:
+		procDestroyWindow.Call(hwnd)
+		return 0
+	case wmDestroy:
 		procPostQuitMessage.Call(0)
 		return 0
 	}
@@ -454,10 +456,12 @@ func (h *helper) showContextMenu() {
 	case menuExit:
 		go h.requestProgramStop()
 	}
+	h.iconMu.Lock()
 	if h.iconHandle != 0 {
 		nid := h.notifyData(h.iconHandle, "")
 		procShellNotifyIconW.Call(nimSetFocus, uintptr(unsafe.Pointer(&nid)))
 	}
+	h.iconMu.Unlock()
 }
 
 func contextMenuItems(servicePaused, webUIAvailable, webUIRunning bool) []menuItem {
@@ -649,10 +653,30 @@ func (h *helper) menuAnchor() (point, uintptr) {
 	return anchor, flags
 }
 
-func (h *helper) pollLoop() {
+// Join the poller before removing the icon and destroying its window. This also
+// releases the ticker and provider when Run returns without exiting the process.
+func (h *helper) startPolling() func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.pollLoop(stop)
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+func (h *helper) pollLoop(stop <-chan struct{}) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
 		if ctl := h.serviceController(); ctl != nil && ctl.ServicePaused() {
 			h.offlineFrom = time.Time{}
 			h.setPausedIcon()
@@ -735,6 +759,9 @@ func (h *helper) postStop() error {
 }
 
 func (h *helper) setOfflineIcon() {
+	if h.hasIconSignature("offline") {
+		return
+	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
 	gray := color.NRGBA{R: 107, G: 114, B: 128, A: 255}
 	for x := 2; x < 14; x++ {
@@ -750,6 +777,9 @@ func (h *helper) setOfflineIcon() {
 }
 
 func (h *helper) setPausedIcon() {
+	if h.hasIconSignature("paused") {
+		return
+	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
 	bg := color.NRGBA{R: 17, G: 24, B: 39, A: 255}
 	border := color.NRGBA{R: 248, G: 113, B: 113, A: 255}
@@ -785,7 +815,7 @@ func (h *helper) setPausedIcon() {
 func (h *helper) setTrafficIcon(view monitor.TrayView) {
 	history, rx, tx, peakRx, peakTx := trafficSeries(view.Traffic)
 	signature := trafficSignature(history)
-	if signature == h.lastIconSignature {
+	if h.hasIconSignature(signature) {
 		return
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
@@ -951,35 +981,31 @@ func drawLine(img *image.NRGBA, x0, y0, x1, y1 int, col color.NRGBA) {
 	}
 }
 
+func (h *helper) hasIconSignature(signature string) bool {
+	h.iconMu.Lock()
+	defer h.iconMu.Unlock()
+	return h.iconClosed || signature == h.lastIconSignature
+}
+
 func (h *helper) updateIcon(img image.Image, tooltip string, signature string) error {
+	h.iconMu.Lock()
+	defer h.iconMu.Unlock()
+	if h.iconClosed {
+		return nil
+	}
 	if signature == h.lastIconSignature {
 		return nil
 	}
-	icoBytes, err := encodeICO(img)
+	newIcon, err := createIcon(img)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(h.iconPath, icoBytes, 0o644); err != nil {
-		return err
-	}
-	pathPtr, err := windows.UTF16PtrFromString(h.iconPath)
-	if err != nil {
-		return err
-	}
-	r1, _, callErr := procLoadImageW.Call(0, uintptr(unsafe.Pointer(pathPtr)), imageIcon, 16, 16, lrLoadFromFile)
-	if r1 == 0 {
-		if callErr != nil && callErr != windows.ERROR_SUCCESS {
-			return fmt.Errorf("LoadImageW: %w", callErr)
-		}
-		return fmt.Errorf("LoadImageW failed")
-	}
-	newIcon := windows.Handle(r1)
 	nid := h.notifyData(newIcon, tooltip)
 	msg := nimModify
 	if h.iconHandle == 0 {
 		msg = nimAdd
 	}
-	if r1, _, callErr = procShellNotifyIconW.Call(uintptr(msg), uintptr(unsafe.Pointer(&nid))); r1 == 0 {
+	if r1, _, callErr := procShellNotifyIconW.Call(uintptr(msg), uintptr(unsafe.Pointer(&nid))); r1 == 0 {
 		procDestroyIcon.Call(uintptr(newIcon))
 		if callErr != nil && callErr != windows.ERROR_SUCCESS {
 			return fmt.Errorf("Shell_NotifyIconW: %w", callErr)
@@ -1019,7 +1045,22 @@ func copyWide(dst []uint16, s string) {
 	copy(dst, ws)
 }
 
-func encodeICO(img image.Image) ([]byte, error) {
+// Create a non-shared icon directly from a DWORD-aligned DIB. The caller owns
+// the returned handle and must DestroyIcon after replacement or on failure.
+func createIcon(img image.Image) (windows.Handle, error) {
+	bits, err := encodeIconDIB(img)
+	if err != nil {
+		return 0, err
+	}
+	r1, _, callErr := procCreateIconFromResourceEx.Call(uintptr(unsafe.Pointer(&bits[0])), uintptr(len(bits)), 1, 0x00030000, 16, 16, 0)
+	runtime.KeepAlive(bits)
+	if r1 == 0 {
+		return 0, fmt.Errorf("CreateIconFromResourceEx: %w", callErr)
+	}
+	return windows.Handle(r1), nil
+}
+
+func encodeIconDIB(img image.Image) ([]byte, error) {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
@@ -1028,8 +1069,6 @@ func encodeICO(img image.Image) ([]byte, error) {
 	}
 
 	const (
-		iconDirSize      = 6
-		iconDirEntrySize = 16
 		bitmapHeaderSize = 40
 		bitsPerPixel     = 32
 	)
@@ -1037,16 +1076,7 @@ func encodeICO(img image.Image) ([]byte, error) {
 	xorBytes := width * height * 4
 	maskBytes := maskStride * height
 	imageBytes := bitmapHeaderSize + xorBytes + maskBytes
-	out := make([]byte, 0, iconDirSize+iconDirEntrySize+imageBytes)
-
-	out = appendUint16LE(out, 0) // reserved
-	out = appendUint16LE(out, 1) // icon
-	out = appendUint16LE(out, 1) // one image
-	out = append(out, iconDimensionByte(width), iconDimensionByte(height), 0, 0)
-	out = appendUint16LE(out, 1)
-	out = appendUint16LE(out, bitsPerPixel)
-	out = appendUint32LE(out, uint32(imageBytes))
-	out = appendUint32LE(out, iconDirSize+iconDirEntrySize)
+	out := make([]byte, 0, imageBytes)
 
 	out = appendUint32LE(out, bitmapHeaderSize)
 	out = appendUint32LE(out, uint32(width))
@@ -1072,13 +1102,6 @@ func encodeICO(img image.Image) ([]byte, error) {
 	return out, nil
 }
 
-func iconDimensionByte(v int) byte {
-	if v == 256 {
-		return 0
-	}
-	return byte(v)
-}
-
 func appendUint16LE(dst []byte, v uint16) []byte {
 	var buf [2]byte
 	binary.LittleEndian.PutUint16(buf[:], v)
@@ -1098,6 +1121,12 @@ func (h *helper) quit() {
 }
 
 func (h *helper) cleanup() {
+	h.iconMu.Lock()
+	defer h.iconMu.Unlock()
+	if h.iconClosed {
+		return
+	}
+	h.iconClosed = true
 	if h.hwnd != 0 {
 		nid := h.notifyData(h.iconHandle, "")
 		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
@@ -1106,7 +1135,9 @@ func (h *helper) cleanup() {
 		procDestroyIcon.Call(uintptr(h.iconHandle))
 		h.iconHandle = 0
 	}
-	_ = os.Remove(h.iconPath)
+	if h.hwnd != 0 {
+		procDestroyWindow.Call(uintptr(h.hwnd))
+	}
 }
 
 func abs(v int) int {

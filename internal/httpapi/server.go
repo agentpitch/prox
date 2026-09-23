@@ -139,6 +139,8 @@ const (
 	maxHTTPHeaderBytes        = 32 << 10
 	maxUpdateInstallBodyBytes = 512
 	maxUpdateVersionBytes     = 128
+	httpWriteTimeout          = 10 * time.Second
+	httpRejectWriteTimeout    = 100 * time.Millisecond
 	updateCheckTimeout        = 30 * time.Second
 	webUIIdleTimeout          = time.Hour
 
@@ -262,9 +264,7 @@ func (s *Server) Serve() error {
 		if !s.trackConn(conn) {
 			continue
 		}
-		s.wg.Add(1)
 		go func(c net.Conn) {
-			defer s.wg.Done()
 			defer s.untrackConn(c)
 			s.handleConn(c)
 		}(conn)
@@ -306,11 +306,16 @@ func (s *Server) trackConn(conn net.Conn) bool {
 	}
 	if len(s.conns) >= maxHTTPConnections {
 		s.mu.Unlock()
-		writeText(conn, 503, "too many connections")
+		// This runs in the accept loop. A client that does not read must not
+		// prevent other clients from connecting or the server from stopping.
+		writeBytesWithTimeout(conn, 503, "text/plain; charset=utf-8", []byte("too many connections\n"), httpRejectWriteTimeout)
 		_ = conn.Close()
 		return false
 	}
 	s.conns[conn] = struct{}{}
+	// Pair registration and Add under the same lock used by Close. Otherwise
+	// Close can finish waiting before Serve adds this connection's handler.
+	s.wg.Add(1)
 	if len(s.conns) > s.connPeak {
 		s.connPeak = len(s.conns)
 	}
@@ -319,6 +324,7 @@ func (s *Server) trackConn(conn net.Conn) bool {
 }
 
 func (s *Server) untrackConn(conn net.Conn) {
+	defer s.wg.Done()
 	_ = conn.Close()
 	s.mu.Lock()
 	delete(s.conns, conn)
@@ -1126,6 +1132,7 @@ func (s *Server) handleEvents(conn net.Conn) {
 	defer cancel()
 
 	bw := bufio.NewWriter(conn)
+	_ = conn.SetWriteDeadline(time.Now().Add(httpWriteTimeout))
 	if err := writeHeaders(bw, 200, map[string]string{
 		"Content-Type":  "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -1135,6 +1142,19 @@ func (s *Server) handleEvents(conn net.Conn) {
 	}
 
 	_ = conn.SetReadDeadline(time.Time{})
+	// EventSource.close sends EOF, but writes alone may not notice it until
+	// the next heartbeat. Release its UI subscription as soon as the tab hides
+	// or closes. Close and join this reader on every exit from the stream.
+	peerClosed := make(chan struct{})
+	go func() {
+		var data [1]byte
+		_, _ = conn.Read(data[:])
+		close(peerClosed)
+	}()
+	defer func() {
+		_ = conn.Close()
+		<-peerClosed
+	}()
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 
@@ -1142,14 +1162,18 @@ func (s *Server) handleEvents(conn net.Conn) {
 		select {
 		case <-s.closeCh:
 			return
+		case <-peerClosed:
+			return
 		case data, ok := <-ch:
 			if !ok {
 				return
 			}
+			_ = conn.SetWriteDeadline(time.Now().Add(httpWriteTimeout))
 			if err := writeSSE(bw, data); err != nil {
 				return
 			}
 		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(httpWriteTimeout))
 			if _, err := bw.WriteString(": ping\n\n"); err != nil {
 				return
 			}
@@ -1283,6 +1307,11 @@ func writeEmpty(conn net.Conn, status int) {
 }
 
 func writeBytes(conn net.Conn, status int, contentType string, body []byte) {
+	writeBytesWithTimeout(conn, status, contentType, body, httpWriteTimeout)
+}
+
+func writeBytesWithTimeout(conn net.Conn, status int, contentType string, body []byte, timeout time.Duration) {
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 	bw := bufio.NewWriter(conn)
 	headers := map[string]string{
 		"Content-Type":   contentType,

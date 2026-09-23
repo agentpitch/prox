@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -94,22 +95,75 @@ type bufferedConn struct {
 	r *bufio.Reader
 }
 
-func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	if c.r == nil {
+		return c.Conn.Read(p)
+	}
+	n, err := c.r.Read(p)
+	if c.r.Buffered() == 0 {
+		c.r = nil
+	}
+	return n, err
+}
+
+// A dial context also covers proxy negotiation, after the parent TCP dial has
+// returned. A deadline alone does not interrupt negotiation on early cancel.
+func watchProxyHandshake(ctx context.Context, conn net.Conn) func() error {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(canceled)
+	})
+	return func() error {
+		if !stop() {
+			<-canceled
+		}
+		if err := ctx.Err(); err != nil {
+			_ = conn.Close()
+			return err
+		}
+		_ = conn.SetDeadline(time.Time{})
+		return nil
+	}
+}
+
+const maxConnectResponseBytes = 64 << 10
+
+func readConnectLine(br *bufio.Reader, remaining *int) (string, error) {
+	var line []byte
+	for {
+		part, err := br.ReadSlice('\n')
+		*remaining -= len(part)
+		if *remaining < 0 {
+			return "", fmt.Errorf("http CONNECT response headers exceed %d bytes", maxConnectResponseBytes)
+		}
+		line = append(line, part...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return string(line), err
+	}
+}
 
 type httpConnectDialer struct {
 	parent Dialer
 	proxy  config.ProxyProfile
 }
 
-func (d *httpConnectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, address string) (result net.Conn, err error) {
 	conn, err := d.parent.DialContext(ctx, "tcp", d.proxy.Address)
 	if err != nil {
 		return nil, err
 	}
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
-		defer conn.SetDeadline(time.Time{})
-	}
+	finish := watchProxyHandshake(ctx, conn)
+	defer func() {
+		if cancelErr := finish(); cancelErr != nil {
+			result, err = nil, cancelErr
+		}
+	}()
 	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n", address, address)
 	if d.proxy.Username != "" || d.proxy.Password != "" {
 		token := base64.StdEncoding.EncodeToString([]byte(d.proxy.Username + ":" + d.proxy.Password))
@@ -121,17 +175,19 @@ func (d *httpConnectDialer) DialContext(ctx context.Context, network, address st
 		return nil, err
 	}
 	br := bufio.NewReader(conn)
-	line, err := br.ReadString('\n')
+	remaining := maxConnectResponseBytes
+	line, err := readConnectLine(br, &remaining)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-	if !strings.Contains(line, " 200 ") {
+	status := strings.Fields(line)
+	if len(status) < 2 || (status[0] != "HTTP/1.0" && status[0] != "HTTP/1.1") || status[1] != "200" {
 		_ = conn.Close()
 		return nil, fmt.Errorf("http CONNECT failed: %s", strings.TrimSpace(line))
 	}
 	for {
-		line, err = br.ReadString('\n')
+		line, err = readConnectLine(br, &remaining)
 		if err != nil {
 			_ = conn.Close()
 			return nil, err
@@ -148,15 +204,17 @@ type socks5Dialer struct {
 	proxy  config.ProxyProfile
 }
 
-func (d *socks5Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d *socks5Dialer) DialContext(ctx context.Context, network, address string) (result net.Conn, err error) {
 	conn, err := d.parent.DialContext(ctx, "tcp", d.proxy.Address)
 	if err != nil {
 		return nil, err
 	}
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
-		defer conn.SetDeadline(time.Time{})
-	}
+	finish := watchProxyHandshake(ctx, conn)
+	defer func() {
+		if cancelErr := finish(); cancelErr != nil {
+			result, err = nil, cancelErr
+		}
+	}()
 	methods := []byte{0x00}
 	if d.proxy.Username != "" || d.proxy.Password != "" {
 		methods = []byte{0x00, 0x02}

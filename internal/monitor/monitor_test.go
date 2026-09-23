@@ -1,12 +1,106 @@
 package monitor
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agentpitch/prox/internal/config"
 )
+
+func BenchmarkActiveConnectionChurn(b *testing.B) {
+	bus := &Bus{active: make(map[string]Connection, 4096)}
+	ids := make([]string, 4096)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("connection-%d", i)
+		bus.active[ids[i]] = Connection{ID: ids[i], State: "open"}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := ids[i%len(ids)]
+		bus.deleteActiveLocked(id)
+		bus.active[id] = Connection{ID: id, State: "open"}
+	}
+}
+
+func BenchmarkPublishTransientEventWithoutSubscribers(b *testing.B) {
+	bus := &Bus{}
+	payload := strings.Repeat("state", 1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bus.PublishTransientEvent("state", payload)
+	}
+}
+
+type observedJSONPayload struct{ calls *int }
+
+func (p observedJSONPayload) MarshalJSON() ([]byte, error) {
+	(*p.calls)++
+	return []byte(`{"ready":true}`), nil
+}
+
+func TestTransientEventsOnlyEncodeForSubscribers(t *testing.T) {
+	bus := &Bus{subs: make(map[int]chan []byte)}
+	encodes := 0
+	payload := observedJSONPayload{calls: &encodes}
+	bus.PublishTransientEvent("state", payload)
+	if encodes != 0 {
+		t.Fatalf("background event encoded %d times without subscribers", encodes)
+	}
+	_, events, cancel := bus.Subscribe()
+	bus.PublishTransientEvent("state", payload)
+	select {
+	case event := <-events:
+		if string(event) != `{"type":"state","data":{"ready":true}}` {
+			t.Fatalf("subscriber received %s", event)
+		}
+	default:
+		t.Fatal("subscriber did not receive the event")
+	}
+	cancel()
+	bus.PublishTransientEvent("state", payload)
+	if encodes != 1 {
+		t.Fatalf("encoded %d events, want only the one with a subscriber", encodes)
+	}
+}
+
+func TestBackgroundWarningStillPersistsWithoutSubscribers(t *testing.T) {
+	bus, err := NewBus(filepath.Join(t.TempDir(), "history"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+	bus.AddLog("warn", "background warning")
+	logs := bus.Snapshot().Logs
+	if len(logs) != 1 || logs[0].Message != "background warning" {
+		t.Fatalf("persisted warning = %+v", logs)
+	}
+}
+
+func TestActiveMapCompactionIsProportionalToDrainage(t *testing.T) {
+	bus := &Bus{active: make(map[string]Connection, 8192)}
+	for i := 0; i < 8192; i++ {
+		id := fmt.Sprintf("connection-%d", i)
+		bus.active[id] = Connection{ID: id, State: "open"}
+	}
+	compactions := 0
+	for i := 1; i < 8192; i++ {
+		bus.deleteActiveLocked(fmt.Sprintf("connection-%d", i))
+		if bus.activeDeletes == 0 {
+			compactions++
+		}
+	}
+	if compactions == 0 || compactions > 6 {
+		t.Fatalf("compacted %d times draining 8192 connections, want geometric shrink", compactions)
+	}
+	if len(bus.active) != 1 || bus.active["connection-0"].ID != "connection-0" {
+		t.Fatalf("long-lived survivor lost: %+v", bus.active)
+	}
+}
 
 func TestSnapshotTrafficBucketSeconds(t *testing.T) {
 	tests := []struct {

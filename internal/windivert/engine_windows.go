@@ -43,7 +43,7 @@ type Engine struct {
 	wg                     sync.WaitGroup
 	localIPs               map[netip.Addr]struct{}
 	servicePID             uint32
-	owners                 *win.OwnerCache
+	owners                 ownerLookupCache
 	flowWake               chan struct{}
 	flowEmpty              chan struct{}
 	packetErrMu            sync.Mutex
@@ -59,6 +59,12 @@ const (
 	cleanupInterval          = 30 * time.Second
 	ownerRefreshMaxAge       = 2 * time.Second
 )
+
+type ownerLookupCache interface {
+	RefreshIfStale(time.Duration) error
+	ForceRefresh() error
+	Lookup(netip.Addr, uint16, netip.Addr, uint16) (uint32, string, bool)
+}
 
 func (e *Engine) Start(ctx context.Context) error {
 	if e.Flows == nil {
@@ -143,7 +149,7 @@ func (e *Engine) classifierLoop(ctx context.Context, h Handle) {
 			e.sendPacket(h, pkt.Raw, addr, "classifier local passthrough")
 			continue
 		}
-		pid, exe, tries, ok := e.lookup(pkt)
+		pid, exe, tries, ok := e.lookup(ctx, pkt)
 		if !ok {
 			if e.Monitor != nil {
 				e.Monitor.AddLog("warn", "owner lookup failed for %s:%d -> %s:%d, passing direct", pkt.Src, pkt.SrcPort, pkt.Dst, pkt.DstPort)
@@ -295,20 +301,36 @@ func (e *Engine) isLocal(ip netip.Addr) bool {
 	return ok
 }
 
-func (e *Engine) lookup(pkt Packet) (uint32, string, int, bool) {
+func (e *Engine) lookup(ctx context.Context, pkt Packet) (uint32, string, int, bool) {
 	tries := 1
+	if ctx.Err() != nil {
+		return 0, "", 0, false
+	}
 	_ = e.owners.RefreshIfStale(ownerRefreshMaxAge)
 	if pid, exe, ok := e.owners.Lookup(pkt.Src, pkt.SrcPort, pkt.Dst, pkt.DstPort); ok {
 		return pid, exe, tries, true
 	}
-	_ = e.owners.ForceRefresh()
-	deadline := time.Now().Add(120 * time.Millisecond)
-	for time.Now().Before(deadline) {
+	// Owner rows may lag a just-intercepted SYN. The cache has no background
+	// refresher, so repeatedly looking at the same snapshot cannot find a late
+	// row. Refresh on bounded, backed-off retries and allow shutdown to abort.
+	for _, delay := range [...]time.Duration{0, 10 * time.Millisecond, 30 * time.Millisecond, 80 * time.Millisecond} {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return 0, "", tries, false
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return 0, "", tries, false
+		}
+		_ = e.owners.ForceRefresh()
 		tries++
 		if pid, exe, ok := e.owners.Lookup(pkt.Src, pkt.SrcPort, pkt.Dst, pkt.DstPort); ok {
 			return pid, exe, tries, true
 		}
-		time.Sleep(6 * time.Millisecond)
 	}
 	return 0, "", tries, false
 }

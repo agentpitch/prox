@@ -2449,6 +2449,7 @@ function openSettingsEditor() {
     onOpen: (editorSession) => {
       const lifecycle = {
         disposed: false,
+        pageSuspended: false,
         generation: 0,
         checking: false,
         syncingStatus: false,
@@ -2474,6 +2475,7 @@ function openSettingsEditor() {
       const progress = $('ed_update_progress');
       const bytesNode = $('ed_update_bytes');
       const isActive = () => !lifecycle.disposed && editorSession === ui.editorSession && $('editorDialog')?.open;
+      const canPoll = () => isActive() && !document.hidden && !lifecycle.pageSuspended;
 
       const syncUpdateControls = () => {
         if (!isActive()) return;
@@ -2603,7 +2605,7 @@ function openSettingsEditor() {
       };
 
       const scheduleStatusPoll = (delay = 900) => {
-        if (!isActive() || !lifecycle.installing) return;
+        if (!canPoll() || !lifecycle.installing) return;
         if (lifecycle.statusTimer != null) clearTimeout(lifecycle.statusTimer);
         lifecycle.statusTimer = setTimeout(() => {
           lifecycle.statusTimer = null;
@@ -2612,7 +2614,7 @@ function openSettingsEditor() {
       };
 
       const pollInstallStatus = async () => {
-        if (!isActive() || !lifecycle.installing || lifecycle.statusRequest) return;
+        if (!canPoll() || !lifecycle.installing || lifecycle.statusRequest) return;
         const controller = new AbortController();
         lifecycle.statusRequest = controller;
         try {
@@ -2717,7 +2719,7 @@ function openSettingsEditor() {
       };
 
       const checkUpdates = async () => {
-        if (!isActive() || lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing) return;
+        if (!canPoll() || lifecycle.checking || lifecycle.syncingStatus || lifecycle.installing) return;
         lifecycle.generation += 1;
         const generation = lifecycle.generation;
         lifecycle.releasesRequest?.abort();
@@ -2750,7 +2752,7 @@ function openSettingsEditor() {
       };
 
       const syncInitialUpdateStatus = async () => {
-        if (!isActive() || lifecycle.statusRequest) return;
+        if (!canPoll() || lifecycle.statusRequest) return;
         const controller = new AbortController();
         lifecycle.statusRequest = controller;
         lifecycle.syncingStatus = true;
@@ -2807,11 +2809,42 @@ function openSettingsEditor() {
             scheduleStatusPoll(1500);
           }
         } finally {
-          if (lifecycle.statusRequest === controller) lifecycle.statusRequest = null;
-          lifecycle.syncingStatus = false;
+          if (lifecycle.statusRequest === controller) {
+            lifecycle.statusRequest = null;
+            lifecycle.syncingStatus = false;
+          }
           syncUpdateControls();
         }
       };
+
+      const suspendUpdateReads = () => {
+        lifecycle.generation += 1;
+        if (lifecycle.statusTimer != null) clearTimeout(lifecycle.statusTimer);
+        lifecycle.statusTimer = null;
+        lifecycle.releasesRequest?.abort();
+        lifecycle.statusRequest?.abort();
+        lifecycle.releasesRequest = null;
+        lifecycle.statusRequest = null;
+        lifecycle.checking = false;
+        lifecycle.syncingStatus = false;
+        // Installing runs in the service. Preserve its request and pending
+        // version so returning to the page can confirm the running version.
+      };
+      const onUpdateVisibility = () => {
+        if (document.hidden) suspendUpdateReads();
+        else void syncInitialUpdateStatus();
+      };
+      const onUpdatePageHide = () => {
+        lifecycle.pageSuspended = true;
+        suspendUpdateReads();
+      };
+      const onUpdatePageShow = () => {
+        lifecycle.pageSuspended = false;
+        void syncInitialUpdateStatus();
+      };
+      document.addEventListener('visibilitychange', onUpdateVisibility);
+      window.addEventListener('pagehide', onUpdatePageHide);
+      window.addEventListener('pageshow', onUpdatePageShow);
 
       if (checkButton) checkButton.onclick = () => void checkUpdates();
       if (releaseList) {
@@ -2825,6 +2858,9 @@ function openSettingsEditor() {
 
       return () => {
         lifecycle.disposed = true;
+        document.removeEventListener('visibilitychange', onUpdateVisibility);
+        window.removeEventListener('pagehide', onUpdatePageHide);
+        window.removeEventListener('pageshow', onUpdatePageShow);
         lifecycle.generation += 1;
         if (lifecycle.statusTimer != null) clearTimeout(lifecycle.statusTimer);
         lifecycle.statusTimer = null;

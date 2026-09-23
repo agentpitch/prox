@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -21,6 +22,161 @@ import (
 	"github.com/agentpitch/prox/internal/proxy"
 	"github.com/agentpitch/prox/internal/updater"
 )
+
+// Keep stalled-client tests fast while using real net.Pipe deadline behavior.
+type shortWriteDeadlineConn struct {
+	net.Conn
+	deadlines atomic.Int32
+}
+
+func (c *shortWriteDeadlineConn) SetWriteDeadline(deadline time.Time) error {
+	c.deadlines.Add(1)
+	if !deadline.IsZero() {
+		deadline = time.Now().Add(20 * time.Millisecond)
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func TestNonReadingHTTPClientReleasesResponse(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	conn := &shortWriteDeadlineConn{Conn: server}
+	done := make(chan struct{})
+	go func() {
+		writeBytes(conn, 200, "application/octet-stream", make([]byte, 1<<20))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a nonreading client retained its response goroutine")
+	}
+	if conn.deadlines.Load() == 0 {
+		t.Fatal("HTTP response did not bound its write")
+	}
+}
+
+func TestStalledSSEClientReleasesSubscriberAndRefreshesWriteDeadline(t *testing.T) {
+	rt := newFakeRuntime(t, "127.0.0.1:0")
+	srv, err := New("", rt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	conn := &shortWriteDeadlineConn{Conn: server}
+	done := make(chan struct{})
+	go func() {
+		srv.handleEvents(conn)
+		close(done)
+	}()
+	// Receive the initial headers, then leave the event stream unread.
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	br := bufio.NewReader(client)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+	rt.mon.PublishTransientEvent("test", map[string]bool{"active": true})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stalled SSE connection retained its subscriber")
+	}
+	if conn.deadlines.Load() < 2 {
+		t.Fatal("SSE write deadline was not refreshed after its idle period")
+	}
+	if stats := rt.mon.DiagnosticStats(); stats.Subscribers != 0 {
+		t.Fatalf("SSE subscribers after blocked write = %d", stats.Subscribers)
+	}
+}
+
+func TestCloseWaitsForRegisteredConnectionBeforeHandlerStarts(t *testing.T) {
+	srv, err := New("", newFakeRuntime(t, "127.0.0.1:0"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, client := net.Pipe()
+	defer client.Close()
+	if !srv.trackConn(server) {
+		t.Fatal("failed to register connection")
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = srv.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Close returned before the registered handler finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	srv.untrackConn(server)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after unregistering its connection")
+	}
+}
+
+func TestSSEDisconnectAndDisablePromptlyJoinPeerWatcher(t *testing.T) {
+	for _, action := range []string{"disconnect", "disable"} {
+		t.Run(action, func(t *testing.T) {
+			rt := newFakeRuntime(t, "127.0.0.1:0")
+			srv, err := New("", rt, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Close()
+			for i := 0; i < 50; i++ {
+				server, client := net.Pipe()
+				done := make(chan struct{})
+				go func() {
+					srv.handleEvents(server)
+					close(done)
+				}()
+				_ = client.SetReadDeadline(time.Now().Add(time.Second))
+				br := bufio.NewReader(client)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						_ = client.Close()
+						t.Fatal(err)
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				if action == "disconnect" {
+					_ = client.Close()
+				} else {
+					// Keep the client connected. Stream shutdown must close its
+					// socket itself to unblock and join the peer watcher.
+					rt.mon.DisableUI()
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					_ = client.Close()
+					t.Fatal("SSE handler retained its peer watcher or waited for a heartbeat")
+				}
+				_ = client.Close()
+				if stats := rt.mon.DiagnosticStats(); stats.Subscribers != 0 {
+					t.Fatalf("iteration %d retained %d subscribers", i, stats.Subscribers)
+				}
+			}
+		})
+	}
+}
 
 type fakeRuntime struct {
 	mu  sync.RWMutex

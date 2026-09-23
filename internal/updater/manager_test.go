@@ -17,6 +17,53 @@ import (
 	"time"
 )
 
+func TestManagerCloseCancelsAndJoinsReleaseCheck(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	source := &managerTestSource{list: func(ctx context.Context) ([]Release, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return nil, ctx.Err()
+	}}
+	manager, _ := newManagerTestFixture(t, "v0.43", source, nil, nil)
+	// Release the fake source even if an assertion fails before Close returns.
+	defer close(release)
+	checkDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Check(context.Background())
+		checkDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("release check did not start")
+	}
+	closed := make(chan struct{})
+	go func() { manager.Close(); close(closed) }()
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not cancel release check")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before its release check finished")
+	default:
+	}
+	release <- struct{}{}
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not join release check")
+	}
+	if err := <-checkDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Check error = %v, want context cancellation", err)
+	}
+}
+
 func TestManagerCheckSelectsLatestStableAndComparison(t *testing.T) {
 	releases := []Release{
 		{Version: "v0.41", Installable: true},
@@ -779,6 +826,7 @@ type managerTestSource struct {
 	mu         sync.Mutex
 	releases   []Release
 	listError  error
+	list       func(context.Context) ([]Release, error)
 	stage      func(context.Context, Release, string, func(int64, int64)) error
 	listCalls  int
 	stageCalls int
@@ -789,7 +837,11 @@ func (s *managerTestSource) ListReleases(ctx context.Context) ([]Release, error)
 	s.listCalls++
 	releases := append([]Release(nil), s.releases...)
 	err := s.listError
+	list := s.list
 	s.mu.Unlock()
+	if list != nil {
+		return list(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}

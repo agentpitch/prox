@@ -112,6 +112,24 @@ func (s *Server) activeConnCountForTest() int {
 	return len(s.activeConns)
 }
 
+func TestServerRejectsConnectionArrivingDuringShutdown(t *testing.T) {
+	srv := &Server{}
+	srv.closeActiveConns()
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	if srv.trackActiveConn(conn) {
+		t.Fatal("socket was registered after shutdown drained connections")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("late socket was not closed: %v", err)
+	}
+	if got := srv.activeConnCountForTest(); got != 0 {
+		t.Fatalf("retained sockets after shutdown = %d", got)
+	}
+}
+
 type trackedConnStub struct{ id int }
 
 func (*trackedConnStub) Read([]byte) (int, error)         { return 0, io.EOF }

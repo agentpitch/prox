@@ -43,6 +43,7 @@ type Server struct {
 	activeMu    sync.Mutex
 	activeConns map[net.Conn]struct{}
 	activePeak  int
+	closing     bool
 }
 
 var relayBufPool = sync.Pool{New: func() any {
@@ -143,7 +144,9 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	s.trackActiveConn(conn)
+	if !s.trackActiveConn(conn) {
+		return
+	}
 	defer conn.Close()
 	defer s.untrackActiveConn(conn)
 	clientAP, ok := addrPortFromNetAddr(conn.RemoteAddr())
@@ -229,7 +232,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		return
 	}
-	s.trackActiveConn(upstream)
+	if !s.trackActiveConn(upstream) {
+		return
+	}
 	defer upstream.Close()
 	defer s.untrackActiveConn(upstream)
 
@@ -281,11 +286,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) trackActiveConn(conn net.Conn) {
+func (s *Server) trackActiveConn(conn net.Conn) bool {
 	if conn == nil {
-		return
+		return false
 	}
 	s.activeMu.Lock()
+	if s.closing {
+		s.activeMu.Unlock()
+		_ = conn.Close()
+		return false
+	}
 	if s.activeConns == nil {
 		s.activeConns = map[net.Conn]struct{}{}
 	}
@@ -294,6 +304,7 @@ func (s *Server) trackActiveConn(conn net.Conn) {
 		s.activePeak = len(s.activeConns)
 	}
 	s.activeMu.Unlock()
+	return true
 }
 
 func (s *Server) untrackActiveConn(conn net.Conn) {
@@ -325,6 +336,9 @@ func (s *Server) untrackActiveConn(conn net.Conn) {
 
 func (s *Server) closeActiveConns() {
 	s.activeMu.Lock()
+	// A handler accepted just before listener shutdown, or an upstream dial
+	// completing concurrently, must not add a socket after this drain.
+	s.closing = true
 	conns := make([]net.Conn, 0, len(s.activeConns))
 	for conn := range s.activeConns {
 		conns = append(conns, conn)
@@ -396,7 +410,18 @@ type prefixedConn struct {
 	Reader *bufio.Reader
 }
 
-func (c *prefixedConn) Read(p []byte) (int, error) { return c.Reader.Read(p) }
+func (c *prefixedConn) Read(p []byte) (int, error) {
+	if c.Reader == nil {
+		return c.Conn.Read(p)
+	}
+	n, err := c.Reader.Read(p)
+	if c.Reader.Buffered() == 0 {
+		// The sniff buffer is only needed for the initial prefix. Keeping it
+		// attached would pin up to SniffBytes for this connection's lifetime.
+		c.Reader = nil
+	}
+	return n, err
+}
 
 type trafficRecorder struct {
 	mu        sync.Mutex

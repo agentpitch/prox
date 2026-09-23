@@ -23,3 +23,16 @@ func TestCompactExeCacheDropsExpiredEntries(t *testing.T) {
 		t.Fatalf("fresh PID cache entry missing or changed: %+v", got[20])
 	}
 }
+
+func TestCompactExeCacheReusesFreshCache(t *testing.T) {
+	now := time.Now()
+	cache := map[uint32]exeCacheEntry{
+		10: {Path: `C:\live.exe`, Expires: now.Add(time.Minute)},
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		cache = compactExeCache(cache, now)
+	})
+	if allocs != 0 {
+		t.Fatalf("unchanged process cache allocates %.1f times per refresh", allocs)
+	}
+}

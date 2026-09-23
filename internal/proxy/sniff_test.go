@@ -3,10 +3,48 @@ package proxy
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"io"
 	"net"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
+
+type sniffReaderConn struct {
+	trackedConnStub
+	reader io.Reader
+}
+
+func (c *sniffReaderConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func TestPeekAndSniffHTTPPreservesBufferedAndFragmentedRequests(t *testing.T) {
+	for _, tc := range []struct{ name, request, hostname string }{
+		{"mixed-case Host", "GET / HTTP/1.1\r\nX-Pad: " + strings.Repeat("x", 3000) + "\r\nhOsT: Example.COM:80\r\n\r\npayload", "example.com"},
+		{"CONNECT", "CONNECT Example.COM:443 HTTP/1.1\r\n\r\npayload", "example.com"},
+		{"Host in body is not a header", "POST / HTTP/1.1\r\nContent-Length: 19\r\n\r\nHost: fake.example\r\n", ""},
+	} {
+		for _, fragmented := range []bool{false, true} {
+			name := tc.name + "/buffered"
+			var input io.Reader = strings.NewReader(tc.request)
+			if fragmented {
+				name = tc.name + "/fragmented"
+				input = iotest.OneByteReader(input)
+			}
+			t.Run(name, func(t *testing.T) {
+				conn := &sniffReaderConn{reader: input}
+				br, result, err := PeekAndSniff(conn, 4096, 0)
+				if err != nil || result.Hostname != tc.hostname {
+					t.Fatalf("sniff result=%+v error=%v, want %q", result, err, tc.hostname)
+				}
+				data, err := io.ReadAll(br)
+				if err != nil || string(data) != tc.request {
+					t.Fatalf("sniff consumed/changed request: error=%v len=%d want=%d", err, len(data), len(tc.request))
+				}
+			})
+		}
+	}
+}
 
 func TestPeekAndSniffHTTPDoesNotWaitForMaxBytes(t *testing.T) {
 	client, server := net.Pipe()

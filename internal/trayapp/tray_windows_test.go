@@ -8,46 +8,111 @@ import (
 	"image/color"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/agentpitch/prox/internal/monitor"
+	"golang.org/x/sys/windows"
 )
 
-func TestEncodeICOUsesUncompressedDIB(t *testing.T) {
+func TestEncodeIconDIBUsesUncompressedAlignedPixels(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
 	img.SetNRGBA(0, 15, color.NRGBA{R: 11, G: 22, B: 33, A: 44})
 
-	data, err := encodeICO(img)
+	data, err := encodeIconDIB(img)
 	if err != nil {
-		t.Fatalf("encodeICO: %v", err)
+		t.Fatalf("encodeIconDIB: %v", err)
 	}
 	const (
-		iconHeader = 6 + 16
-		dibHeader  = 40
-		xorBytes   = 16 * 16 * 4
-		maskBytes  = 16 * 4
-		wantLen    = iconHeader + dibHeader + xorBytes + maskBytes
+		dibHeader = 40
+		xorBytes  = 16 * 16 * 4
+		maskBytes = 16 * 4
+		wantLen   = dibHeader + xorBytes + maskBytes
 	)
 	if len(data) != wantLen {
-		t.Fatalf("ico len = %d, want %d", len(data), wantLen)
+		t.Fatalf("DIB len = %d, want %d", len(data), wantLen)
 	}
-	if got := binary.LittleEndian.Uint16(data[2:4]); got != 1 {
-		t.Fatalf("icon type = %d, want 1", got)
+	if uintptr(unsafe.Pointer(&data[0]))%4 != 0 {
+		t.Fatal("icon resource must be DWORD-aligned")
 	}
-	if got := binary.LittleEndian.Uint32(data[14:18]); got != dibHeader+xorBytes+maskBytes {
-		t.Fatalf("image bytes = %d, want %d", got, dibHeader+xorBytes+maskBytes)
-	}
-	if got := binary.LittleEndian.Uint32(data[22:26]); got != dibHeader {
+	if got := binary.LittleEndian.Uint32(data[0:4]); got != dibHeader {
 		t.Fatalf("DIB header size = %d, want %d", got, dibHeader)
 	}
-	if got := binary.LittleEndian.Uint32(data[30:34]); got != 32 {
+	if got := binary.LittleEndian.Uint32(data[8:12]); got != 32 {
 		t.Fatalf("DIB height = %d, want 32", got)
 	}
-	firstPixel := data[iconHeader+dibHeader : iconHeader+dibHeader+4]
+	firstPixel := data[dibHeader : dibHeader+4]
 	if got := [4]byte{firstPixel[0], firstPixel[1], firstPixel[2], firstPixel[3]}; got != [4]byte{33, 22, 11, 44} {
 		t.Fatalf("first BGRA pixel = %v, want [33 22 11 44]", got)
+	}
+}
+
+func TestInMemoryIconsReleaseNativeResources(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
+	drawTrafficIconFrame(img)
+	getGUIResources := windows.NewLazySystemDLL("user32.dll").NewProc("GetGuiResources")
+	resourceCount := func() uintptr {
+		t.Helper()
+		count, _, _ := getGUIResources.Call(^uintptr(0), 1) // GR_USEROBJECTS
+		return count
+	}
+	makeAndDestroy := func() {
+		t.Helper()
+		icon, err := createIcon(img)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok, _, err := procDestroyIcon.Call(uintptr(icon)); ok == 0 {
+			t.Fatalf("DestroyIcon: %v", err)
+		}
+	}
+	makeAndDestroy() // Initialize USER32 before measuring steady state.
+	before := resourceCount()
+	for i := 0; i < 500; i++ {
+		makeAndDestroy()
+	}
+	after := resourceCount()
+	t.Logf("USER resources before=%d after=%d", before, after)
+	if after > before+2 {
+		t.Fatalf("icon churn leaked USER resources: %d -> %d", before, after)
+	}
+}
+
+func TestPollerStopsBeforeFirstTick(t *testing.T) {
+	h := &helper{}
+	stop := h.startPolling()
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopping the tray left its poller running")
+	}
+}
+
+func TestCleanupDestroysHiddenWindowAndRejectsFurtherIcons(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	h := &helper{}
+	if err := h.createWindow(); err != nil {
+		t.Fatal(err)
+	}
+	h.cleanup()
+	isWindow := windows.NewLazySystemDLL("user32.dll").NewProc("IsWindow")
+	if exists, _, _ := isWindow.Call(uintptr(h.hwnd)); exists != 0 {
+		t.Fatal("tray cleanup left its hidden window alive")
+	}
+	if err := h.updateIcon(nil, "", "late update"); err != nil {
+		t.Fatal(err)
+	}
+	if h.iconHandle != 0 {
+		t.Fatal("an icon was recreated after cleanup")
 	}
 }
 

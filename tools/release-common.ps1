@@ -5,6 +5,7 @@ $PitchProxReleaseSettings = [ordered]@{
     GOARCH                   = "amd64"
     GOAMD64                  = "v1"
     CGOEnabled               = "0"
+    MaxWritableStaticBytes   = 2MB
     WinDivertVersion         = "2.2.2"
     WinDivertReleaseURL      = "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
     WinDivertReleasePage     = "https://github.com/basil00/WinDivert/releases/tag/v2.2.2"
@@ -123,6 +124,107 @@ function Assert-PitchProxBuildToolchain {
         GOENV       = "off"
         GOEXPERIMENT = $goExperiment
         GOFIPS140   = $goFIPS140
+    }
+}
+
+function Assert-PitchProxLeanDependencies {
+    # Check only the shipped command: test servers may legitimately use net/http
+    # and TLS. A standard-library import alone can reserve tens of MiB of static
+    # memory, so checking go.mod or the compressed executable size is insufficient.
+    $dependencies = @(Invoke-PitchProxNative -FilePath "go" -Arguments @("list", "-mod=readonly", "-deps", "./cmd/pitchprox") -FailureMessage "Unable to inspect production dependencies")
+    $forbidden = @(
+        "crypto/internal/fips140/drbg",
+        "crypto/rand",
+        "crypto/sha256",
+        "crypto/tls",
+        "net/http",
+        "modernc.org/sqlite",
+        "modernc.org/libc"
+    )
+    $present = @($forbidden | Where-Object { $_ -in $dependencies })
+    if ($present.Count -gt 0) {
+        throw "Production dependency memory regression: $($present -join ', '). Use the platform crypto/HTTP adapters; do not disable this gate to ship a heavy runtime."
+    }
+}
+
+function Assert-PitchProxLeanBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath
+    )
+
+    # Read only DOS, PE and section headers. In particular, do not mistake the
+    # small raw .data section for the much larger zero-initialized virtual data.
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    $reader = New-Object IO.BinaryReader($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) {
+            throw "Invalid DOS header in candidate executable"
+        }
+        $stream.Position = 0x3c
+        $peOffset = [long]$reader.ReadUInt32()
+        if ($peOffset -lt 64 -or $peOffset + 24 -gt $stream.Length) {
+            throw "Invalid PE header offset in candidate executable"
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) {
+            throw "Candidate is not a Windows amd64 PE executable"
+        }
+        $sectionCount = $reader.ReadUInt16()
+        $stream.Position = $peOffset + 20
+        $optionalSize = $reader.ReadUInt16()
+        $sectionTable = $peOffset + 24 + $optionalSize
+        if ($sectionCount -lt 1 -or $sectionCount -gt 96 -or $optionalSize -lt 70 -or $sectionTable + 40 * $sectionCount -gt $stream.Length) {
+            throw "Invalid PE section table in candidate executable"
+        }
+        $stream.Position = $peOffset + 24
+        if ($reader.ReadUInt16() -ne 0x20b) {
+            throw "Candidate is not a PE32+ executable"
+        }
+        $stream.Position = $peOffset + 24 + 68
+        if ($reader.ReadUInt16() -ne 2) {
+            throw "Candidate does not use the Windows GUI subsystem"
+        }
+        $dataSections = 0
+        [long]$dataVirtualBytes = 0
+        [long]$dataRawBytes = 0
+        [long]$writableVirtualBytes = 0
+        for ($index = 0; $index -lt $sectionCount; $index++) {
+            $stream.Position = $sectionTable + 40 * $index
+            $name = [Text.Encoding]::ASCII.GetString($reader.ReadBytes(8)).TrimEnd([char]0)
+            $virtualSize = [long]$reader.ReadUInt32()
+            $null = $reader.ReadUInt32() # VirtualAddress
+            $rawSize = [long]$reader.ReadUInt32()
+            $rawOffset = [long]$reader.ReadUInt32()
+            $stream.Position = $sectionTable + 40 * $index + 36
+            $characteristics = [long]$reader.ReadUInt32()
+            if ($rawSize -gt 0 -and ($rawOffset -lt $sectionTable + 40 * $sectionCount -or $rawOffset + $rawSize -gt $stream.Length)) {
+                throw "Invalid raw section range in candidate executable: $name"
+            }
+            if (($characteristics -band 2147483648) -ne 0) {
+                $writableVirtualBytes += [Math]::Max($virtualSize, $rawSize)
+            }
+            if ($name -eq ".data") {
+                $dataSections++
+                $dataVirtualBytes = $virtualSize
+                $dataRawBytes = $rawSize
+            }
+        }
+        if ($dataSections -ne 1 -or $dataVirtualBytes -le 0) {
+            throw "Candidate must contain exactly one nonempty .data section"
+        }
+        if ($dataVirtualBytes -gt $PitchProxReleaseSettings.MaxWritableStaticBytes -or $writableVirtualBytes -gt $PitchProxReleaseSettings.MaxWritableStaticBytes) {
+            throw "Static memory regression: .data VirtualSize=$dataVirtualBytes, writable sections=$writableVirtualBytes; limit=$($PitchProxReleaseSettings.MaxWritableStaticBytes) bytes"
+        }
+        return [pscustomobject][ordered]@{
+            data_virtual_bytes = $dataVirtualBytes
+            data_raw_bytes = $dataRawBytes
+            writable_static_bytes = $writableVirtualBytes
+            writable_static_limit_bytes = $PitchProxReleaseSettings.MaxWritableStaticBytes
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
     }
 }
 

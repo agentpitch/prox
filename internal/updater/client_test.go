@@ -846,7 +846,6 @@ func newTestGitHubClient(t *testing.T, handler http.Handler) *GitHubClient {
 	t.Cleanup(server.Close)
 	client, err := NewGitHubClient(ClientOptions{
 		ReleasesURL: server.URL + "/releases",
-		HTTPClient:  server.Client(),
 		AllowHTTP:   true,
 	})
 	if err != nil {

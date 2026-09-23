@@ -4,12 +4,47 @@ package updater
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRequestHealthUsesBoundedLoopbackResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		fail   bool
+	}{
+		{"valid", 200, `{"ok":true,"version":"v0.45","pid":123,"update_token":"token"}`, false},
+		{"oversized", 200, strings.Repeat(" ", 8<<10) + `{"ok":true}`, true},
+		{"redirect", 302, `{}`, true},
+		{"invalid", 200, `{`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "GET" || r.URL.Path != "/api/health" {
+					t.Errorf("unexpected health request: %s %s", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Location", "http://192.0.2.1/should-not-follow")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			health, err := requestHealth(strings.TrimPrefix(server.URL, "http://"))
+			if (err != nil) != tc.fail || (!tc.fail && (!health.OK || health.PID != 123 || health.UpdateToken != "token")) {
+				t.Fatalf("health=%+v err=%v", health, err)
+			}
+		})
+	}
+	if _, err := requestHealth("192.0.2.1:80"); err == nil {
+		t.Fatal("non-loopback health address accepted")
+	}
+}
 
 func TestWindowsUpdateLockBatonExcludesOtherManagers(t *testing.T) {
 	directory := updaterTestTempDir(t)
@@ -87,7 +122,7 @@ func TestVerifyActiveTransactionIsBoundToPlan(t *testing.T) {
 	createdAt := time.Now().UTC().Add(-time.Second)
 	plan := HandoffPlan{
 		StatePath: filepath.Join(directory, stateFileName), Version: "v0.44",
-		UpdateToken: token, TransactionID: transactionIDForToken(token), CreatedAt: createdAt,
+		UpdateToken: token, TransactionID: mustTransactionID(t, token), CreatedAt: createdAt,
 	}
 	active := Status{
 		Phase: PhaseRestarting, Busy: true, Version: plan.Version,

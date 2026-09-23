@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.44.1",
+    [string]$Version = "v0.44.2",
     [switch]$SkipChecks,
     [switch]$AllowDirty,
     [switch]$DownloadWinDivertArchive,
@@ -201,6 +201,7 @@ try {
         Invoke-PitchProxNative -FilePath "node" -Arguments @("--check", "internal\webui\dist\rules-ui.js") -FailureMessage "rules-ui.js syntax check failed"
         Invoke-PitchProxNative -FilePath "node" -Arguments @("--check", "internal\webui\dist\app.js") -FailureMessage "app.js syntax check failed"
         Invoke-PitchProxNative -FilePath "node" -Arguments @("--test", "internal\webui\rules_ui_test.js", "internal\webui\lifecycle_test.js") -FailureMessage "WebUI unit tests failed"
+        & (Join-Path $PSScriptRoot "release-memory.test.ps1")
         Invoke-PitchProxNative -FilePath "go" -Arguments @("mod", "download") -FailureMessage "Go module download failed"
         Invoke-PitchProxNative -FilePath "go" -Arguments @("mod", "verify") -FailureMessage "Go module verification failed"
         Invoke-PitchProxNative -FilePath "go" -Arguments @("test", "-mod=readonly", "-count=1", "-cover", "./...") -FailureMessage "Go tests failed"
@@ -347,6 +348,7 @@ try {
     }
 
     $builtExe = Join-Path $packageDir "pitchProx.exe"
+    $memoryLayout = Assert-PitchProxLeanBinary -LiteralPath $builtExe
     $moduleLines = @(Invoke-PitchProxNative -FilePath "go" -Arguments @("version", "-m", $builtExe) -FailureMessage "Unable to read candidate module metadata")
     $moduleMetadata = $moduleLines -join "`n"
     $normalizedModuleLines = @($moduleLines | ForEach-Object {
@@ -441,6 +443,7 @@ try {
             sha256 = $exeHash
             injected_version_verified = $true
         }
+        memory_layout = $memoryLayout
         release_notes_source = $releaseNotesSourceDescription
         go_version_m = $normalizedModuleLines
     }

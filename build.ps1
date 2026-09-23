@@ -66,6 +66,7 @@ try {
     Push-Location $repoRoot
     $locationPushed = $true
     $toolchain = Assert-PitchProxBuildToolchain -ExpectedModulePath (Join-Path $repoRoot "go.mod")
+    Assert-PitchProxLeanDependencies
     New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
     $exePath = Join-Path $outputPath $OutputName
     $ldflags = "-H=windowsgui -s -w -X github.com/agentpitch/prox/internal/buildinfo.Version=$Version"
@@ -79,6 +80,7 @@ try {
         "-o", $exePath,
         ".\cmd\pitchprox"
     ) -FailureMessage "go build failed"
+    $memoryLayout = Assert-PitchProxLeanBinary -LiteralPath $exePath
 
     foreach ($runtimeFile in $availableRuntimeFiles) {
         $runtimeDestination = [IO.Path]::GetFullPath((Join-Path $outputPath $runtimeFile.Name))
@@ -94,6 +96,7 @@ try {
 }
 
 Write-Host "Built $exePath (version $Version, $($toolchain.GoVersion), windows/amd64, CGO_ENABLED=0, GUI subsystem)"
+Write-Host "Verified static writable memory: $($memoryLayout.writable_static_bytes) bytes (limit $($memoryLayout.writable_static_limit_bytes))"
 foreach ($runtimeFile in $runtimeFiles) {
     if ($runtimeFile.Name -notin @($availableRuntimeFiles | ForEach-Object { $_.Name })) {
         Write-Warning "Missing $($runtimeFile.Name). Download the exact WinDivert $($PitchProxReleaseSettings.WinDivertVersion) runtime from $($PitchProxReleaseSettings.WinDivertReleasePage)"

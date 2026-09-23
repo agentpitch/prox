@@ -25,9 +25,9 @@ This archive contains the current optimized baseline with segment-backed history
 - periodic WebUI refreshes can skip historical log payloads, while tab hide/close explicitly marks the UI inactive;
 - WebUI traffic snapshots are bucketed on the backend, so long retention windows do not emit or render full per-second series;
 - relay accounting is batched instead of writing counters on every copied chunk;
-- the embedded WebUI/control plane uses a lightweight loopback HTTP
-  implementation; the explicit GitHub updater and short-lived `ctl` client
-  use `net/http`, with no idle network polling;
+- the embedded WebUI/control plane and CLI use bounded loopback HTTP;
+  the Windows updater uses WinHTTP and CNG without linking Go HTTP/TLS/crypto
+  into the resident process; there is no idle network polling;
 - SQLite and `modernc` were removed from the runtime path.
 - history recovery, retry and pending-memory behavior are bounded for long-running disk-error scenarios;
 - process-path caches validate PID reuse with process creation time;
@@ -37,13 +37,13 @@ This archive contains the current optimized baseline with segment-backed history
 - IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
 - runtime config activation rolls back if a required listener/interception restart fails.
 
-## v0.44.1 release gate
+## v0.44.2 release gate
 
-A publishable v0.44.1 candidate is prepared only from a committed clean working
+A publishable v0.44.2 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44.1 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44.2 -DownloadWinDivertArchive
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is
@@ -64,6 +64,7 @@ go vet -mod=readonly ./...
 git diff --check and git show --check HEAD
 physical working-tree EOLs match .gitattributes
 go build -mod=readonly -trimpath -buildvcs=true with the Windows GUI subsystem
+production dependency and PE writable-static-memory gates (2 MiB ceiling)
 ```
 
 Before packaging, GitHub CI also runs the pinned `govulncheck` v1.8.0 against
@@ -103,9 +104,9 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
 
 - `go version -m` lists only `golang.org/x/sys` as a non-stdlib dependency;
 - SQLite/`modernc` remain absent from the runtime and symbol table;
-- `net/http` and `crypto/tls` are now intentionally linked by the on-demand
-  GitHub updater. The custom WebUI server still does not use them, and no
-  updater network request runs until the user presses **Проверить обновления**;
+- `net/http`, `crypto/tls`, `crypto/rand`, `crypto/sha256` and the static FIPS
+  DRBG buffer are excluded from the Windows production dependency graph;
+  test servers and non-Windows adapters may use standard Go implementations;
 - executable size is no longer compared with the pre-updater 4.26 MB baseline.
   The exact size and SHA-256 of each candidate are recorded in
   `pitchProx-build-manifest.json` and `pitchProx-windows-amd64.sha256`;
@@ -114,11 +115,27 @@ go build -trimpath -o build\pitchProx-debug.exe .\cmd\pitchprox
   - `modernc.org/sqlite`
   - `modernc.org/libc`
 
-## What was not executed here
+## Native transport verification
 
-- elevated end-to-end runtime execution of `pitchProx.exe run`;
-- WinDivert interception against a live Windows network stack;
-- Windows tray interaction with the real shell;
+The CNG implementation is checked against SHA-256 known vectors and the Go
+reference implementation, including streaming and resource finalization. HTTP
+tests cover invalid certificates, redirect restrictions, truncated bodies,
+cancellation before headers and during reads, unread-body deadlines, concurrent
+close/read, repeated callback cleanup, and explicit proxy selection. Local
+control tests cover bounded framing, IPv6, stale revisions and no mutation retry.
+
+A controlled 60-second comparison of v0.44.1 and a v0.44.2 candidate on the same
+Windows host measured approximately 49 versus 16.4 MiB private commit, without
+UI, tray, interception, forced GC or working-set trimming. Live GitHub discovery
+and verified staging of the published v0.44.1 EXE also passed through WinHTTP
+and CNG; the downloaded bytes matched the published SHA-256 independently.
+
+See [UPDATER_TRANSPORT.md](docs/UPDATER_TRANSPORT.md) for platform security,
+resource ownership and environment-proxy compatibility boundaries.
+
+## Broader platform scenarios still requiring separate verification
+
+- manual interaction with every tray and browser UI action;
 - Windows Service installation/start/stop;
 - elevated end-to-end updater handoff through helper, SCM replacement, health
   confirmation, and forced rollback. Unit tests exercise real Windows

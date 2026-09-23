@@ -131,7 +131,7 @@ jobs:
             release-assets/pitchProx-windows-amd64.sha256
             release-assets/pitchProx-build-manifest.json
 
-      - name: Verify assets, publish, and confirm older updater availability
+      - name: Verify assets, publish, and confirm current updater with asset fallback
         shell: bash
         timeout-minutes: 2
         env:
@@ -145,5 +145,5 @@ jobs:
             --release-id "$RELEASE_ID" --publish-body "$RUNNER_TEMP/publish-release.json"
           timeout 15s gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --input "$RUNNER_TEMP/publish-release.json" --silent
-          python3 tools/verify-github-release.py published \
+          python3 tools/verify-github-release.py published-current \
             --repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --release-id "$RELEASE_ID"

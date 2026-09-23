@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -46,7 +47,7 @@ def api_json(path, *, authenticated, allow_not_found=False, timeout=5):
         if error.code == 404 and allow_not_found:
             return NOT_FOUND
         raise GateError(f"GitHub API returned HTTP {error.code} for {path}") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, HTTPException):
         raise GateError(f"GitHub API request failed for {path}") from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise GateError("GitHub API response exceeded the size limit")
@@ -85,8 +86,12 @@ def local_assets(directory):
     return expected
 
 
-def verify_assets(assets, expected):
-    if not isinstance(assets, list) or len(assets) != len(expected):
+def verify_assets(assets, expected, *, allow_partial=False):
+    if (
+        not isinstance(assets, list)
+        or len(assets) > len(expected)
+        or (not allow_partial and len(assets) != len(expected))
+    ):
         raise GateError("Release must expose exactly the four packaged assets")
     seen = set()
     for asset in assets:
@@ -126,7 +131,7 @@ def prepare_publish(repository, tag, release_id, expected, body_path):
     body_path.write_text(json.dumps({"draft": False}) + "\n", encoding="utf-8")
 
 
-def verify_public(repository, tag, release_id, expected, *, wait_seconds=75):
+def verify_public(repository, tag, release_id, expected, *, wait_seconds=75, current_updater=False):
     deadline = time.monotonic() + wait_seconds
     last_error = "Published release metadata is not available"
     while time.monotonic() < deadline:
@@ -142,7 +147,8 @@ def verify_public(repository, tag, release_id, expected, *, wait_seconds=75):
             if len(matching) != 1:
                 raise GateError("Public release list does not contain exactly one matching release")
             verify_release(matching[0], tag, release_id, draft=False)
-            verify_assets(matching[0].get("assets"), expected)
+            listed_assets = matching[0].get("assets", [])
+            verify_assets(listed_assets, expected, allow_partial=current_updater)
             if time.monotonic() >= deadline:
                 break
             release = api_json(
@@ -151,20 +157,43 @@ def verify_public(repository, tag, release_id, expected, *, wait_seconds=75):
                 timeout=min(5, max(0.1, deadline - time.monotonic())),
             )
             verify_release(release, tag, release_id, draft=False)
-            verify_assets(release.get("assets"), expected)
-            print("Anonymous release list and tag metadata expose all four verified assets")
+            tagged_assets = release.get("assets", [])
+            verify_assets(tagged_assets, expected, allow_partial=current_updater)
+            if current_updater:
+                if time.monotonic() >= deadline:
+                    break
+                # v0.44.1+ resolves incomplete nested arrays through this
+                # canonical endpoint. Always verify the full set, and never
+                # let the fallback excuse corrupt or duplicate nested assets.
+                canonical_assets = api_json(
+                    f"repos/{repository}/releases/{release_id}/assets?per_page=100",
+                    authenticated=False,
+                    timeout=min(5, max(0.1, deadline - time.monotonic())),
+                )
+                verify_assets(canonical_assets, expected)
+                print("Anonymous list/tag identities and all four canonical assets verified for the current updater (v0.44.1+)")
+                if len(listed_assets) != len(expected) or len(tagged_assets) != len(expected):
+                    print(
+                        "::warning::Legacy v0.43 updater compatibility is NOT confirmed: GitHub nested asset metadata is incomplete. "
+                        "The current updater uses the verified numeric assets endpoint; v0.43 may require manual installation."
+                    )
+                else:
+                    print("Legacy v0.43 nested-asset compatibility also confirmed")
+            else:
+                print("Anonymous release list and tag metadata expose all four verified assets")
             return
         except GateError as error:
             last_error = str(error)
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(5, remaining))
-    raise GateError("Release is published, but older updater compatibility was not confirmed: " + last_error)
+    requirement = "current updater availability" if current_updater else "older updater compatibility"
+    raise GateError(f"Release is published, but {requirement} was not confirmed: " + last_error)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "prepare", "published"))
+    parser.add_argument("mode", choices=("preflight", "prepare", "published", "published-current"))
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--release-id", type=int)
@@ -187,7 +216,7 @@ def main():
             prepare_publish(args.repository, args.tag, args.release_id, expected, args.publish_body)
             print("Draft release assets match the verified local package")
         else:
-            verify_public(args.repository, args.tag, args.release_id, expected)
+            verify_public(args.repository, args.tag, args.release_id, expected, current_updater=args.mode == "published-current")
     except (GateError, OSError) as error:
         print(f"Release verification failed: {error}", file=sys.stderr)
         sys.exit(1)

@@ -48,6 +48,14 @@ This file maps concepts to source files.
 
 ## Application updater
 
+- `internal/platformcrypto` - Windows CNG SHA-256 and secure tokens, with explicit
+  native resource ownership; standard Go implementations are restricted to
+  non-Windows builds and tests.
+- `internal/httpclient` - bounded streaming GET requests through Windows WinHTTP,
+  including certificate validation, redirects, cancellation and handle cleanup.
+- `internal/localhttp` - bounded loopback-only HTTP for CLI mutations and helper
+  health checks; no DNS for localhost, redirects, proxies or automatic retries.
+
 - `internal/updater/client.go` - bounded GitHub Releases client, exact asset and
   manifest/checksum verification, legacy-runtime compatibility gate, and
   streamed executable staging.

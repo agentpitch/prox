@@ -5,14 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"debug/pe"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,6 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/agentpitch/prox/internal/httpclient"
+	"github.com/agentpitch/prox/internal/platformcrypto"
 )
 
 var canonicalReleaseTag = regexp.MustCompile(`^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$`)
@@ -51,13 +52,13 @@ type Source interface {
 
 type ClientOptions struct {
 	ReleasesURL string
-	HTTPClient  *http.Client
+	HTTPClient  *httpclient.Client
 	AllowHTTP   bool // tests only
 }
 
 type GitHubClient struct {
 	releasesURL *url.URL
-	httpClient  *http.Client
+	httpClient  *httpclient.Client
 	allowHTTP   bool
 }
 
@@ -75,19 +76,19 @@ func NewGitHubClient(options ClientOptions) (*GitHubClient, error) {
 	}
 	base := options.HTTPClient
 	if base == nil {
-		base = &http.Client{Timeout: 5 * time.Minute}
+		base = &httpclient.Client{Timeout: 5 * time.Minute}
 	}
 	clone := *base
 	previousRedirect := clone.CheckRedirect
-	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
+	clone.CheckRedirect = func(destination *url.URL, redirects int) error {
+		if redirects >= 5 {
 			return errors.New("too many update download redirects")
 		}
-		if err := validateRemoteURL(req.URL, options.AllowHTTP, parsed.Hostname()); err != nil {
+		if err := validateRemoteURL(destination, options.AllowHTTP, parsed.Hostname()); err != nil {
 			return err
 		}
 		if previousRedirect != nil {
-			return previousRedirect(req, via)
+			return previousRedirect(destination, redirects)
 		}
 		return nil
 	}
@@ -449,7 +450,11 @@ func hashZipEntry(entry *zip.File) (string, error) {
 		return "", err
 	}
 	defer reader.Close()
-	hash := sha256.New()
+	hash, err := platformcrypto.NewSHA256()
+	if err != nil {
+		return "", err
+	}
+	defer hash.Close()
 	written, err := io.CopyBuffer(hash, io.LimitReader(reader, maxRuntimeBytes+1), make([]byte, 64<<10))
 	if err != nil {
 		return "", err
@@ -457,7 +462,11 @@ func hashZipEntry(entry *zip.File) (string, error) {
 	if written != int64(entry.UncompressedSize64) || written > maxRuntimeBytes {
 		return "", errors.New("legacy runtime package entry exceeds its declared size")
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	sum, err := hash.Sum()
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (c *GitHubClient) downloadVerifiedBytes(ctx context.Context, item asset, limit int64, description string) ([]byte, error) {
@@ -469,7 +478,10 @@ func (c *GitHubClient) downloadVerifiedBytes(ctx context.Context, item asset, li
 	if err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256(body)
+	sum, err := platformcrypto.SHA256(body)
+	if err != nil {
+		return nil, err
+	}
 	if hex.EncodeToString(sum[:]) != want {
 		return nil, fmt.Errorf("%s SHA-256 does not match GitHub metadata", description)
 	}
@@ -481,12 +493,12 @@ func (c *GitHubClient) getBytes(ctx context.Context, rawURL, accept string, limi
 	if err != nil {
 		return nil, err
 	}
-	response, err := c.httpClient.Do(request)
+	response, err := c.httpClient.Do(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("download %s: %w", description, err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != 200 {
 		return nil, githubStatusError(response, description)
 	}
 	if expectedSize > 0 && response.ContentLength > 0 && response.ContentLength != expectedSize {
@@ -535,12 +547,12 @@ func (c *GitHubClient) downloadAssetFile(ctx context.Context, item asset, destin
 	if err != nil {
 		return err
 	}
-	response, err := c.httpClient.Do(request)
+	response, err := c.httpClient.Do(ctx, request)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", description, err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != 200 {
 		return githubStatusError(response, description)
 	}
 	if response.ContentLength > 0 && response.ContentLength != item.Size {
@@ -558,7 +570,11 @@ func (c *GitHubClient) downloadAssetFile(ctx context.Context, item asset, destin
 			_ = os.Remove(partPath)
 		}
 	}()
-	hash := sha256.New()
+	hash, err := platformcrypto.NewSHA256()
+	if err != nil {
+		return err
+	}
+	defer hash.Close()
 	writer := io.MultiWriter(file, hash)
 	buffer := make([]byte, 64<<10)
 	limited := &io.LimitedReader{R: response.Body, N: limit + 1}
@@ -588,7 +604,11 @@ func (c *GitHubClient) downloadAssetFile(ctx context.Context, item asset, destin
 	if written != item.Size {
 		return fmt.Errorf("%s size is %d bytes; expected %d", description, written, item.Size)
 	}
-	if got := hex.EncodeToString(hash.Sum(nil)); !strings.EqualFold(got, wantHash) {
+	sum, err := hash.Sum()
+	if err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(sum[:]); !strings.EqualFold(got, wantHash) {
 		return fmt.Errorf("%s SHA-256 verification failed", description)
 	}
 	if err := file.Sync(); err != nil {
@@ -612,7 +632,10 @@ func (c *GitHubClient) assetURL(id int64) string {
 	return base.String()
 }
 
-func (c *GitHubClient) newRequest(ctx context.Context, rawURL, accept string) (*http.Request, error) {
+func (c *GitHubClient) newRequest(ctx context.Context, rawURL, accept string) (*httpclient.Request, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse update URL: %w", err)
@@ -620,10 +643,7 @@ func (c *GitHubClient) newRequest(ctx context.Context, rawURL, accept string) (*
 	if err := validateRemoteURL(parsed, c.allowHTTP, c.releasesURL.Hostname()); err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
-	if err != nil {
-		return nil, err
-	}
+	request := &httpclient.Request{URL: parsed, Header: make(httpclient.Header)}
 	request.Header.Set("Accept", accept)
 	request.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 	request.Header.Set("User-Agent", "pitchProx-updater")
@@ -648,9 +668,9 @@ func validateRemoteURL(value *url.URL, allowHTTP bool, apiHost string) error {
 	return nil
 }
 
-func githubStatusError(response *http.Response, description string) error {
+func githubStatusError(response *httpclient.Response, description string) error {
 	message := fmt.Sprintf("GitHub returned HTTP %d for %s", response.StatusCode, description)
-	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests {
+	if response.StatusCode == 403 || response.StatusCode == 429 {
 		if reset := response.Header.Get("X-RateLimit-Reset"); reset != "" {
 			if seconds, err := strconv.ParseInt(reset, 10, 64); err == nil {
 				message += "; rate limit resets at " + time.Unix(seconds, 0).Local().Format(time.RFC3339)
@@ -858,11 +878,19 @@ func verifyLocalFileSHA256(path, expected string) error {
 		return err
 	}
 	defer file.Close()
-	hash := sha256.New()
+	hash, err := platformcrypto.NewSHA256()
+	if err != nil {
+		return err
+	}
+	defer hash.Close()
 	if _, err := io.CopyBuffer(hash, file, make([]byte, 64<<10)); err != nil {
 		return err
 	}
-	if !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), expected) {
+	sum, err := hash.Sum()
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), expected) {
 		return errors.New("SHA-256 does not match the release manifest; install the full package manually")
 	}
 	return nil

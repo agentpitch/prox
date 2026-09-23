@@ -4,14 +4,12 @@ package updater
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +17,9 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/agentpitch/prox/internal/localhttp"
+	"github.com/agentpitch/prox/internal/platformcrypto"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -658,7 +659,11 @@ func loadAndValidatePlan(planPath string) (HandoffPlan, error) {
 			return plan, errors.New("invalid update plan digest")
 		}
 	}
-	if plan.TransactionID != transactionIDForToken(plan.UpdateToken) {
+	transactionID, err := transactionIDForToken(plan.UpdateToken)
+	if err != nil {
+		return plan, err
+	}
+	if plan.TransactionID != transactionID {
 		return plan, errors.New("update transaction identity does not match its token")
 	}
 	target, err := filepath.Abs(plan.TargetPath)
@@ -1076,7 +1081,6 @@ func (application *launchedApplication) trackServiceProcess(status svc.Status) e
 }
 
 func waitForHealthyApplication(plan HandoffPlan, application *launchedApplication, installing bool) error {
-	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(newProcessTimeout)
 	consecutive := 0
 	for time.Now().Before(deadline) {
@@ -1092,7 +1096,7 @@ func waitForHealthyApplication(plan HandoffPlan, application *launchedApplicatio
 				continue
 			}
 		}
-		health, err := requestHealth(client, plan.ListenAddress)
+		health, err := requestHealth(plan.ListenAddress)
 		valid := err == nil && health.OK
 		if valid && installing && !plan.LegacyHealth {
 			valid = health.Version == plan.Version && health.PID == application.pid && health.UpdateToken == plan.UpdateToken
@@ -1119,25 +1123,19 @@ type healthResponse struct {
 	UpdateToken string `json:"update_token"`
 }
 
-func requestHealth(client *http.Client, address string) (healthResponse, error) {
+func requestHealth(address string) (healthResponse, error) {
 	var health healthResponse
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+address+"/api/health", nil)
+	response, err := localhttp.Request(context.Background(), localhttp.Options{
+		Timeout: 800 * time.Millisecond, DialTimeout: 800 * time.Millisecond,
+		MaxHeaderBytes: 8 << 10, MaxBodyBytes: 8 << 10,
+	}, "GET", "http://"+address+"/api/health", nil, nil)
 	if err != nil {
 		return health, err
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return health, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != 200 {
 		return health, fmt.Errorf("health returned HTTP %d", response.StatusCode)
 	}
-	content, err := io.ReadAll(io.LimitReader(response.Body, 8<<10))
-	if err != nil {
-		return health, err
-	}
-	if err := json.Unmarshal(content, &health); err != nil {
+	if err := json.Unmarshal(response.Body, &health); err != nil {
 		return health, err
 	}
 	return health, nil
@@ -1339,11 +1337,19 @@ func copyFileVerified(source, destination, expectedHash string) error {
 			_ = os.Remove(destination)
 		}
 	}()
-	hash := sha256.New()
+	hash, err := platformcrypto.NewSHA256()
+	if err != nil {
+		return err
+	}
+	defer hash.Close()
 	if _, err := io.CopyBuffer(io.MultiWriter(output, hash), input, make([]byte, 64<<10)); err != nil {
 		return err
 	}
-	if !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), expectedHash) {
+	sum, err := hash.Sum()
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), expectedHash) {
 		return errors.New("copied file SHA-256 verification failed")
 	}
 	if err := output.Sync(); err != nil {

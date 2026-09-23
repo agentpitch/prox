@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44.1 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44.2 -DownloadWinDivertArchive
 ```
 
-The candidate is written to `build\candidates\v0.44.1\`; it does not replace
+The candidate is written to `build\candidates\v0.44.2\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, then obtains and verifies the pinned
 official WinDivert archive for a release-grade updater manifest. If a network
@@ -276,7 +276,9 @@ return to a current build manually if needed.
 - [docs/CODE_AUDIT_2026-07-28.md](docs/CODE_AUDIT_2026-07-28.md) - code audit, long-running resource fixes, decisions, and remaining isolated tests.
 - [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) - preserved CPU investigation that motivated later runtime optimizations.
 - [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) - how to publish the repository to GitHub and use the included CI and release workflow.
-- [docs/RELEASE_NOTES_v0.44.1.md](docs/RELEASE_NOTES_v0.44.1.md) - release notes used for the v0.44.1 GitHub Release body.
+- [docs/RELEASE_NOTES_v0.44.2.md](docs/RELEASE_NOTES_v0.44.2.md) - platform HTTP/crypto and reduced background memory.
+- [docs/UPDATER_TRANSPORT.md](docs/UPDATER_TRANSPORT.md) - Windows TLS, native resources and environment proxy compatibility.
+- [docs/RELEASE_NOTES_v0.44.1.md](docs/RELEASE_NOTES_v0.44.1.md) - update discovery compatibility repair.
 - [CHECKS.md](CHECKS.md) - verification notes for this archive.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - bundled dependency notices and license locations.
 
@@ -303,7 +305,7 @@ used.
 A push to any branch, a pull request, or a manual workflow run executes the
 Windows build and uploads packaged workflow artifacts.
 
-If you push an approved tag such as `v0.44.1`, the same workflow also creates a
+If you push an approved tag such as `v0.44.2`, the same workflow also creates a
 versioned GitHub Release automatically. A matching
 `docs/RELEASE_NOTES_v<major>.<minor>[.<patch>].md` file is required (without the
 prerelease suffix), so patch tags cannot silently reuse older notes. The release attaches:
@@ -323,6 +325,8 @@ Desktop mode is optimized for a quiet idle state:
 - when the WebUI tab is hidden or closed, the backend is explicitly allowed to cool back down instead of treating the UI as permanently active;
 - after one hour without a marked browser request, only WebUI is automatically paused; one lazy deadline timer is used, proxy routing continues unchanged, and the tray exposes **Включить WebUI** while **Управление** remains an enable-and-open shortcut;
 - GitHub release discovery is strictly on demand; outside an active check or installation the updater performs no network polling and retains only a bounded five-release cache;
+- Windows HTTPS uses WinHTTP and SHA-256/update tokens use Windows CNG. The resident executable does not link Go's HTTP/TLS/FIPS implementation or its 32 MiB static entropy buffer. Local CLI/helper requests use a bounded loopback-only client;
+- every build checks production dependencies and the executable's writable static sections (maximum 2 MiB); the manifest records the measured section sizes;
 - WebUI traffic snapshots are server-bucketed to a bounded series, so long retention windows do not materialize huge per-second payloads in the backend or browser;
 - if every enabled rule is `Direct`, pitchProx starts in observer-only mode and does not start WinDivert or the transparent listener at all;
 - otherwise a lightweight SYN classifier decides whether a connection needs interception; a shared redirector is opened lazily while at least one selected flow exists and is closed again as soon as the flow table becomes empty;

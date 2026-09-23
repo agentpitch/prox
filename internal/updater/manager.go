@@ -2,8 +2,6 @@ package updater
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/agentpitch/prox/internal/platformcrypto"
 )
 
 const (
@@ -412,6 +412,12 @@ func (m *Manager) install(ctx context.Context, cancel context.CancelFunc, versio
 		m.fail(version, err)
 		return
 	}
+	transactionID, err := transactionIDForToken(token)
+	if err != nil {
+		_ = os.Remove(paths.Stage)
+		m.fail(version, fmt.Errorf("derive update transaction: %w", err))
+		return
+	}
 	listenAddress := strings.TrimSpace(m.listenProvider())
 	if listenAddress == "" {
 		_ = os.Remove(paths.Stage)
@@ -439,7 +445,7 @@ func (m *Manager) install(ctx context.Context, cancel context.CancelFunc, versio
 		OldSHA256:     oldHash,
 		NewSHA256:     newHash,
 		UpdateToken:   token,
-		TransactionID: transactionIDForToken(token),
+		TransactionID: transactionID,
 		LegacyHealth:  release.Verification == "legacy",
 		CreatedAt:     time.Now().UTC(),
 	}
@@ -840,10 +846,14 @@ func (m *Manager) loadHealthToken() {
 		return
 	}
 	if plan.Format != handoffPlanFormat || plan.FormatVersion != 2 || !strings.EqualFold(plan.TargetPath, m.executablePath) || plan.Version != m.currentVersion ||
-		len(plan.UpdateToken) != 64 || plan.TransactionID != transactionIDForToken(plan.UpdateToken) {
+		len(plan.UpdateToken) != 64 {
 		return
 	}
 	if _, err := hex.DecodeString(plan.UpdateToken); err != nil {
+		return
+	}
+	transactionID, err := transactionIDForToken(plan.UpdateToken)
+	if err != nil || plan.TransactionID != transactionID {
 		return
 	}
 	if time.Since(plan.CreatedAt) < 0 || time.Since(plan.CreatedAt) > 10*time.Minute {
@@ -888,15 +898,18 @@ func prepareTransactionPaths(paths transactionPaths) error {
 
 func randomToken() (string, error) {
 	value := make([]byte, 32)
-	if _, err := rand.Read(value); err != nil {
+	if err := platformcrypto.Random(value); err != nil {
 		return "", fmt.Errorf("generate update token: %w", err)
 	}
 	return hex.EncodeToString(value), nil
 }
 
-func transactionIDForToken(token string) string {
-	digest := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(digest[:])
+func transactionIDForToken(token string) (string, error) {
+	digest, err := platformcrypto.SHA256([]byte(token))
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func hashFile(path string) (string, error) {
@@ -905,11 +918,19 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	hash := sha256.New()
+	hash, err := platformcrypto.NewSHA256()
+	if err != nil {
+		return "", err
+	}
+	defer hash.Close()
 	if _, err := io.CopyBuffer(hash, file, make([]byte, 64<<10)); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	digest, err := hash.Sum()
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func writeJSONAtomic(path string, value any) error {

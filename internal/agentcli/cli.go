@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/agentpitch/prox/internal/config"
 	"github.com/agentpitch/prox/internal/control"
+	"github.com/agentpitch/prox/internal/localhttp"
 	"github.com/agentpitch/prox/internal/util"
 )
 
@@ -125,10 +125,9 @@ func execute(args []string, stdin io.Reader) (any, error) {
 		return nil, err
 	}
 	client := newClient(baseURL)
-	defer client.http.CloseIdleConnections()
 	switch inv.command {
 	case "status":
-		data, err := client.request(http.MethodGet, statusEndpoint, nil, false)
+		data, err := client.request("GET", statusEndpoint, nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -422,46 +421,14 @@ func normalizeURL(raw string) (string, error) {
 
 type client struct {
 	baseURL string
-	http    *http.Client
 }
 
 func newClient(baseURL string) *client {
-	dialer := &net.Dialer{Timeout: 3 * time.Second}
-	transport := &http.Transport{
-		Proxy: nil, DisableKeepAlives: true, MaxResponseHeaderBytes: 64 << 10,
-		ResponseHeaderTimeout: 30 * time.Second,
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, err
-			}
-			if host == "localhost" {
-				// A localhost listener may bind either family. Try literal
-				// loopback addresses only; never resolve a hostname to a remote
-				// peer. Fallback occurs before a connection/HTTP request exists,
-				// so an unconfirmed mutation is still never sent a second time.
-				conn, firstErr := dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
-				if firstErr == nil || ctx.Err() != nil {
-					return conn, firstErr
-				}
-				conn, secondErr := dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
-				if secondErr != nil {
-					return nil, errors.Join(firstErr, secondErr)
-				}
-				return conn, nil
-			}
-			ip, err := netip.ParseAddr(host)
-			if err != nil || !ip.IsLoopback() {
-				return nil, errors.New("non-loopback control connection rejected")
-			}
-			return dialer.DialContext(ctx, network, address)
-		},
-	}
-	return &client{baseURL: baseURL, http: &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &client{baseURL: baseURL}
 }
 
 func (c *client) request(method, endpoint string, payload any, mutation bool) (json.RawMessage, error) {
-	var body io.Reader
+	var body []byte
 	if payload != nil {
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -470,27 +437,21 @@ func (c *client) request(method, endpoint string, payload any, mutation bool) (j
 		if len(data) > maxJSONBytes {
 			return nil, failure("input_error", "request exceeds JSON size limit", 2)
 		}
-		body = bytes.NewReader(data)
+		body = data
 	}
-	req, err := http.NewRequest(method, c.baseURL+endpoint, body)
-	if err != nil {
-		return nil, failure("invalid_url", err.Error(), 2)
-	}
-	req.Header.Set("X-PitchProx-Agent", "1")
-	req.Header.Set("Accept", "application/json")
+	headers := map[string]string{"X-PitchProx-Agent": "1", "Accept": "application/json"}
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		headers["Content-Type"] = "application/json"
 	}
-	resp, err := c.http.Do(req)
+	resp, err := localhttp.Request(context.Background(), localhttp.Options{
+		Timeout: 30 * time.Second, DialTimeout: 3 * time.Second,
+		MaxHeaderBytes: 64 << 10, MaxBodyBytes: maxJSONBytes,
+	}, method, c.baseURL+endpoint, headers, body)
 	if err != nil {
 		return nil, transportFailure(err, mutation)
 	}
-	defer resp.Body.Close()
-	data, err := readBounded(resp.Body)
-	if err != nil {
-		return nil, transportFailure(err, mutation)
-	}
-	if resp.StatusCode == http.StatusNotFound {
+	data := resp.Body
+	if resp.StatusCode == 404 {
 		return nil, failure("upgrade_required", "server does not support agent control; upgrade the running pitchProx instance", 6)
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -533,17 +494,17 @@ func errorExit(code string, status int) int {
 	case "unavailable", "update_busy", "activation_failed", "forbidden":
 		return 5
 	}
-	if status == http.StatusConflict || status == http.StatusPreconditionFailed {
+	if status == 409 || status == 412 {
 		return 3
 	}
-	if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
+	if status == 400 || status == 422 {
 		return 2
 	}
 	return 7
 }
 
 func (c *client) getConfig() (config.Config, error) {
-	data, err := c.request(http.MethodGet, configEndpoint, nil, false)
+	data, err := c.request("GET", configEndpoint, nil, false)
 	if err != nil {
 		return config.Config{}, err
 	}
@@ -555,9 +516,9 @@ func (c *client) getConfig() (config.Config, error) {
 }
 
 func (c *client) save(candidate config.Config, dryRun, allowDisruptive bool) (json.RawMessage, error) {
-	method, endpoint := http.MethodPut, configEndpoint
+	method, endpoint := "PUT", configEndpoint
 	if dryRun {
-		method, endpoint = http.MethodPost, configEndpoint+"/validate"
+		method, endpoint = "POST", configEndpoint+"/validate"
 	}
 	data, err := c.request(method, endpoint, control.ConfigRequest{Config: candidate, ExpectedUpdatedAt: candidate.UpdatedAt, DryRun: dryRun, AllowDisruptive: allowDisruptive}, !dryRun)
 	if err != nil {

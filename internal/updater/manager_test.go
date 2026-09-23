@@ -499,7 +499,7 @@ func TestManagerLoadsPersistedStatusAndHealthToken(t *testing.T) {
 		TargetPath:    absolute,
 		Version:       "v0.43",
 		UpdateToken:   token,
-		TransactionID: transactionIDForToken(token),
+		TransactionID: mustTransactionID(t, token),
 		CreatedAt:     now.Add(-time.Minute),
 	}
 	planPath := filepath.Join(directory, planFileName)
@@ -648,7 +648,7 @@ func TestReconcileRequiresMatchingCompletedTransaction(t *testing.T) {
 				}
 			}
 			token := strings.Repeat("a", 64)
-			transactionID := transactionIDForToken(token)
+			transactionID := mustTransactionID(t, token)
 			createdAt := time.Now().UTC().Add(-time.Second)
 			plan := HandoffPlan{
 				Format: handoffPlanFormat, FormatVersion: 2, TargetPath: target,
@@ -735,7 +735,7 @@ func TestCheckPreservesSuccessfulCleanupWarningWhilePlanRemains(t *testing.T) {
 		StagePath: paths.Stage, BackupPath: paths.Backup, RecoveryPath: paths.Recovery,
 		PlanPath: paths.Plan, ReadyPath: paths.Ready, ProceedPath: paths.Proceed, StatePath: paths.State,
 		Version: "v0.44", OldVersion: "v0.43", OldSHA256: managerSHA256(oldContent), NewSHA256: managerSHA256(newContent),
-		UpdateToken: token, TransactionID: transactionIDForToken(token), CreatedAt: createdAt,
+		UpdateToken: token, TransactionID: mustTransactionID(t, token), CreatedAt: createdAt,
 	}
 	mustWriteManagerJSON(t, paths.Plan, plan)
 	mustWriteManagerJSON(t, paths.State, Status{
@@ -795,7 +795,7 @@ func TestReconcileKeepsRollbackCopiesWhenOldTargetSyncFails(t *testing.T) {
 		StagePath: paths.Stage, BackupPath: paths.Backup, RecoveryPath: paths.Recovery,
 		PlanPath: paths.Plan, ReadyPath: paths.Ready, ProceedPath: paths.Proceed, StatePath: paths.State,
 		Version: "v0.44", OldVersion: "v0.43", OldSHA256: managerSHA256(oldContent), NewSHA256: managerSHA256(newContent),
-		UpdateToken: token, TransactionID: transactionIDForToken(token), CreatedAt: createdAt,
+		UpdateToken: token, TransactionID: mustTransactionID(t, token), CreatedAt: createdAt,
 	}
 	mustWriteManagerJSON(t, paths.Plan, plan)
 	mustWriteManagerJSON(t, paths.State, Status{
@@ -897,6 +897,15 @@ func newManagerTestFixture(t *testing.T, current string, source Source, handoff 
 	}
 	t.Cleanup(manager.Close)
 	return manager, directory
+}
+
+func mustTransactionID(t *testing.T, token string) string {
+	t.Helper()
+	id, err := transactionIDForToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func managerSHA256(content []byte) string {

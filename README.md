@@ -109,10 +109,10 @@ To prepare a reviewable release candidate, first commit all intended source
 changes, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.43 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44 -DownloadWinDivertArchive
 ```
 
-The candidate is written to `build\candidates\v0.43\`; it does not replace
+The candidate is written to `build\candidates\v0.44\`; it does not replace
 `build\pitchProx.exe` or interact with a running pitchProx process. The release
 script runs all Go and WebUI checks, then obtains and verifies the pinned
 official WinDivert archive for a release-grade updater manifest. If a network
@@ -276,7 +276,7 @@ return to a current build manually if needed.
 - [docs/CODE_AUDIT_2026-07-28.md](docs/CODE_AUDIT_2026-07-28.md) - code audit, long-running resource fixes, decisions, and remaining isolated tests.
 - [docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md](docs/HISTORICAL_CPU_DIAGNOSTICS_2026-04-15.md) - preserved CPU investigation that motivated later runtime optimizations.
 - [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) - how to publish the repository to GitHub and use the included CI and release workflow.
-- [docs/RELEASE_NOTES_v0.43.md](docs/RELEASE_NOTES_v0.43.md) - release notes used for the v0.43 GitHub Release body.
+- [docs/RELEASE_NOTES_v0.44.md](docs/RELEASE_NOTES_v0.44.md) - release notes used for the v0.44 GitHub Release body.
 - [CHECKS.md](CHECKS.md) - verification notes for this archive.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) - bundled dependency notices and license locations.
 
@@ -303,7 +303,7 @@ used.
 A push to any branch, a pull request, or a manual workflow run executes the
 Windows build and uploads packaged workflow artifacts.
 
-If you push an approved tag such as `v0.43`, the same workflow also creates a
+If you push an approved tag such as `v0.44`, the same workflow also creates a
 versioned GitHub Release automatically. A matching
 `docs/RELEASE_NOTES_v<major>.<minor>.md` file is required, so future tags cannot
 silently reuse notes from v0.43. The release attaches:

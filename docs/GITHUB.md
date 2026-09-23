@@ -66,9 +66,9 @@ Third-party actions in the workflow are pinned to full commit SHAs.
 Branch builds use `dev-<short-commit>` as their embedded version. Tag builds use
 the exact tag. The packaging script rejects malformed version tags even though
 the workflow trigger itself uses the broader `v*` pattern. For a tag such as
-`v0.43` or `v0.43-rc.1`, the script requires
-`docs/RELEASE_NOTES_v0.43.md`; future major/minor tags therefore cannot
-silently publish v0.43 notes. Development artifacts receive a neutral generated
+`v0.44` or `v0.44-rc.1`, the script requires
+`docs/RELEASE_NOTES_v0.44.md`; future major/minor tags therefore cannot
+silently publish v0.44 notes. Development artifacts receive a neutral generated
 note instead.
 
 ## Publishing
@@ -77,8 +77,8 @@ After reviewing a clean candidate and merging the approved commit to `main`,
 create and push only the intended annotated tag:
 
 ```powershell
-git tag -a v0.43 -m "v0.43"
-git push origin v0.43
+git tag -a v0.44 -m "v0.44"
+git push origin v0.44
 ```
 
 Do not use `git push --tags` as a release command: unrelated local tags would
@@ -87,8 +87,8 @@ must not be created or pushed before approval.
 
 The release job downloads the Windows artifact, verifies its SHA-256 file on
 Linux, then publishes the executable, ZIP, checksum, and manifest. The curated
-v0.43 notes are prepended to GitHub-generated change notes. Tags containing a
-hyphen, such as `v0.43-rc.1`, are marked as prereleases.
+v0.44 notes are prepended to GitHub-generated change notes. Tags containing a
+hyphen, such as `v0.44-rc.1`, are marked as prereleases.
 
 The built-in updater treats these exact unique asset names as an API contract.
 It cross-checks the GitHub asset SHA-256 digest, checksum file, executable, and

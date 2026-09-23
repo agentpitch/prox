@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,256 @@ func TestGitHubClientListReleasesRejectsDuplicateAssets(t *testing.T) {
 				t.Fatalf("Reason = %q, want substring %q", releases[0].Reason, test.wantReason)
 			}
 		})
+	}
+}
+
+func TestGitHubClientRecoversIncompleteNestedAssets(t *testing.T) {
+	for _, nestedCount := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("nested-%d", nestedCount), func(t *testing.T) {
+			t.Parallel()
+			item := testGitHubRelease("v0.44", 394494379, time.Now().UTC(), false, false)
+			complete := append([]githubAsset(nil), item.Assets...)
+			item.Assets = item.Assets[:nestedCount]
+			// Ignore server-provided URLs; IDs form canonical repository URLs.
+			complete[0].URL = "https://untrusted.invalid/payload"
+			complete[0].ID++
+			complete[0].Size = 2048
+			var requests atomic.Int32
+			client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				switch r.URL.Path {
+				case "/releases":
+					_ = json.NewEncoder(w).Encode([]githubRelease{item})
+				case "/repos/agentpitch/prox/releases/394494379/assets":
+					if r.URL.Query().Get("per_page") != "33" || r.URL.Query().Get("page") != "1" {
+						t.Errorf("unbounded query: %s", r.URL.RawQuery)
+					}
+					if r.Header.Get("Accept") != "application/vnd.github+json" || r.Header.Get("X-GitHub-Api-Version") != githubAPIVersion {
+						t.Error("fallback lost GitHub API headers")
+					}
+					_ = json.NewEncoder(w).Encode(complete)
+				default:
+					t.Errorf("unexpected endpoint %s", r.URL)
+					w.WriteHeader(404)
+				}
+			}))
+			got, err := client.ListReleases(context.Background())
+			if err != nil || len(got) != 1 || !got[0].Installable || got[0].Verification != "manifest" {
+				t.Fatalf("ListReleases=%+v, %v", got, err)
+			}
+			if requests.Load() != 2 || got[0].executable.ID != complete[0].ID || got[0].Size != complete[0].Size || got[0].executable.APIURL != client.assetURL(complete[0].ID) {
+				t.Fatalf("lookup did not replace asset snapshot safely: %+v, requests %d", got[0], requests.Load())
+			}
+		})
+	}
+}
+
+func TestGitHubClientFallbackStillRequiresStrictAssets(t *testing.T) {
+	for _, mode := range []string{"empty", "missing_manifest", "duplicate_executable", "invalid_digest", "too_many", "server_error", "invalid_json", "oversized_response"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			item := testGitHubRelease("v0.44", 44, time.Now().UTC(), false, false)
+			assets := append([]githubAsset(nil), item.Assets...)
+			item.Assets = nil
+			switch mode {
+			case "empty":
+				assets = nil
+			case "missing_manifest":
+				assets = assets[:2]
+			case "duplicate_executable":
+				assets = append(assets, assets[0])
+			case "invalid_digest":
+				assets[0].Digest = ""
+			case "too_many":
+				for len(assets) <= maxReleaseAssets {
+					assets = append(assets, testGitHubAsset(int64(1000+len(assets)), fmt.Sprintf("extra-%d", len(assets)), 100))
+				}
+			}
+			var requests atomic.Int32
+			client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path == "/releases" {
+					_ = json.NewEncoder(w).Encode([]githubRelease{item})
+					return
+				}
+				if mode == "server_error" {
+					w.WriteHeader(503)
+					return
+				}
+				if mode == "invalid_json" {
+					_, _ = w.Write([]byte(`{"not":"a list"}`))
+					return
+				}
+				if mode == "oversized_response" {
+					_, _ = w.Write([]byte(strings.Repeat(" ", int(maxReleaseJSON)+1)))
+					return
+				}
+				// No pagination following: 33 entries already prove overflow.
+				w.Header().Set("Link", `<https://untrusted.invalid/next>; rel="next"`)
+				_ = json.NewEncoder(w).Encode(assets)
+			}))
+			got, err := client.ListReleases(context.Background())
+			if err != nil || len(got) != 1 || got[0].Installable || got[0].Reason == "" {
+				t.Fatalf("unsafe fallback result=%+v, %v", got, err)
+			}
+			if requests.Load() != 2 {
+				t.Fatalf("requests=%d; want one bounded fallback", requests.Load())
+			}
+			if (mode == "server_error" || mode == "invalid_json" || mode == "oversized_response") && !strings.Contains(got[0].Reason, "полный список файлов") {
+				t.Fatalf("lookup failure hidden: %s", got[0].Reason)
+			}
+		})
+	}
+}
+
+func TestGitHubClientAssetFallbackPreservesLegacyArchiveRequirement(t *testing.T) {
+	t.Parallel()
+	item := testGitHubRelease("v0.41", 41, time.Now().UTC(), false, false)
+	item.Assets = item.Assets[:2]
+	complete := append(append([]githubAsset(nil), item.Assets...), testGitHubAsset(413, archiveName, 4096))
+	client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases" {
+			_ = json.NewEncoder(w).Encode([]githubRelease{item})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(complete)
+	}))
+	got, err := client.ListReleases(context.Background())
+	if err != nil || len(got) != 1 || !got[0].Installable || got[0].Verification != "legacy" || got[0].archive.ID != 413 {
+		t.Fatalf("legacy fallback=%+v, %v", got, err)
+	}
+}
+
+func TestGitHubClientDoesNotRepairKnownInvalidReleaseMetadata(t *testing.T) {
+	for _, mode := range []string{"duplicate", "invalid_digest", "invalid_size", "pending_upload", "noncanonical", "prerelease_mismatch", "missing_id", "too_many"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			item := testGitHubRelease("v0.44", 44, time.Now().UTC(), false, false)
+			item.Assets = item.Assets[:2] // A missing manifest alone would allow lookup.
+			switch mode {
+			case "duplicate":
+				item.Assets = append(item.Assets, item.Assets[0])
+			case "invalid_digest":
+				item.Assets[0].Digest = ""
+			case "invalid_size":
+				item.Assets[0].Size = 0
+			case "pending_upload":
+				item.Assets[0].State = "new"
+			case "noncanonical":
+				item.TagName = "v00.44"
+			case "prerelease_mismatch":
+				item.TagName = "v0.44-rc.1"
+			case "missing_id":
+				item.ID = 0
+			case "too_many":
+				for len(item.Assets) <= maxReleaseAssets {
+					item.Assets = append(item.Assets, testGitHubAsset(int64(1000+len(item.Assets)), fmt.Sprintf("extra-%d", len(item.Assets)), 100))
+				}
+			}
+			var requests atomic.Int32
+			client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path != "/releases" {
+					t.Errorf("known invalid metadata triggered fallback %s", r.URL)
+					w.WriteHeader(500)
+					return
+				}
+				_ = json.NewEncoder(w).Encode([]githubRelease{item})
+			}))
+			got, err := client.ListReleases(context.Background())
+			if err != nil || len(got) != 1 || got[0].Installable || requests.Load() != 1 {
+				t.Fatalf("invalid metadata bypassed: %+v, %v; requests %d", got, err, requests.Load())
+			}
+		})
+	}
+}
+
+func TestGitHubClientBoundsFallbackToMostRecentVisibleReleases(t *testing.T) {
+	t.Parallel()
+	base := time.Now().UTC()
+	var response []githubRelease
+	for id := 1; id <= 30; id++ {
+		item := testGitHubRelease(fmt.Sprintf("v0.%d", id+50), int64(id), base.Add(time.Duration(id)*time.Hour), false, false)
+		item.Assets = nil
+		response = append(response, item)
+	}
+	response = append(response, testGitHubRelease("v999.0", 999, base.Add(999*time.Hour), true, false))
+	response = append(response, testGitHubRelease("v999.1", 1000, time.Time{}, false, false))
+	var requests atomic.Int32
+	client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path == "/releases" {
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		var id int
+		if _, err := fmt.Sscanf(r.URL.Path, "/repos/agentpitch/prox/releases/%d/assets", &id); err != nil || id < 26 || id > 30 {
+			t.Errorf("lookup outside newest five: %s", r.URL)
+		}
+		complete := testGitHubRelease("v0.80", int64(id), base, false, false)
+		_ = json.NewEncoder(w).Encode(complete.Assets)
+	}))
+	got, err := client.ListReleases(context.Background())
+	if err != nil || len(got) != maxReleaseResults {
+		t.Fatalf("comparison window len=%d, %v", len(got), err)
+	}
+	if requests.Load() != 1+maxVisibleReleases {
+		t.Fatalf("requests=%d, want %d", requests.Load(), 1+maxVisibleReleases)
+	}
+	for i, item := range got {
+		if item.id != int64(30-i) || item.Installable != (i < maxVisibleReleases) {
+			t.Fatalf("result[%d]=%+v", i, item)
+		}
+	}
+}
+
+func TestGitHubClientCompleteNestedAssetsDoNotAddRequests(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	item := testGitHubRelease("v0.44", 44, time.Now().UTC(), false, false)
+	client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/releases" {
+			t.Errorf("complete metadata triggered fallback %s", r.URL)
+		}
+		_ = json.NewEncoder(w).Encode([]githubRelease{item})
+	}))
+	got, err := client.ListReleases(context.Background())
+	if err != nil || len(got) != 1 || !got[0].Installable || requests.Load() != 1 {
+		t.Fatalf("complete result=%+v, %v; requests%d", got, err, requests.Load())
+	}
+}
+
+func TestGitHubClientAssetLookupHonorsCancellation(t *testing.T) {
+	t.Parallel()
+	item := testGitHubRelease("v0.44", 44, time.Now().UTC(), false, false)
+	item.Assets = nil
+	started := make(chan struct{})
+	client := newTestGitHubClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases" {
+			_ = json.NewEncoder(w).Encode([]githubRelease{item})
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := client.ListReleases(ctx); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v, want cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback did not cancel")
 	}
 }
 

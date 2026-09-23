@@ -37,13 +37,13 @@ This archive contains the current optimized baseline with segment-backed history
 - IPv6 extension headers and multi-record TLS ClientHello/SNI are parsed with strict work and size bounds;
 - runtime config activation rolls back if a required listener/interception restart fails.
 
-## v0.44 release gate
+## v0.44.1 release gate
 
-A publishable v0.44 candidate is prepared only from a committed clean working
+A publishable v0.44.1 candidate is prepared only from a committed clean working
 tree with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44 -DownloadWinDivertArchive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Version v0.44.1 -DownloadWinDivertArchive
 ```
 
 The script fails immediately on an uncommitted tree unless `-AllowDirty` is

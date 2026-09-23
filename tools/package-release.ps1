@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.44",
+    [string]$Version = "v0.44.1",
     [switch]$SkipChecks,
     [switch]$AllowDirty,
     [switch]$DownloadWinDivertArchive,
@@ -325,8 +325,8 @@ try {
         }
         Copy-Item -LiteralPath $releaseNotesSourcePath -Destination $releaseNotesOutputPath
         $releaseNotesSourceDescription = $ReleaseNotesSource
-    } elseif ($Version -match '^v(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)') {
-        $releaseNotesName = "RELEASE_NOTES_v$($Matches.major).$($Matches.minor).md"
+    } elseif ($Version -match '^(?<release>v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?)(?:-|$)') {
+        $releaseNotesName = "RELEASE_NOTES_$($Matches.release).md"
         $releaseNotesSourcePath = Join-Path $repoRoot (Join-Path "docs" $releaseNotesName)
         if (-not (Test-Path -LiteralPath $releaseNotesSourcePath -PathType Leaf)) {
             throw "Missing release notes for ${Version}: $releaseNotesSourcePath"

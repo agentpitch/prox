@@ -124,11 +124,27 @@ func (c *GitHubClient) ListReleases(ctx context.Context) ([]Release, error) {
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("decode GitHub release list: %w", err)
 	}
-	releases := make([]Release, 0, 5)
+	// Establish the bounded comparison/visible windows before issuing any
+	// per-release requests. An oversized or unordered response must not cause
+	// unbounded fan-out or spend the lookup budget on older hidden releases.
+	visible := make([]githubRelease, 0, min(len(response), maxReleaseResults))
 	for _, item := range response {
 		if item.Draft || strings.TrimSpace(item.TagName) == "" || item.PublishedAt.IsZero() {
 			continue
 		}
+		visible = append(visible, item)
+	}
+	sort.SliceStable(visible, func(i, j int) bool {
+		if visible[i].PublishedAt.Equal(visible[j].PublishedAt) {
+			return visible[i].ID > visible[j].ID
+		}
+		return visible[i].PublishedAt.After(visible[j].PublishedAt)
+	})
+	if len(visible) > maxReleaseResults {
+		visible = visible[:maxReleaseResults]
+	}
+	releases := make([]Release, 0, len(visible))
+	for index, item := range visible {
 		release := Release{
 			Version:     strings.TrimSpace(item.TagName),
 			Name:        strings.TrimSpace(item.Name),
@@ -140,6 +156,23 @@ func (c *GitHubClient) ListReleases(ctx context.Context) ([]Release, error) {
 		if release.Name == "" {
 			release.Name = release.Version
 		}
+		// GitHub can temporarily publish incomplete nested asset arrays while
+		// the canonical assets endpoint already has the complete upload. Only
+		// the five releases users can select need this on-demand fallback.
+		if index < maxVisibleReleases && c.needsAssetLookup(item) {
+			assets, lookupErr := c.releaseAssets(ctx, item.ID)
+			if lookupErr != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				release.Reason = "не удалось получить полный список файлов: " + lookupErr.Error()
+				releases = append(releases, release)
+				continue
+			}
+			// Replace the snapshot rather than merging it: merging would turn
+			// repeated references to the same asset into false duplicates.
+			item.Assets = assets
+		}
 		assetCounts := map[string]int{}
 		if len(item.Assets) > maxReleaseAssets {
 			release.Reason = "в релизе слишком много файлов"
@@ -148,11 +181,7 @@ func (c *GitHubClient) ListReleases(ctx context.Context) ([]Release, error) {
 		}
 		for _, rawAsset := range item.Assets {
 			assetCounts[rawAsset.Name]++
-			parsedAsset := asset{
-				ID: rawAsset.ID, Name: rawAsset.Name, APIURL: c.assetURL(rawAsset.ID),
-				Size: rawAsset.Size, Digest: strings.ToLower(strings.TrimSpace(rawAsset.Digest)),
-				State: rawAsset.State, ContentType: rawAsset.ContentType,
-			}
+			parsedAsset := c.parseAsset(rawAsset)
 			switch rawAsset.Name {
 			case executableName:
 				release.executable = parsedAsset
@@ -173,19 +202,79 @@ func (c *GitHubClient) ListReleases(ctx context.Context) ([]Release, error) {
 		}
 		releases = append(releases, release)
 	}
-	sort.SliceStable(releases, func(i, j int) bool {
-		if releases[i].PublishedAt.Equal(releases[j].PublishedAt) {
-			return releases[i].id > releases[j].id
-		}
-		return releases[i].PublishedAt.After(releases[j].PublishedAt)
-	})
-	if len(releases) > maxReleaseResults {
-		releases = releases[:maxReleaseResults]
-	}
-	if releases == nil {
-		releases = []Release{}
-	}
 	return releases, nil
+}
+
+func (c *GitHubClient) parseAsset(raw githubAsset) asset {
+	return asset{
+		ID: raw.ID, Name: raw.Name, APIURL: c.assetURL(raw.ID),
+		Size: raw.Size, Digest: strings.ToLower(strings.TrimSpace(raw.Digest)),
+		State: raw.State, ContentType: raw.ContentType,
+	}
+}
+
+// needsAssetLookup repairs only absent filenames. Evidence of duplicate files,
+// invalid digests, unfinished uploads or unsupported release metadata must not
+// be hidden by substituting a different snapshot of that release.
+func (c *GitHubClient) needsAssetLookup(item githubRelease) bool {
+	version := strings.TrimSpace(item.TagName)
+	if item.ID <= 0 || !canonicalReleaseTag.MatchString(version) || len(item.Assets) > maxReleaseAssets {
+		return false
+	}
+	parsed, ok := parseVersion(version)
+	if !ok || (len(parsed.pre) > 0) != item.Prerelease {
+		return false
+	}
+	counts := make(map[string]int, len(item.Assets))
+	for _, raw := range item.Assets {
+		counts[raw.Name]++
+		if counts[raw.Name] > 1 {
+			return false
+		}
+		var limit int64
+		switch raw.Name {
+		case executableName:
+			limit = maxExecutableBytes
+		case checksumsName:
+			limit = maxChecksumBytes
+		case manifestName:
+			limit = maxManifestBytes
+		case archiveName:
+			limit = maxArchiveBytes
+		default:
+			continue
+		}
+		if raw.Size <= 0 || raw.Size > limit || validateAssetMetadata(c.parseAsset(raw)) != nil {
+			return false
+		}
+	}
+	if counts[executableName] == 0 || counts[checksumsName] == 0 {
+		return true
+	}
+	if counts[manifestName] != 0 {
+		return false
+	}
+	if comparison, known := compareVersions(version, "v0.42"); known && comparison >= 0 {
+		return true
+	}
+	return counts[archiveName] == 0
+}
+
+func (c *GitHubClient) releaseAssets(ctx context.Context, releaseID int64) ([]githubAsset, error) {
+	endpoint := *c.releasesURL
+	endpoint.Path = "/repos/agentpitch/prox/releases/" + strconv.FormatInt(releaseID, 10) + "/assets"
+	endpoint.RawPath = ""
+	endpoint.RawQuery = "per_page=" + strconv.Itoa(maxReleaseAssets+1) + "&page=1"
+	endpoint.Fragment = ""
+	body, err := c.getBytes(ctx, endpoint.String(), "application/vnd.github+json", maxReleaseJSON, 0, "release asset list")
+	if err != nil {
+		return nil, err
+	}
+	var assets []githubAsset
+	if err := json.Unmarshal(body, &assets); err != nil {
+		return nil, fmt.Errorf("decode GitHub release assets: %w", err)
+	}
+	return assets, nil
 }
 
 func validateReleaseMetadata(release Release, counts map[string]int) (bool, string, string) {

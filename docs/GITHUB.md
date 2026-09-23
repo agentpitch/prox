@@ -68,9 +68,9 @@ Third-party actions in the workflow are pinned to full commit SHAs.
 Branch builds use `dev-<short-commit>` as their embedded version. Tag builds use
 the exact tag. The packaging script rejects malformed version tags even though
 the workflow trigger itself uses the broader `v*` pattern. For a tag such as
-`v0.44` or `v0.44-rc.1`, the script requires
-`docs/RELEASE_NOTES_v0.44.md`; future major/minor tags therefore cannot
-silently publish v0.44 notes. Development artifacts receive a neutral generated
+`v0.44.1` or `v0.44.1-rc.1`, the script requires
+`docs/RELEASE_NOTES_v0.44.1.md`; future stable version tags therefore cannot
+silently publish v0.44.1 notes. Development artifacts receive a neutral generated
 note instead.
 
 ## Publishing
@@ -79,8 +79,8 @@ After reviewing a clean candidate and merging the approved commit to `main`,
 create and push only the intended annotated tag:
 
 ```powershell
-git tag -a v0.44 -m "v0.44"
-git push origin v0.44
+git tag -a v0.44.1 -m "v0.44.1"
+git push origin v0.44.1
 ```
 
 Do not use `git push --tags` as a release command: unrelated local tags would
@@ -88,9 +88,13 @@ also trigger releases. A tag immediately starts the publication workflow, so it
 must not be created or pushed before approval.
 
 The release job downloads the Windows artifact, verifies its SHA-256 file on
-Linux, then publishes the executable, ZIP, checksum, and manifest. The curated
-v0.44 notes are prepended to GitHub-generated change notes. Tags containing a
-hyphen, such as `v0.44-rc.1`, are marked as prereleases.
+Linux, stages the executable, ZIP, checksum, and manifest in a draft, and
+independently compares the uploaded names, sizes and SHA-256 digests before
+publication. It refuses to overwrite an already-published release on rerun.
+After publication, anonymous release-list and tag responses must expose the
+complete assets so older updaters can install them. The curated
+v0.44.1 notes are prepended to GitHub-generated change notes. Tags containing a
+hyphen, such as `v0.44.1-rc.1`, are marked as prereleases.
 
 The built-in updater treats these exact unique asset names as an API contract.
 It cross-checks the GitHub asset SHA-256 digest, checksum file, executable, and
@@ -99,6 +103,11 @@ renamed or replaced in place; publish a new version instead. Releases from
 `v0.42` onward are installable only with a valid manifest. Older releases use a
 restricted compatibility path that also verifies the ZIP's WinDivert runtime
 against the currently installed DLL and driver.
+
+From v0.44.1, an explicit update check can recover an incomplete nested asset
+list through GitHub's numeric release-assets endpoint. This adds at most one
+request for each of the five visible releases and retains strict validation.
+It does not poll in the background.
 
 ## Runtime scope
 

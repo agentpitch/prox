@@ -99,7 +99,7 @@ func TestPollerStopsBeforeFirstTick(t *testing.T) {
 func TestCleanupDestroysHiddenWindowAndRejectsFurtherIcons(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	h := &helper{}
+	h := &helper{notifyIcon: shellNotifyIcon}
 	if err := h.createWindow(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +113,91 @@ func TestCleanupDestroysHiddenWindowAndRejectsFurtherIcons(t *testing.T) {
 	}
 	if h.iconHandle != 0 {
 		t.Fatal("an icon was recreated after cleanup")
+	}
+}
+
+func TestTrayRecoversAfterShellLosesIcon(t *testing.T) {
+	const taskbarCreated = 0xc123
+	var shellIcon windows.Handle
+	var shellVersion uint32
+	var calls int
+	var shellAvailable = true
+	h := &helper{taskbarCreated: taskbarCreated}
+	h.notifyIcon = func(action uintptr, nid *notifyIconData) bool {
+		calls++
+		if !shellAvailable {
+			return false
+		}
+		switch action {
+		case nimAdd:
+			if shellIcon != 0 {
+				return false
+			}
+			shellIcon = nid.Icon
+		case nimModify:
+			if shellIcon == 0 {
+				return false
+			}
+			shellIcon = nid.Icon
+		case nimSetVersion:
+			shellVersion = nid.TimeoutOrVersion
+		}
+		return true
+	}
+	currentTrayMu.Lock()
+	currentTray = h
+	currentTrayMu.Unlock()
+	t.Cleanup(func() {
+		currentTrayMu.Lock()
+		currentTray = nil
+		currentTrayMu.Unlock()
+		h.cleanup()
+	})
+	loseIcon := func() { shellIcon, shellVersion = 0, 0 }
+	assertRegistered := func() {
+		t.Helper()
+		if shellIcon == 0 || shellIcon != h.iconHandle || shellVersion != notificationVer4 {
+			t.Fatalf("shell icon = %v, cached icon = %v, notification version = %d", shellIcon, h.iconHandle, shellVersion)
+		}
+	}
+
+	h.setPausedIcon()
+	assertRegistered()
+	pausedIcon := h.iconHandle
+	initialCalls := calls
+	h.setPausedIcon()
+	if calls != initialCalls {
+		t.Fatal("unchanged icon contacted the shell without a taskbar notification")
+	}
+
+	loseIcon()
+	shellAvailable = false
+	windowProc(0, taskbarCreated, 0, 0)
+	if calls != initialCalls {
+		t.Fatal("taskbar broadcast contacted the shell synchronously")
+	}
+	h.setPausedIcon()
+	if calls == initialCalls || shellIcon != 0 || h.iconHandle != pausedIcon {
+		t.Fatal("taskbar broadcast must try immediately on the next poll and keep the cached frame on failure")
+	}
+	shellAvailable = true
+	h.setPausedIcon()
+	assertRegistered()
+	if h.iconHandle != pausedIcon {
+		t.Fatal("restoring a static frame allocated a new icon")
+	}
+
+	loseIcon()
+	recoveredCalls := calls
+	h.setPausedIcon()
+	if calls != recoveredCalls {
+		t.Fatal("successful recovery left a pending refresh")
+	}
+
+	h.setOfflineIcon()
+	assertRegistered()
+	if h.iconHandle == pausedIcon {
+		t.Fatal("recovery did not publish the new frame")
 	}
 }
 

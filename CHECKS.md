@@ -149,6 +149,10 @@ resource ownership and environment-proxy compatibility boundaries.
 
 - one `pitchProx.exe` process in desktop mode;
 - tray icon appears and opens WebUI on double click;
+- in a disposable Windows session, restart Explorer with pitchProx already
+  running elevated, both with a static tray graph and with active traffic.
+  The icon should return, its context menu should work, and `pitchProx.exe ctl
+  status` should report the same PID;
 - `pitchProx.config.json` and `pitchProx.history\` appear next to the executable;
 - rule matching works for `Direct / Proxy / Chain / Block`;
 - clipboard export of all or selected rules round-trips through the import

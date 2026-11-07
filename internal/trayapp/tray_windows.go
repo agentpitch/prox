@@ -188,20 +188,26 @@ var (
 	procCreateIconFromResourceEx = windows.NewLazySystemDLL("user32.dll").NewProc("CreateIconFromResourceEx")
 	procDestroyIcon              = windows.NewLazySystemDLL("user32.dll").NewProc("DestroyIcon")
 	procGetModuleHandleW         = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetModuleHandleW")
-	procCreateMutexW             = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
 	currentTrayMu                sync.Mutex
 	currentTray                  *helper
 	trayWindowCallback           = syscall.NewCallback(windowProc)
 	hwndTopmost                  = ^uintptr(0)
 	hwndNotopmost                = ^uintptr(1)
+
+	procRegisterWindowMessageW      = windows.NewLazySystemDLL("user32.dll").NewProc("RegisterWindowMessageW")
+	procChangeWindowMessageFilterEx = windows.NewLazySystemDLL("user32.dll").NewProc("ChangeWindowMessageFilterEx")
 )
 
 type helper struct {
 	provider          Provider
 	url               string
 	hwnd              windows.Handle
+	taskbarCreated    uint32
+	refreshRequested  atomic.Bool
+	notifyIcon        func(uintptr, *notifyIconData) bool
 	iconMu            sync.Mutex
 	iconHandle        windows.Handle
+	iconTooltip       string
 	iconClosed        bool
 	mutexHandle       windows.Handle
 	quitOnce          sync.Once
@@ -219,8 +225,9 @@ func Run(opts Options) error {
 		url = trimTrailingSlash(opts.Provider.OpenURL())
 	}
 	h := &helper{
-		provider: opts.Provider,
-		url:      url,
+		provider:   opts.Provider,
+		url:        url,
+		notifyIcon: shellNotifyIcon,
 	}
 	already, err := h.acquireMutex()
 	if err != nil {
@@ -258,18 +265,12 @@ func (h *helper) acquireMutex() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	r1, _, callErr := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(name)))
-	if r1 == 0 {
-		if callErr != nil && callErr != windows.ERROR_SUCCESS {
-			return false, fmt.Errorf("CreateMutexW: %w", callErr)
-		}
-		return false, fmt.Errorf("CreateMutexW failed")
+	handle, err := windows.CreateMutexEx(nil, name, 0, windows.SYNCHRONIZE)
+	if handle == 0 {
+		return false, fmt.Errorf("CreateMutexExW: %w", err)
 	}
-	h.mutexHandle = windows.Handle(r1)
-	if syscall.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		return true, nil
-	}
-	return false, nil
+	h.mutexHandle = handle
+	return err == windows.ERROR_ALREADY_EXISTS, nil
 }
 
 func (h *helper) releaseMutex() {
@@ -284,6 +285,9 @@ func (h *helper) createWindow() error {
 	if err != nil {
 		return err
 	}
+	taskbarName, _ := windows.UTF16PtrFromString("TaskbarCreated")
+	taskbarCreated, _, _ := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(taskbarName)))
+	h.taskbarCreated = uint32(taskbarCreated)
 	instance, _, callErr := procGetModuleHandleW.Call(0)
 	if instance == 0 {
 		return fmt.Errorf("GetModuleHandleW: %w", callErr)
@@ -313,6 +317,11 @@ func (h *helper) createWindow() error {
 		return fmt.Errorf("CreateWindowExW: %w", callErr)
 	}
 	h.hwnd = windows.Handle(wnd)
+	if h.taskbarCreated != 0 {
+		// Explorer normally runs at a lower integrity level than desktop mode.
+		const msgfltAllow = 1
+		procChangeWindowMessageFilterEx.Call(wnd, taskbarCreated, msgfltAllow, 0)
+	}
 	return nil
 }
 
@@ -339,6 +348,11 @@ func windowProc(hwnd, message, wParam, lParam uintptr) uintptr {
 	if h == nil {
 		ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 		return ret
+	}
+	if h.taskbarCreated != 0 && uint32(message) == h.taskbarCreated {
+		// Let the poller contact Explorer after the broadcast handler returns.
+		h.refreshRequested.Store(true)
+		return 0
 	}
 
 	switch uint32(message) {
@@ -470,7 +484,7 @@ func (h *helper) showContextMenu() {
 	h.iconMu.Lock()
 	if h.iconHandle != 0 {
 		nid := h.notifyData(h.iconHandle, "")
-		procShellNotifyIconW.Call(nimSetFocus, uintptr(unsafe.Pointer(&nid)))
+		h.notifyIcon(nimSetFocus, &nid)
 	}
 	h.iconMu.Unlock()
 }
@@ -695,13 +709,12 @@ func (h *helper) pollLoop(stop <-chan struct{}) {
 		}
 		view, err := h.fetchTrayView()
 		if err != nil {
+			h.setOfflineIcon()
 			if h.provider != nil {
-				h.setOfflineIcon()
 				continue
 			}
 			if h.offlineFrom.IsZero() {
 				h.offlineFrom = time.Now()
-				h.setOfflineIcon()
 				if h.shutdownRequested.Load() {
 					h.quit()
 					return
@@ -770,7 +783,7 @@ func (h *helper) postStop() error {
 }
 
 func (h *helper) setOfflineIcon() {
-	if h.hasIconSignature("offline") {
+	if h.reuseIcon("offline") {
 		return
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
@@ -788,7 +801,7 @@ func (h *helper) setOfflineIcon() {
 }
 
 func (h *helper) setPausedIcon() {
-	if h.hasIconSignature("paused") {
+	if h.reuseIcon("paused") {
 		return
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
@@ -826,7 +839,7 @@ func (h *helper) setPausedIcon() {
 func (h *helper) setTrafficIcon(view monitor.TrayView) {
 	history, rx, tx, peakRx, peakTx := trafficSeries(view.Traffic)
 	signature := trafficSignature(history)
-	if h.hasIconSignature(signature) {
+	if h.reuseIcon(signature) {
 		return
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, 16, 16))
@@ -992,10 +1005,22 @@ func drawLine(img *image.NRGBA, x0, y0, x1, y1 int, col color.NRGBA) {
 	}
 }
 
-func (h *helper) hasIconSignature(signature string) bool {
+func (h *helper) reuseIcon(signature string) bool {
 	h.iconMu.Lock()
 	defer h.iconMu.Unlock()
-	return h.iconClosed || signature == h.lastIconSignature
+	if h.iconClosed {
+		return true
+	}
+	if h.iconHandle == 0 || signature != h.lastIconSignature {
+		return false
+	}
+	if h.refreshRequested.Swap(false) {
+		// Explorer can still be starting when the taskbar notification arrives.
+		if err := h.publishIcon(h.iconHandle, h.iconTooltip, true); err != nil {
+			h.refreshRequested.Store(true)
+		}
+	}
+	return true
 }
 
 func (h *helper) updateIcon(img image.Image, tooltip string, signature string) error {
@@ -1004,35 +1029,49 @@ func (h *helper) updateIcon(img image.Image, tooltip string, signature string) e
 	if h.iconClosed {
 		return nil
 	}
-	if signature == h.lastIconSignature {
+	if h.iconHandle != 0 && signature == h.lastIconSignature {
 		return nil
 	}
 	newIcon, err := createIcon(img)
 	if err != nil {
 		return err
 	}
-	nid := h.notifyData(newIcon, tooltip)
-	msg := nimModify
-	if h.iconHandle == 0 {
-		msg = nimAdd
-	}
-	if r1, _, callErr := procShellNotifyIconW.Call(uintptr(msg), uintptr(unsafe.Pointer(&nid))); r1 == 0 {
-		procDestroyIcon.Call(uintptr(newIcon))
-		if callErr != nil && callErr != windows.ERROR_SUCCESS {
-			return fmt.Errorf("Shell_NotifyIconW: %w", callErr)
+	force := h.refreshRequested.Swap(false)
+	if err := h.publishIcon(newIcon, tooltip, force); err != nil {
+		if force {
+			h.refreshRequested.Store(true)
 		}
-		return fmt.Errorf("Shell_NotifyIconW failed")
-	}
-	if msg == nimAdd {
-		nid.TimeoutOrVersion = notificationVer4
-		procShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&nid)))
+		procDestroyIcon.Call(uintptr(newIcon))
+		return err
 	}
 	if h.iconHandle != 0 {
 		procDestroyIcon.Call(uintptr(h.iconHandle))
 	}
 	h.iconHandle = newIcon
+	h.iconTooltip = tooltip
 	h.lastIconSignature = signature
 	return nil
+}
+
+// Called under iconMu. A taskbar notification requests NIM_ADD directly;
+// an ordinary frame update re-adds the icon only if NIM_MODIFY fails.
+func (h *helper) publishIcon(icon windows.Handle, tooltip string, addFirst bool) error {
+	nid := h.notifyData(icon, tooltip)
+	if !addFirst && h.iconHandle != 0 && h.notifyIcon(nimModify, &nid) {
+		return nil
+	}
+	if h.notifyIcon(nimAdd, &nid) {
+		nid.TimeoutOrVersion = notificationVer4
+		h.notifyIcon(nimSetVersion, &nid)
+	} else if !addFirst || h.iconHandle == 0 || !h.notifyIcon(nimModify, &nid) {
+		return fmt.Errorf("Shell_NotifyIconW: could not register tray icon")
+	}
+	return nil
+}
+
+func shellNotifyIcon(action uintptr, nid *notifyIconData) bool {
+	r1, _, _ := procShellNotifyIconW.Call(action, uintptr(unsafe.Pointer(nid)))
+	return r1 != 0
 }
 
 func (h *helper) notifyData(icon windows.Handle, tooltip string) notifyIconData {
@@ -1140,7 +1179,7 @@ func (h *helper) cleanup() {
 	h.iconClosed = true
 	if h.hwnd != 0 {
 		nid := h.notifyData(h.iconHandle, "")
-		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+		h.notifyIcon(nimDelete, &nid)
 	}
 	if h.iconHandle != 0 {
 		procDestroyIcon.Call(uintptr(h.iconHandle))

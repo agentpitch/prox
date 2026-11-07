@@ -53,6 +53,27 @@ Desktop mode runs as **one elevated process** and contains:
 
 No second `pitchProx.exe tray` helper is required in this mode.
 
+If the icon disappears, first look under the **^** arrow for hidden icons.
+When Windows reports that Explorer has recreated the taskbar, pitchProx
+registers its icon again. If Windows loses the icon silently, the next change
+to the icon also restores it when the usual update fails.
+
+To reach a running instance without the tray, use `.\pitchProx.exe open`
+from the directory with the running executable.
+If WebUI is disabled, enable it through the local control endpoint and open it
+again, using the configured `http.listen` if it differs from the default:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:18080/api/control/webui/enable'
+.\pitchProx.exe open
+```
+
+This also resumes proxying if you paused it from the tray.
+
+If the tray loop is no longer running, `.\pitchProx.exe tray` starts a
+tray-only helper for the existing proxy without restarting it. It cannot
+replace an active tray loop in the same session.
+
 ### Service mode
 
 Optional for background/system use.

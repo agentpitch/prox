@@ -1,0 +1,53 @@
+[package]
+name = "pitchprox-core"
+version = "0.50.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[lib]
+path = "rust/src/lib.rs"
+
+[[bin]]
+name = "pitchProx"
+path = "rust/src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["now", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+sha2 = "0.10"
+getrandom = "0.3"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock", "Win32_Networking_WinHttp", "Win32_Security",
+    "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com",
+    "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO",
+    "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_ProcessStatus",
+    "Win32_System_Services", "Win32_System_SystemInformation", "Win32_System_Threading",
+    "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+bench-allocations = []
+
+[[bench]]
+name = "rules"
+path = "rust/benches/rules.rs"
+harness = false
+
+[[test]]
+name = "parity"
+path = "rust/tests/parity.rs"
+
+[[test]]
+name = "handoff"
+path = "rust/tests/handoff.rs"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -2758,7 +2758,7 @@ function openSettingsEditor() {
           renderReleases();
         } catch (error) {
           if (isAbortError(error) || !isActive() || generation !== lifecycle.generation) return;
-          if (summary) summary.innerHTML = `<strong>Не удалось проверить обновления</strong><span>${escapeHtml(error.message || String(error))}</span>`;
+          if (summary) summary.innerHTML = `<strong>Не удалось проверить обновления</strong><span>${escapeHtml(error.message || String(error))}</span><span><a href="https://github.com/agentpitch/prox/releases/latest" target="_blank" rel="noopener noreferrer">Скачать последнюю версию вручную на GitHub</a></span>`;
         } finally {
           if (lifecycle.releasesRequest === controller) lifecycle.releasesRequest = null;
           if (generation === lifecycle.generation) lifecycle.checking = false;

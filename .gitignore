@@ -3,6 +3,7 @@
 /package/
 /release/
 /output/
+/target/
 /.playwright-cli/
 *.sqlite
 *.sqlite-shm

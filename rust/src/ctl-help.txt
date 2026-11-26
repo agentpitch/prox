@@ -1,0 +1,33 @@
+pitchProx ctl [--url http://127.0.0.1:18080] COMMAND
+
+  status                          Show running instance and protocol version
+  schema                          Print the JSON command guide and input schemas
+  config get                      Export the complete live configuration
+  config validate --file PATH|-    Validate locally; print canonical configuration
+  config plan --file PATH|-        Preview server activation without applying
+  config apply --file PATH|- [--allow-disruptive]
+  rules list                      Print rules and their configuration revision
+  rules upsert --file PATH|- --if-revision TIMESTAMP [--before ID|--after ID]
+  rules delete --id ID --if-revision TIMESTAMP
+  rules move --id ID --before ID|--after ID --if-revision TIMESTAMP
+
+Rule mutations also accept --allow-disruptive. --file - reads JSON from stdin.
+Arguments following ctl are independent of desktop/service startup arguments.
+--url overrides PITCHPROX_CONTROL_URL and read-only config-file discovery.
+Only HTTP loopback origins are accepted; proxies and redirects are disabled.
+
+Config apply requires the unmodified updated_at from config get. Rule mutations
+require --if-revision from rules list or config get. Conflicts require a fresh
+read and review. Existing rules retain their position unless one is specified.
+New rules become the first rule when the list is empty, or go before a final
+enabled default catch-all; otherwise a position is required. Rule files
+replace the entire rule with that ID, including notes.
+
+Plan first: rule/proxy hot reloads preserve connections; listener/interception
+changes can require --allow-disruptive. That flag never overrides a conflict.
+Success is JSON on stdout. Failures are JSON on stderr. No writes are retried.
+An ambiguous write exits 8: read config get and compare before doing anything.
+Configuration exports contain proxy credentials. --help prints this text.
+JSON input/output is UTF-8. In Windows PowerShell 5.1, avoid > redirection;
+set [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) and
+pipe exports to Set-Content -Encoding UTF8 instead.

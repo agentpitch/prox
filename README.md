@@ -1,6 +1,11 @@
 # pitchProx
 
-pitchProx is a Windows transparent TCP proxy manager written in Go. It combines:
+pitchProx is a Windows transparent TCP proxy manager. The Rust implementation
+builds a standalone Windows executable with the original WebUI. The Go source
+and build remain available as the reference implementation. See the
+[Rust build and comparison](rust/README.md).
+
+The application combines:
 
 - a privileged runtime that uses WinDivert only where interception is actually required;
 - a local transparent listener that handles only `Proxy / Chain / Block` flows and hostname-dependent `Direct` decisions;

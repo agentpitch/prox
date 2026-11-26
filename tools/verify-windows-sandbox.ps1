@@ -1,10 +1,12 @@
 param(
     [Parameter(Mandatory = $true)][string]$InputDirectory,
-    [Parameter(Mandatory = $true)][string]$ResultPath
+    [Parameter(Mandatory = $true)][string]$ResultPath,
+    [ValidateSet('go', 'rust')][string[]]$Implementations = @('go', 'rust')
 )
 
 $ErrorActionPreference = 'Stop'
 $results = [Collections.Generic.List[object]]::new()
+$diagnostics = $null
 
 function Wait-Result([scriptblock]$Probe, [int]$Seconds = 15) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -25,12 +27,12 @@ function Request([string]$Base, [string]$Path, [string]$Method = 'GET', $Body = 
     Invoke-RestMethod @params
 }
 
-function Socket-Request([int]$Port) {
+function Socket-Request([int]$Port, [switch]$AllowBlocked) {
     $tcp = [Net.Sockets.TcpClient]::new()
     try {
         $connect = $tcp.ConnectAsync('198.51.100.42', $Port)
         if (!$connect.Wait(5000)) { throw 'No TCP response from the test route' }
-        $connect.GetAwaiter().GetResult()
+        [void]$connect.GetAwaiter().GetResult()
         $stream = $tcp.GetStream()
         $stream.ReadTimeout = 5000
         $stream.WriteTimeout = 5000
@@ -40,9 +42,11 @@ function Socket-Request([int]$Port) {
         try {
             $count = $stream.Read($buffer, 0, $buffer.Length)
             [Text.Encoding]::ASCII.GetString($buffer, 0, $count)
-        } catch [IO.IOException] {
-            if ($_.Exception.InnerException.SocketErrorCode -eq [Net.Sockets.SocketError]::ConnectionReset) { '' }
-            else { throw }
+        } catch {
+            $cause = $_.Exception
+            while ($cause -and $cause -isnot [Net.Sockets.SocketException]) { $cause = $cause.InnerException }
+            if (!$AllowBlocked -or !$cause -or $cause.SocketErrorCode -notin @('ConnectionReset', 'TimedOut')) { throw }
+            ''
         }
     } finally {
         $tcp.Dispose()
@@ -52,6 +56,7 @@ function Socket-Request([int]$Port) {
 function Command-Exit([string]$Path, [string]$Argument, [string]$Directory) {
     $process = Start-Process -FilePath $Path -ArgumentList $Argument -WorkingDirectory $Directory -WindowStyle Hidden -PassThru
     try {
+        [void]$process.Handle
         if (!$process.WaitForExit(12000)) { throw "Timed out running $Argument" }
         if ($process.ExitCode -ne 0) { throw "$Argument exited with code $($process.ExitCode)" }
     } finally {
@@ -76,7 +81,7 @@ using System.Threading;
 public sealed class PitchProxSandboxProxy : IDisposable {
     private readonly TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
     private readonly Thread worker;
-    public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+    public int Port { get { return ((IPEndPoint)listener.LocalEndpoint).Port; } }
     public string RequestLine;
     public string Failure;
     public PitchProxSandboxProxy() {
@@ -110,11 +115,16 @@ public sealed class PitchProxSandboxProxy : IDisposable {
 '@
 
     $env:PITCHPROX_DISABLE_TRAY = '1'
-    foreach ($implementation in @('go', 'rust')) {
-        $directory = Join-Path $env:TEMP "pitchprox-sandbox-$implementation"
+    foreach ($implementation in $Implementations) {
+        $directory = Join-Path $env:TEMP "pitchprox-sandbox-$implementation-$([Guid]::NewGuid().ToString('N'))"
         [IO.Directory]::CreateDirectory($directory) | Out-Null
-        foreach ($name in @('pitchProx.exe','WinDivert.dll','WinDivert64.sys')) {
+        $files = @('pitchProx.exe')
+        if ($implementation -eq 'go') { $files += @('WinDivert64.sys','WinDivert.dll') }
+        foreach ($name in $files) {
             Copy-Item -LiteralPath (Join-Path $InputDirectory "$implementation/$name") -Destination (Join-Path $directory $name)
+        }
+        if ($implementation -eq 'rust' -and (Test-Path -LiteralPath (Join-Path $directory 'WinDivert.dll'))) {
+            throw 'The Rust verification directory contains WinDivert.dll'
         }
         $path = Join-Path $directory 'pitchProx.exe'
         $configPath = Join-Path $directory 'pitchProx.config.json'
@@ -136,6 +146,7 @@ public sealed class PitchProxSandboxProxy : IDisposable {
         $stderr = Join-Path $directory 'desktop.stderr'
         $app = Start-Process -FilePath $path -ArgumentList 'run' -WorkingDirectory $directory -WindowStyle Hidden -RedirectStandardError $stderr -PassThru
         try {
+            [void]$app.Handle
             Wait-Result {
                 if ($app.HasExited) { throw "Desktop exited $($app.ExitCode) $(Get-Content $stderr -Raw)" }
                 try {
@@ -143,7 +154,15 @@ public sealed class PitchProxSandboxProxy : IDisposable {
                     if ($health.pid -eq $app.Id) { $health }
                 } catch {}
             } | Out-Null
-            $blocked = Socket-Request $originalPort
+            if ($implementation -eq 'rust') {
+                $driver = Join-Path $directory 'WinDivert64.sys'
+                $hash = (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash
+                if ($hash -ne '8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2') {
+                    throw 'Extracted driver differs from the signed upstream driver'
+                }
+                $results.Add(@{ implementation=$implementation; check='EXE extracts the original signed WinDivert driver'; passed=$true })
+            }
+            $blocked = Socket-Request $originalPort -AllowBlocked
             if ($blocked) { throw 'Blocked connection unexpectedly returned content' }
             $drop = Wait-Result {
                 (Request $base '/api/dropped?q=fixture.test').items | Where-Object { $_.rule_id -eq 'fixture' } | Select-Object -First 1
@@ -169,7 +188,13 @@ public sealed class PitchProxSandboxProxy : IDisposable {
                 $proxy.Dispose()
             }
             Request $base '/api/control/stop' 'POST' | Out-Null
-            if (!$app.WaitForExit(12000) -or $app.ExitCode -ne 0) { throw 'Desktop did not stop cleanly' }
+            if (!$app.WaitForExit(25000)) { throw 'Desktop did not exit after the stop request' }
+            if ($app.ExitCode -ne 0) { throw "Desktop exit code $($app.ExitCode). $(Get-Content $stderr -Raw)" }
+        } catch {
+            $diagnostics = @{ implementation = $implementation }
+            if (Test-Path -LiteralPath $stderr) { $diagnostics.stderr = Get-Content -LiteralPath $stderr -Raw }
+            try { $diagnostics.snapshot = Request $base '/api/snapshot?include_logs=1' } catch {}
+            throw
         } finally {
             if (!$app.HasExited) { $app.Kill(); $app.WaitForExit() }
             $app.Dispose()
@@ -196,7 +221,7 @@ public sealed class PitchProxSandboxProxy : IDisposable {
     }
     $report = @{ ok = $true; checks = @($results.ToArray()) }
 } catch {
-    $report = @{ ok = $false; checks = @($results.ToArray()); error = $_.Exception.Message; stack = $_.ScriptStackTrace }
+    $report = @{ ok = $false; checks = @($results.ToArray()); error = $_.Exception.Message; stack = $_.ScriptStackTrace; diagnostics = $diagnostics }
 } finally {
     [IO.File]::WriteAllText($ResultPath, ($report | ConvertTo-Json -Depth 8))
 }

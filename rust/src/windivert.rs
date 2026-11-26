@@ -5,178 +5,22 @@ use crate::platform::{self, TcpOwner};
 use crate::routing::{request, ExeCache, SharedRoutes, Stop};
 use crate::rules::Action;
 use std::collections::HashSet;
-use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-};
 
-const CLASSIFIER: &str =
-    "outbound and tcp and !loopback and !impostor and tcp.Syn and !tcp.Ack and !tcp.Rst";
+mod device;
+mod identity;
+pub(crate) mod runtime;
+
+use device::{Address, Device};
+
+pub(crate) use identity::{DRIVER_NAME, DRIVER_SHA256};
+
 const CLEANUP: Duration = Duration::from_secs(30);
-const SHUTDOWN_RECV: u32 = 1;
-
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-struct Address([u8; 80]);
-
-type Open = unsafe extern "system" fn(*const i8, u32, i16, u64) -> HANDLE;
-type Close = unsafe extern "system" fn(HANDLE) -> i32;
-type Shutdown = unsafe extern "system" fn(HANDLE, u32) -> i32;
-type Recv = unsafe extern "system" fn(HANDLE, *mut u8, u32, *mut u32, *mut Address) -> i32;
-type Send = unsafe extern "system" fn(HANDLE, *const u8, u32, *mut u32, *const Address) -> i32;
-type Checksum = unsafe extern "system" fn(*mut u8, u32, *mut Address, u64) -> i32;
-
-struct Library(HMODULE);
-unsafe impl std::marker::Send for Library {}
-unsafe impl Sync for Library {}
-impl Drop for Library {
-    fn drop(&mut self) {
-        unsafe {
-            FreeLibrary(self.0);
-        }
-    }
-}
-
-struct Api {
-    _library: Library,
-    open: Open,
-    close: Close,
-    shutdown: Shutdown,
-    recv: Recv,
-    send: Send,
-    checksum: Checksum,
-}
-impl Api {
-    fn load() -> io::Result<Arc<Self>> {
-        let executable = std::env::current_exe()?;
-        let path = executable.with_file_name("WinDivert.dll");
-        let path = platform::wide(path.as_os_str());
-        let module = unsafe {
-            LoadLibraryExW(
-                path.as_ptr(),
-                null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if module.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let library = Library(module);
-        macro_rules! symbol {
-            ($name:literal, $ty:ty) => {{
-                let pointer = unsafe { GetProcAddress(module, concat!($name, "\0").as_ptr()) }
-                    .ok_or_else(io::Error::last_os_error)?;
-                // Signature and calling convention are from the WinDivert 2.2 header.
-                unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(pointer) }
-            }};
-        }
-        Ok(Arc::new(Self {
-            _library: library,
-            open: symbol!("WinDivertOpen", Open),
-            close: symbol!("WinDivertClose", Close),
-            shutdown: symbol!("WinDivertShutdown", Shutdown),
-            recv: symbol!("WinDivertRecv", Recv),
-            send: symbol!("WinDivertSend", Send),
-            checksum: symbol!("WinDivertHelperCalcChecksums", Checksum),
-        }))
-    }
-
-    fn open(self: &Arc<Self>, filter: &str, priority: i16) -> io::Result<Arc<Device>> {
-        let filter = CString::new(filter).map_err(io::Error::other)?;
-        let handle = unsafe { (self.open)(filter.as_ptr(), 0, priority, 0) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::other(format!(
-                "WinDivertOpen: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        Ok(Arc::new(Device {
-            api: self.clone(),
-            handle,
-            stopped: AtomicBool::new(false),
-        }))
-    }
-}
-
-struct Device {
-    api: Arc<Api>,
-    handle: HANDLE,
-    stopped: AtomicBool,
-}
-unsafe impl std::marker::Send for Device {}
-unsafe impl Sync for Device {}
-impl Device {
-    fn stop(&self) {
-        if !self.stopped.swap(true, Ordering::AcqRel) {
-            unsafe {
-                (self.api.shutdown)(self.handle, SHUTDOWN_RECV);
-            }
-        }
-    }
-    fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-    }
-    fn recv(&self, data: &mut [u8], address: &mut Address) -> io::Result<usize> {
-        let mut size = 0;
-        if unsafe {
-            (self.api.recv)(
-                self.handle,
-                data.as_mut_ptr(),
-                data.len() as u32,
-                &mut size,
-                address,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if size as usize > data.len() {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        Ok(size as usize)
-    }
-    fn send(&self, data: &[u8], address: &Address) -> io::Result<()> {
-        let mut size = 0;
-        if unsafe {
-            (self.api.send)(
-                self.handle,
-                data.as_ptr(),
-                data.len() as u32,
-                &mut size,
-                address,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if size as usize != data.len() {
-            return Err(io::ErrorKind::WriteZero.into());
-        }
-        Ok(())
-    }
-    fn checksum(&self, data: &mut [u8], address: &mut Address) -> io::Result<()> {
-        if unsafe { (self.api.checksum)(data.as_mut_ptr(), data.len() as u32, address, 0) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-impl Drop for Device {
-    fn drop(&mut self) {
-        unsafe {
-            (self.api.close)(self.handle);
-        }
-    }
-}
 
 struct Worker {
     device: Arc<Device>,
@@ -218,7 +62,7 @@ impl Capture {
         stop: Arc<Stop>,
     ) -> io::Result<Self> {
         let local = platform::local_ips()?;
-        let device = Api::load()?.open(CLASSIFIER, 200)?;
+        let device = Device::classifier()?;
         let (wake, events) = mpsc::sync_channel(1);
         let callback = wake.clone();
         let shared = Arc::new(Shared {
@@ -296,7 +140,7 @@ impl Drop for Capture {
 }
 
 impl Shared {
-    fn redirector(self: &Arc<Self>, api: &Arc<Api>) -> io::Result<()> {
+    fn redirector(self: &Arc<Self>) -> io::Result<()> {
         let mut state = self.redirector.lock().unwrap();
         if self.stop.stopped() {
             return Err(io::ErrorKind::Interrupted.into());
@@ -304,9 +148,7 @@ impl Shared {
         if state.is_some() {
             return Ok(());
         }
-        let port = self.port;
-        let filter = format!("outbound and tcp and !impostor and (!loopback or tcp.SrcPort == {port} or tcp.DstPort == {port})");
-        let device = api.open(&filter, 100)?;
+        let device = Device::redirector(self.port)?;
         let thread_device = device.clone();
         let shared = self.clone();
         let task = thread::Builder::new()
@@ -354,7 +196,7 @@ fn classifier(shared: &Arc<Shared>, device: &Device) {
     let mut raw = vec![0; 0xffff];
     let mut backup = Vec::new();
     while !device.stopped() {
-        let mut address = Address([0; 80]);
+        let mut address = Address::EMPTY;
         let n = match device.recv(&mut raw, &mut address) {
             Ok(size) => size,
             Err(_) if device.stopped() || shared.stop.stopped() => break,
@@ -429,7 +271,7 @@ fn classifier(shared: &Arc<Shared>, device: &Device) {
         }
         shared.flows.register(flow.clone());
         let _ = shared.wake.try_send(());
-        if let Err(err) = shared.redirector(&device.api) {
+        if let Err(err) = shared.redirector() {
             shared.flows.delete(flow.client);
             shared.monitor.log(
                 "error",
@@ -453,8 +295,9 @@ fn classifier(shared: &Arc<Shared>, device: &Device) {
         let original_address = address;
         if let Err(err) = packet
             .set_destination(flow.client.ip(), shared.port)
+            .and_then(|()| packet.repair_checksums())
+            .map(|()| address.mark_checksums(packet.ipv6))
             .map_err(io::Error::other)
-            .and_then(|_| device.checksum(buf, &mut address))
         {
             shared.flows.delete(flow.client);
             shared.packet_error("classifier checksum", err);
@@ -479,7 +322,7 @@ fn classifier(shared: &Arc<Shared>, device: &Device) {
 fn redirect(shared: &Shared, device: &Device) {
     let mut raw = vec![0; 0xffff];
     while !device.stopped() {
-        let mut address = Address([0; 80]);
+        let mut address = Address::EMPTY;
         let n = match device.recv(&mut raw, &mut address) {
             Ok(size) => size,
             Err(_) if device.stopped() || shared.stop.stopped() => break,
@@ -506,12 +349,13 @@ fn redirect(shared: &Shared, device: &Device) {
                     }
                 };
                 if let Err(err) = changed
+                    .and_then(|()| packet.repair_checksums())
                     .map_err(io::Error::other)
-                    .and_then(|_| device.checksum(buf, &mut address))
                 {
                     shared.packet_error("redirector checksum", err);
                     continue;
                 }
+                address.mark_checksums(packet.ipv6);
             }
         }
         shared.reinject(device, buf, &address, "redirector send");

@@ -905,7 +905,7 @@ fn sha(bytes: &[u8]) -> String {
 fn hash_file(path: &Path) -> io::Result<String> {
     hash_reader(File::open(path)?, u64::MAX)
 }
-fn hash_reader(mut reader: impl Read, limit: u64) -> io::Result<String> {
+pub(crate) fn hash_reader(mut reader: impl Read, limit: u64) -> io::Result<String> {
     let mut sha = Sha256::new();
     let mut data = vec![0; 64 << 10];
     let mut total = 0u64;
@@ -1037,18 +1037,38 @@ fn validate_manifest(
     {
         return Err("build manifest does not describe a verified WinDivert runtime".into());
     }
-    for (name, key) in [
-        ("WinDivert.dll", "dll_sha256"),
-        ("WinDivert64.sys", "driver_sha256"),
-    ] {
-        if !runtime[key]
+    if runtime["client"] == "rust-native" {
+        if !runtime["driver_sha256"]
             .as_str()
-            .is_some_and(|hash| has_hash(&directory.join(name), hash))
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(crate::windivert::DRIVER_SHA256))
         {
-            return Err(format!(
-                "installed {name} is incompatible with this release: SHA-256 mismatch"
-            ));
+            return Err(
+                "release requires a different WinDivert driver; install the full package".into(),
+            );
         }
+        crate::windivert::runtime::extract_if_missing(
+            &directory.join(crate::windivert::DRIVER_NAME),
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        verify_runtime_file(directory, "WinDivert.dll", &runtime["dll_sha256"])?;
+    }
+    verify_runtime_file(
+        directory,
+        crate::windivert::DRIVER_NAME,
+        &runtime["driver_sha256"],
+    )
+}
+
+#[cfg(windows)]
+fn verify_runtime_file(directory: &Path, name: &str, digest: &Value) -> Result<(), String> {
+    if !digest
+        .as_str()
+        .is_some_and(|hash| has_hash(&directory.join(name), hash))
+    {
+        return Err(format!(
+            "installed {name} is incompatible with this release: SHA-256 mismatch"
+        ));
     }
     Ok(())
 }

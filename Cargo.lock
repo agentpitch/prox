@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "pitchprox-core"
-version = "0.50.0"
+version = "0.60.0"
 dependencies = [
  "chrono",
  "getrandom",

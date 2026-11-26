@@ -27,31 +27,27 @@ function Resolve-BuildDirectory([string]$Path) {
 
 $output = Resolve-BuildDirectory $OutputDirectory
 $runtime = Resolve-BuildDirectory $WinDivertDirectory
-$verified = @()
-foreach ($file in @(
-    @{ Name = "WinDivert.dll"; Hash = $PitchProxReleaseSettings.WinDivertDLLSHA256 },
-    @{ Name = "WinDivert64.sys"; Hash = $PitchProxReleaseSettings.WinDivertDriverSHA256 }
-)) {
-    $source = Join-Path $runtime $file.Name
-    if (!(Test-Path -LiteralPath $source -PathType Leaf)) {
-        $source = Join-Path $output $file.Name
-    }
-    if (Test-Path -LiteralPath $source -PathType Leaf) {
-        Assert-PitchProxFileSHA256 -LiteralPath $source -ExpectedSHA256 $file.Hash -Description $file.Name
-        $verified += @{ Name = $file.Name; Source = $source }
-    } elseif ($RequireWinDivert) {
-        throw "Missing required WinDivert runtime file: $($file.Name)"
-    } else {
-        Write-Warning "Missing $($file.Name). Use the verified WinDivert $($PitchProxReleaseSettings.WinDivertVersion) runtime for interception."
-    }
+$driverName = "WinDivert64.sys"
+$driver = Join-Path $runtime $driverName
+$driverDestination = Join-Path $output $driverName
+if (!(Test-Path -LiteralPath $driver -PathType Leaf)) { $driver = $driverDestination }
+$driverPresent = Test-Path -LiteralPath $driver -PathType Leaf
+if ($driverPresent) {
+    Assert-PitchProxFileSHA256 -LiteralPath $driver -ExpectedSHA256 $PitchProxReleaseSettings.WinDivertDriverSHA256 -Description $driverName
+} elseif ($RequireWinDivert) {
+    throw "Missing required WinDivert driver: $driverName"
+} else {
+    Write-Warning "Missing $driverName. This development build requires an external driver file for interception."
 }
 
 $previousVersion = $env:PITCHPROX_VERSION
 $targetDirectory = Join-Path $repo "target"
 $previousTargetDirectory = $env:CARGO_TARGET_DIR
+$previousDriver = $env:PITCHPROX_WINDIVERT_DRIVER
 try {
     $env:PITCHPROX_VERSION = $Version
     $env:CARGO_TARGET_DIR = $targetDirectory
+    $env:PITCHPROX_WINDIVERT_DRIVER = if ($driverPresent) { $driver } else { $null }
     Push-Location $repo
     try {
         & cargo build --locked --release --target $Target --bin pitchProx
@@ -62,15 +58,10 @@ try {
 } finally {
     $env:PITCHPROX_VERSION = $previousVersion
     $env:CARGO_TARGET_DIR = $previousTargetDirectory
+    $env:PITCHPROX_WINDIVERT_DRIVER = $previousDriver
 }
 
 [IO.Directory]::CreateDirectory($output) | Out-Null
 $executable = Join-Path $output "pitchProx.exe"
 Copy-Item -LiteralPath (Join-Path $targetDirectory "$Target/release/pitchProx.exe") -Destination $executable -Force
-foreach ($file in $verified) {
-    $destination = Join-Path $output $file.Name
-    if (![string]::Equals($destination, $file.Source, [StringComparison]::OrdinalIgnoreCase)) {
-        Copy-Item -LiteralPath $file.Source -Destination $destination -Force
-    }
-}
 Write-Host "Built $executable (Rust $Target, version $Version)"

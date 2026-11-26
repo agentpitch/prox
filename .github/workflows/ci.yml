@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: ["**"]
-    # v0.50.0 uses the separately verified Rust release package.
-    tags: ["v*", "!v0.50.0"]
+    # These tags use separately verified Rust release packages.
+    tags: ["v*", "!v0.50.0", "!v0.60.0"]
   pull_request:
   workflow_dispatch:
 
@@ -85,7 +85,7 @@ jobs:
             build/candidates/${{ steps.release-version.outputs.version }}/RELEASE_NOTES.md
 
   release-tag:
-    if: startsWith(github.ref, 'refs/tags/v') && github.ref_name != 'v0.50.0'
+    if: startsWith(github.ref, 'refs/tags/v') && github.ref_name != 'v0.50.0' && github.ref_name != 'v0.60.0'
     needs: windows-build
     runs-on: ubuntu-latest
     permissions:

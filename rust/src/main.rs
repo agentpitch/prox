@@ -114,6 +114,13 @@ fn execute(command: &str, args: &[String]) -> Result<(), String> {
             }
         }
         "update-helper" => updater::run_helper(args.get(1..).unwrap_or_default()),
+        "windivert-license" => {
+            println!(
+                "WinDivert 2.2.2 (Copyright Basil)\nSource: https://github.com/basil00/WinDivert/tree/v2.2.2\n\n{}",
+                include_str!("../../licenses/WinDivert-LICENSE.txt")
+            );
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

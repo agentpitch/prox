@@ -12,14 +12,18 @@ const DESCRIPTION: &str = "Local WebUI + WinDivert transparent proxy service";
 static APP: OnceLock<Arc<App>> = OnceLock::new();
 static OUTCOME: OnceLock<Result<(), String>> = OnceLock::new();
 
-struct ServiceHandle(SC_HANDLE);
+pub(crate) struct ServiceHandle(SC_HANDLE);
 impl ServiceHandle {
-    fn new(handle: SC_HANDLE) -> io::Result<Self> {
+    pub(crate) fn new(handle: SC_HANDLE) -> io::Result<Self> {
         if handle.is_null() {
             Err(io::Error::last_os_error())
         } else {
             Ok(Self(handle))
         }
+    }
+
+    pub(crate) fn raw(&self) -> SC_HANDLE {
+        self.0
     }
 }
 impl Drop for ServiceHandle {
@@ -114,7 +118,7 @@ fn publish(handle: SERVICE_STATUS_HANDLE, state: u32, exit: u32) {
     }
 }
 
-fn manager(access: u32) -> io::Result<ServiceHandle> {
+pub(crate) fn manager(access: u32) -> io::Result<ServiceHandle> {
     ServiceHandle::new(unsafe { OpenSCManagerW(null(), null(), access) })
 }
 fn open(name: &str, access: u32) -> io::Result<ServiceHandle> {
